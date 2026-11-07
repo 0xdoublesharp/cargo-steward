@@ -569,6 +569,11 @@ mod tests {
     fn usage_counts_symlinks_as_private() {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("a"), vec![1u8; 64 * 1024]).unwrap();
+        // APFS only reports a file's private size once its data is on disk.
+        fs::File::open(tmp.path().join("a"))
+            .unwrap()
+            .sync_all()
+            .unwrap();
         std::os::unix::fs::symlink("a", tmp.path().join("link")).unwrap();
         let usage = tree_usage(tmp.path());
         assert_eq!(usage.allocated, tree_size(tmp.path()));
