@@ -684,4 +684,130 @@ mod tests {
         assert_eq!(report.kept_units, 3);
         assert_eq!(report.kept_caches, 2);
     }
+
+    #[test]
+    fn a_missing_build_directory_is_nothing_to_trim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let options = opts(&tmp.path().join("absent"));
+        run(&options).unwrap();
+        assert!(!tmp.path().join("absent").exists());
+    }
+
+    #[test]
+    fn a_noatime_marker_leaves_only_the_budget() {
+        let tracking = Tracking::from_marker(Some(Marker {
+            start: 1_700_000_000,
+            atime: false,
+        }));
+        assert_eq!(tracking, Tracking::Frozen);
+        assert!(tracking.describe().contains("noatime"));
+        assert!(
+            Tracking::NoMarker
+                .describe()
+                .contains("`ci start` didn't run")
+        );
+        let reads = Tracking::from_marker(Some(Marker {
+            start: 1_700_000_000,
+            atime: true,
+        }));
+        assert!(
+            reads
+                .describe()
+                .starts_with("kept what the job used since 2023-11-14")
+        );
+        assert_eq!(
+            Reason::Budget.label(Some(1 << 20)),
+            "over the 1.0 MiB budget"
+        );
+    }
+
+    #[test]
+    fn a_member_cache_kept_with_incremental_still_goes_with_the_workspace() {
+        let (_tmp, root) = fixture();
+        let options = Options {
+            members: BTreeSet::from(["used".to_owned()]),
+            keep_incremental: true,
+            dry_run: true,
+            verbose: true,
+            ..opts(&root)
+        };
+        let report = trim(&options, Tracking::NoMarker);
+        // `used`'s unit and its incremental cache, as workspace members.
+        assert_eq!(
+            report
+                .removed
+                .iter()
+                .map(|r| (r.0, r.1))
+                .collect::<Vec<_>>(),
+            [(Reason::Workspace, 2)]
+        );
+        assert!(
+            root.join("debug/incremental/used-1abc").exists(),
+            "a dry run"
+        );
+        let text = render_text(&options, Tracking::NoMarker, &report);
+        assert!(text.contains("Would remove"), "{text}");
+    }
+
+    #[test]
+    fn removes_objects_later_compiles_replaced() {
+        let (_tmp, root) = fixture();
+        let deps = root.join("debug/deps");
+        let old = deps.join("used-1111111111111111.x.0aaa.rcgu.o");
+        let new = deps.join("used-1111111111111111.x.0bbb.rcgu.o");
+        fs::write(&old, vec![0u8; 4096]).unwrap();
+        fs::write(&new, vec![0u8; 4096]).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(at(1_700_000_000))
+            .unwrap();
+        let options = Options {
+            keep_workspace: true,
+            keep_incremental: true,
+            verbose: true,
+            ..opts(&root)
+        };
+        let report = trim(&options, Tracking::NoMarker);
+        assert_eq!(
+            report
+                .removed
+                .iter()
+                .map(|r| (r.0, r.1))
+                .collect::<Vec<_>>(),
+            [(Reason::StaleObjects, 1)]
+        );
+        assert!(!old.exists());
+        assert!(new.exists());
+        assert_eq!(report.kept_units, 3);
+    }
+
+    #[test]
+    fn leaves_a_profile_a_build_is_using() {
+        let (_tmp, root) = fixture();
+        let lock = fsutil::try_lock_file(&root.join("debug/.cargo-lock"))
+            .unwrap()
+            .unwrap();
+        let options = Options {
+            budget: Some(1),
+            ..opts(&root)
+        };
+        let report = trim(&options, Tracking::NoMarker);
+        assert!(report.removed.is_empty(), "{report:?}");
+        assert_eq!(fingerprint_count(&root), 3);
+        drop(lock);
+    }
+
+    #[test]
+    fn an_unwritable_step_summary_is_an_error() {
+        let (_tmp, root) = fixture();
+        let options = Options {
+            dry_run: true,
+            step_summary: Some(root.join("missing-dir/summary.md")),
+            ..opts(&root)
+        };
+        let err = run(&options).unwrap_err();
+        assert!(format!("{err:#}").contains("step summary"), "{err:#}");
+    }
 }

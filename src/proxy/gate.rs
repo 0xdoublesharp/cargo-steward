@@ -327,4 +327,75 @@ mod tests {
         // SAFETY: as above.
         unsafe { libc::close(fd) };
     }
+
+    #[test]
+    fn acquire_waits_for_a_held_slot_then_takes_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Created by `acquire` itself.
+        let dir = tmp.path().join("new/slots");
+        let mut env = Vec::new();
+        acquire(&dir, 1, &mut env).unwrap();
+        let fd: RawFd = env[0].1.to_str().unwrap().parse().unwrap();
+        assert_eq!(env[0].0, FD_VAR);
+        assert_eq!(env[1], (SLOT_VAR.into(), dir.join("0.lock").into()));
+
+        // The only slot is held: `acquire` waits until it's released.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = {
+            let dir = dir.clone();
+            std::thread::spawn(move || {
+                let mut env = Vec::new();
+                acquire(&dir, 1, &mut env).unwrap();
+                tx.send(env).unwrap();
+            })
+        };
+        assert!(
+            rx.recv_timeout(Duration::from_millis(400)).is_err(),
+            "took a held slot"
+        );
+        // SAFETY: releasing the descriptor the first acquire left open.
+        unsafe { libc::close(fd) };
+        let env = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        waiter.join().unwrap();
+        assert_eq!(env[1].1, dir.join("0.lock").into_os_string());
+        let fd: RawFd = env[0].1.to_str().unwrap().parse().unwrap();
+        // SAFETY: as above.
+        unsafe { libc::close(fd) };
+    }
+
+    #[test]
+    fn acquire_fails_when_the_slots_cant_be_made() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("file");
+        fs::write(&file, "").unwrap();
+        let mut env = Vec::new();
+        assert!(acquire(&file.join("slots"), 1, &mut env).is_err());
+        // A slot that's a symlink is refused, never followed.
+        let dir = tmp.path().join("slots");
+        fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink(&file, dir.join("0.lock")).unwrap();
+        assert!(try_any(&dir, 1).is_err());
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn an_inherited_slot_must_be_a_regular_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let held = open(&dir.join("held"));
+        let fd = held.as_raw_fd().to_string();
+        let missing = dir.join("missing.lock");
+        assert!(!reuse_inherited(
+            &dir,
+            Some(fd.as_ref()),
+            Some(missing.as_os_str())
+        ));
+        let sub = dir.join("sub.lock");
+        fs::create_dir(&sub).unwrap();
+        assert!(!reuse_inherited(
+            &dir,
+            Some(fd.as_ref()),
+            Some(sub.as_os_str())
+        ));
+    }
 }

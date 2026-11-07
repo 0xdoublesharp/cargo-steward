@@ -496,4 +496,86 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn finds_programs_by_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = tmp.path().join("tool");
+        fs::write(&tool, "").unwrap();
+        assert_eq!(find_program(tool.as_os_str()), Some(tool.clone()));
+        assert_eq!(find_program(tmp.path().join("missing").as_os_str()), None);
+        // A directory isn't a program.
+        assert_eq!(find_program(tmp.path().as_os_str()), None);
+    }
+
+    #[test]
+    fn the_inner_wrapper_must_exist_and_not_be_us() {
+        if env::var_os("CARGO_STEWARD_INNER").is_some() {
+            return; // The environment decides; covered end to end.
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        assert_eq!(inner_wrapper(&config), None);
+        config.inner_wrapper = Some(String::new());
+        assert_eq!(inner_wrapper(&config), None);
+        // A missing sccache never breaks the build.
+        let missing = tmp.path().join("sccache");
+        config.inner_wrapper = Some(missing.display().to_string());
+        assert_eq!(inner_wrapper(&config), None);
+        fs::write(&missing, "").unwrap();
+        assert_eq!(inner_wrapper(&config), Some(missing.into_os_string()));
+        // Never ourselves: that would recurse.
+        let us = tmp.path().join("cargo-steward");
+        fs::write(&us, "").unwrap();
+        config.inner_wrapper = Some(us.display().to_string());
+        assert_eq!(inner_wrapper(&config), None);
+    }
+
+    #[test]
+    fn exit_codes_carry_signals() {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(exit_code(ExitStatus::from_raw(3 << 8)), 3);
+        // Killed by SIGKILL, as a shell reports it.
+        assert_eq!(exit_code(ExitStatus::from_raw(9)), 137);
+    }
+
+    #[test]
+    fn a_cleanup_is_due_after_the_interval_or_when_space_is_low() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            home: tmp.path().to_path_buf(),
+        };
+        let mut config = Config {
+            gc_interval: "1h".into(),
+            min_free: "0".into(),
+            ..Config::default()
+        };
+        // Never cleaned up: due.
+        assert!(gc_due(&paths, &config, tmp.path()));
+        fs::write(paths.stamp(), "").unwrap();
+        assert!(!gc_due(&paths, &config, tmp.path()));
+        // Low on space, but cleaned up moments ago: not yet.
+        config.min_free = "1000000T".into();
+        config.target_free = "1000000T".into();
+        assert!(!gc_due(&paths, &config, tmp.path()));
+        let set_age = |age: Duration| {
+            fs::File::options()
+                .write(true)
+                .open(paths.stamp())
+                .unwrap()
+                .set_modified(SystemTime::now() - age)
+                .unwrap();
+        };
+        // Low on space and past the recheck: due.
+        set_age(Duration::from_secs(400));
+        assert!(gc_due(&paths, &config, tmp.path()));
+        config.min_free = "0".into();
+        assert!(!gc_due(&paths, &config, tmp.path()));
+        // Past the interval: due.
+        set_age(Duration::from_secs(7200));
+        assert!(gc_due(&paths, &config, tmp.path()));
+        // A broken policy never starts one.
+        config.gc_interval = "often".into();
+        assert!(!gc_due(&paths, &config, tmp.path()));
+    }
 }
