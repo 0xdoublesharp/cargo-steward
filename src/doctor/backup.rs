@@ -91,25 +91,36 @@ fn indexing(root: &Path) -> Indexing {
 }
 
 pub fn report_root(status: &RootStatus) {
+    for (level, message) in root_findings(status) {
+        say(level, message);
+    }
+}
+
+/// What [`report_root`] says about a scan root. Fix commands quote the path
+/// for the shell, since volume names may contain spaces.
+fn root_findings(status: &RootStatus) -> Vec<(Level, String)> {
     let root = status.root.display();
+    let quoted = shell_quote(&status.root);
+    let mut findings = Vec::new();
     match status.excluded {
-        Some(true) => say(Level::Ok, format!("{root} is excluded from Time Machine")),
-        Some(false) => say(
+        Some(true) => findings.push((Level::Ok, format!("{root} is excluded from Time Machine"))),
+        Some(false) => findings.push((
             Level::Warn,
-            format!("{root} is backed up by Time Machine.\nFix: tmutil addexclusion {root}"),
-        ),
+            format!("{root} is backed up by Time Machine.\nFix: tmutil addexclusion {quoted}"),
+        )),
         None => {}
     }
     match status.indexing {
-        Indexing::On => say(
+        Indexing::On => findings.push((
             Level::Warn,
             format!(
-                "Spotlight indexes {root}, which costs CPU on every build.\nFix (volume roots): sudo mdutil -i off {root}"
+                "Spotlight indexes {root}, which costs CPU on every build.\nFix (volume roots): sudo mdutil -i off {quoted}"
             ),
-        ),
-        Indexing::Off => say(Level::Ok, format!("Spotlight doesn't index {root}")),
+        )),
+        Indexing::Off => findings.push((Level::Ok, format!("Spotlight doesn't index {root}"))),
         Indexing::Unknown => {}
     }
+    findings
 }
 
 /// Build directories on the system disk that Time Machine still backs up.
@@ -156,6 +167,24 @@ pub fn report_build_dirs(on_system_disk: usize, statuses: &[Exclusion]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quotes_paths_in_fix_commands() {
+        let status = RootStatus {
+            root: "/Volumes/Build Scratch".into(),
+            excluded: Some(false),
+            indexing: Indexing::On,
+        };
+        let text: Vec<String> = root_findings(&status).into_iter().map(|f| f.1).collect();
+        assert!(
+            text[0].ends_with("Fix: tmutil addexclusion '/Volumes/Build Scratch'"),
+            "{text:?}"
+        );
+        assert!(
+            text[1].ends_with("sudo mdutil -i off '/Volumes/Build Scratch'"),
+            "{text:?}"
+        );
+    }
 
     #[test]
     fn parses_tmutil_isexcluded() {

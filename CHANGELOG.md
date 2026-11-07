@@ -53,3 +53,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   until that crate's next compile.
 - `scripts/install.sh` for new machines (from source, git, or a release
   binary) and a release workflow building macOS and Linux binaries.
+
+### Fixed
+
+- `doctor` quotes scan roots in its `tmutil addexclusion` and `mdutil -i off`
+  fix commands, so they work for volume names with spaces.
