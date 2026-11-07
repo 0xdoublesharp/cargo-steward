@@ -147,15 +147,26 @@ pub struct Profile {
 /// `--target`, its grandchildren.
 pub fn profiles(root: &Path) -> Vec<Profile> {
     let mut found = Vec::new();
-    for child in subdirs(root) {
+    for child in subdirs(root).filter(|c| !is_trash(c)) {
         if let Some(profile) = as_profile(&child) {
             found.push(profile);
             continue;
         }
-        found.extend(subdirs(&child).filter_map(|g| as_profile(&g)));
+        found.extend(
+            subdirs(&child)
+                .filter(|g| !is_trash(g))
+                .filter_map(|g| as_profile(&g)),
+        );
     }
     found.sort_by(|a, b| a.path.cmp(&b.path));
     found
+}
+
+/// Renamed aside for deletion ([`crate::fsutil::remove`]).
+fn is_trash(dir: &Path) -> bool {
+    dir.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with(crate::fsutil::TRASH_PREFIX))
 }
 
 fn as_profile(dir: &Path) -> Option<Profile> {

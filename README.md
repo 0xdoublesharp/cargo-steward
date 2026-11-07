@@ -112,7 +112,7 @@ Cheapest-to-rebuild first. Every threshold is a setting.
 | A crate's incremental cache | Unused for `incremental-idle` (7 days) | That crate compiles from scratch once |
 | A build unit (new layout) | Unused for `unit-idle` (14 days), and no unit used since was built from it (cargo's fingerprints link them) | That unit rebuilds if needed again |
 | A whole build directory | Every workspace that built there is deleted, for `orphan-grace` (2 days); or unused for `dir-idle` (21 days) | Full rebuild |
-| Whole build directories, cheapest to rebuild first (idle time × size ÷ recorded compile time) | The disk has under `min-free` (50 GiB) free; until it has `target-free` (100 GiB). Never one used within `recent-guard` (1 day) | Full rebuild |
+| Whole build directories, cheapest to rebuild first (idle time × unshared size ÷ recorded compile time) | The disk has under `min-free` (50 GiB) free; until it has `target-free` (100 GiB), or until removals stop raising free space (local snapshots or clones holding it). Never one used within `recent-guard` (1 day) | Full rebuild |
 
 Safety:
 
@@ -125,7 +125,8 @@ Safety:
 - Replaced object files are kept for `object-grace`, so a binary that's still
   running keeps symbolized backtraces.
 - Directories are renamed aside before they're deleted, so nothing ever sees
-  one half removed.
+  one half removed. What an interrupted cleanup leaves is finished by the
+  next `gc --apply`, never by a preview.
 - Incremental caches are removed whole. Removing part of one can crash rustc.
 - The wrapper only removes a compiled unit's own objects, only after rustc
   succeeds, and only ones the compile didn't rewrite. Binaries keep their debug

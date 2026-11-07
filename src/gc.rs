@@ -356,11 +356,15 @@ pub struct Sweep<'a> {
 /// Plans, and when applying, carries out the cleanup of `dirs`. Each build
 /// directory is handled by one thread, several at a time.
 pub fn clean(dirs: &[BuildDir], sweep: Sweep) -> Cleanup {
-    // Before any thread renames something aside into the same parent.
-    for dir in dirs {
-        fsutil::sweep_trash(&dir.root);
-        if let Some(parent) = dir.root.parent() {
-            fsutil::sweep_trash(parent);
+    // Finish removals an interrupted cleanup left renamed aside: inside a
+    // build directory everything goes to its root, and a whole one goes
+    // next to it. Only when applying: a preview changes nothing.
+    if sweep.apply {
+        for dir in dirs {
+            fsutil::sweep_trash(&dir.root);
+            if let Some(parent) = dir.root.parent() {
+                fsutil::sweep_trash(parent);
+            }
         }
     }
     let results = fsutil::parallel_map(dirs, |dir| clean_dir(dir, sweep));
@@ -372,7 +376,7 @@ pub fn clean(dirs: &[BuildDir], sweep: Sweep) -> Cleanup {
         }
         cleanup.absorb(result);
     }
-    let low = free_space(dirs, &removed, &cleanup.actions, sweep);
+    let low = free_space(dirs, &removed, &cleanup.actions, sweep, &fsutil::free_space);
     cleanup.absorb(low);
     cleanup
 }
@@ -414,7 +418,13 @@ fn clean_dir(dir: &BuildDir, sweep: Sweep) -> (Cleanup, bool) {
         live_units(&dir.profiles, sweep)
     };
     for profile in &dir.profiles {
-        out.absorb(clean_profile(profile, dir.pinned, live.as_ref(), sweep));
+        out.absorb(clean_profile(
+            profile,
+            &dir.root,
+            dir.pinned,
+            live.as_ref(),
+            sweep,
+        ));
     }
     (out, false)
 }
@@ -475,9 +485,11 @@ fn live_units(profiles: &[Profile], sweep: Sweep) -> Option<BTreeSet<PathBuf>> {
 }
 
 /// `live`: the new-layout units builds still need ([`live_units`]); `None`
-/// keeps every unit.
+/// keeps every unit. What's removed is renamed aside into `root`, the build
+/// directory, first.
 fn clean_profile(
     profile: &Profile,
+    root: &Path,
     pinned: bool,
     live: Option<&BTreeSet<PathBuf>>,
     sweep: Sweep,
@@ -533,6 +545,7 @@ fn clean_profile(
                 &path,
                 String::new(),
                 None,
+                root,
                 sweep,
                 &mut out,
             );
@@ -541,14 +554,14 @@ fn clean_profile(
     if let Some(live) = live {
         for unit in scan::v2_units(&profile.path) {
             if idle(unit.last_used, policy.unit_idle) && !live.contains(&unit.path) {
-                remove_dated(Kind::IdleUnit, &unit, sweep, &mut out);
+                remove_dated(Kind::IdleUnit, &unit, root, sweep, &mut out);
             }
         }
     }
     let mut sessions: Vec<PathBuf> = Vec::new();
     for cache in scan::incremental_dirs(&profile.path) {
         if idle(cache.last_used, policy.incremental_idle) {
-            remove_dated(Kind::IdleIncremental, &cache, sweep, &mut out);
+            remove_dated(Kind::IdleIncremental, &cache, root, sweep, &mut out);
         } else {
             sessions.extend(scan::superseded_sessions(&cache.path));
         }
@@ -560,7 +573,7 @@ fn clean_profile(
         let bytes: u64 = session_dirs.iter().map(|d| fsutil::tree_size(d)).sum();
         if sweep.apply {
             for path in &sessions {
-                if let Err(e) = fsutil::remove(path) {
+                if let Err(e) = fsutil::remove_into(path, root) {
                     eprintln!(
                         "warning: cargo-steward: failed to remove {}: {e}",
                         path.display()
@@ -590,9 +603,15 @@ enum Removal {
     Failed,
 }
 
-fn remove_dated(kind: Kind, item: &Dated, sweep: Sweep, out: &mut Cleanup) -> Removal {
+fn remove_dated(
+    kind: Kind,
+    item: &Dated,
+    trash: &Path,
+    sweep: Sweep,
+    out: &mut Cleanup,
+) -> Removal {
     let note = format!("unused for {}", fsutil::ago(item.last_used));
-    remove_dir(kind, &item.path, note, None, sweep, out)
+    remove_dir(kind, &item.path, note, None, trash, sweep, out)
 }
 
 /// Removes `path` (when applying) and records it, unless a running program
@@ -603,6 +622,7 @@ fn remove_dir(
     path: &Path,
     note: String,
     bytes: Option<u64>,
+    trash: &Path,
     sweep: Sweep,
     out: &mut Cleanup,
 ) -> Removal {
@@ -620,7 +640,7 @@ fn remove_dir(
     }
     let bytes = bytes.unwrap_or_else(|| fsutil::tree_size(path));
     if sweep.apply
-        && let Err(e) = fsutil::remove(path)
+        && let Err(e) = fsutil::remove_into(path, trash)
     {
         eprintln!(
             "warning: cargo-steward: failed to remove {}: {e}",
@@ -648,17 +668,37 @@ fn remove_build_dir(
     sweep: Sweep,
     out: &mut Cleanup,
 ) -> Removal {
+    let trash = dir.root.parent().unwrap_or(&dir.root);
     if !sweep.apply {
-        return remove_dir(kind, &dir.root, note, bytes, sweep, out);
+        return remove_dir(kind, &dir.root, note, bytes, trash, sweep, out);
     }
+    // The profiles seen when the directory was inspected, and any a build
+    // has started since (`--release`, another `--target`): list again after
+    // locking until no new one turns up.
     let mut locks = Vec::new();
-    for profile in &dir.profiles {
-        match fsutil::lock_profile(&profile.path) {
-            Lock::Busy => return Removal::Busy,
-            held => locks.push(held),
+    let mut locked: BTreeSet<PathBuf> = BTreeSet::new();
+    loop {
+        // A set: a second lock on the same file conflicts with the first,
+        // even in one process.
+        let listed: BTreeSet<PathBuf> = dir
+            .profiles
+            .iter()
+            .map(|p| p.path.clone())
+            .chain(scan::profiles(&dir.root).into_iter().map(|p| p.path))
+            .filter(|p| !locked.contains(p))
+            .collect();
+        if listed.is_empty() {
+            break;
+        }
+        for profile in listed {
+            match fsutil::lock_profile(&profile) {
+                Lock::Busy => return Removal::Busy,
+                held => locks.push(held),
+            }
+            locked.insert(profile);
         }
     }
-    let removal = remove_dir(kind, &dir.root, note, bytes, sweep, out);
+    let removal = remove_dir(kind, &dir.root, note, bytes, trash, sweep, out);
     drop(locks);
     removal
 }
@@ -787,12 +827,19 @@ pub fn build_dir_of(worktree: &Path) -> Result<PathBuf> {
 
 /// Removes build directories from each disk that is below `min-free`, until
 /// it has `target-free` again, those whose bytes cost least to rebuild first
-/// ([`eviction_order`]).
+/// ([`eviction_order`]). `measure` reads a disk's free space.
+///
+/// Directories are weighed by what removing each frees on its own: blocks a
+/// copy-on-write clone shares (seeded worktrees, `dedup`) stay on disk while
+/// another copy remains. And when removals stop raising free space (Time
+/// Machine's local snapshots hold deleted files; clones share their blocks),
+/// it stops rather than go on to remove every directory on the disk.
 fn free_space(
     dirs: &[BuildDir],
     removed: &BTreeSet<PathBuf>,
     done: &[Action],
     sweep: Sweep,
+    measure: &(dyn Fn(&Path) -> Option<u64> + Sync),
 ) -> Cleanup {
     let policy = sweep.policy;
     let mut by_device: BTreeMap<u64, Vec<&BuildDir>> = BTreeMap::new();
@@ -805,7 +852,7 @@ fn free_space(
     }
     let mut out = Cleanup::default();
     for (_, mut candidates) in by_device {
-        let Some(free) = fsutil::free_space(&candidates[0].root) else {
+        let Some(free) = measure(&candidates[0].root) else {
             continue;
         };
         // A dry run hasn't freed what it reported; assume it would have.
@@ -826,29 +873,62 @@ fn free_space(
             !d.pinned
                 && sweep.now.duration_since(d.last_used).unwrap_or_default() >= policy.recent_guard
         });
-        let sizes = fsutil::parallel_map(&candidates, |d| fsutil::tree_size(&d.root));
-        let ordered = eviction_order(candidates.into_iter().zip(sizes).collect(), sweep.now);
-        for (dir, bytes) in ordered {
+        let usages = fsutil::parallel_map(&candidates, |d| fsutil::tree_usage(&d.root));
+        let allocated: BTreeMap<&Path, u64> = candidates
+            .iter()
+            .zip(&usages)
+            .map(|(d, u)| (d.root.as_path(), u.allocated))
+            .collect();
+        let freeable = usages.iter().map(|u| u.private.unwrap_or(u.allocated));
+        let ordered = eviction_order(candidates.into_iter().zip(freeable).collect(), sweep.now);
+        let mut stalled = 0;
+        for (dir, frees) in ordered {
             if free >= policy.target_free {
                 break;
             }
             let note = format!("unused for {}", fsutil::ago(dir.last_used));
-            if remove_build_dir(dir, Kind::LowSpace, note, Some(bytes), sweep, &mut out)
-                == Removal::Done
+            let bytes = allocated.get(dir.root.as_path()).copied();
+            if remove_build_dir(dir, Kind::LowSpace, note, bytes, sweep, &mut out) != Removal::Done
             {
-                free = if sweep.apply {
-                    dir.root
-                        .parent()
-                        .and_then(fsutil::free_space)
-                        .unwrap_or(free + bytes)
-                } else {
-                    free + bytes
-                };
+                continue;
+            }
+            if !sweep.apply {
+                free += frees;
+                continue;
+            }
+            let after = dir.root.parent().and_then(measure).unwrap_or(free + frees);
+            let gained = after.saturating_sub(free);
+            free = after;
+            if frees < STALL_FLOOR {
+                continue;
+            }
+            if gained >= frees / 4 {
+                stalled = 0;
+                continue;
+            }
+            stalled += 1;
+            if stalled >= 2 {
+                out.skipped.push(Skipped {
+                    kind: Kind::LowSpace,
+                    path: dir.root.parent().unwrap_or(&dir.root).to_path_buf(),
+                    reason: format!(
+                        "stopped: removing build directories isn't freeing space on this disk \
+                         (the last one freed {} of {}); Time Machine local snapshots or \
+                         clones may be holding it",
+                        human(gained),
+                        human(frees)
+                    ),
+                });
+                break;
             }
         }
     }
     out
 }
+
+/// Removals expected to free less than this aren't judged on whether free
+/// space rose: other writes to the disk move it as much.
+const STALL_FLOOR: u64 = 1 << 20;
 
 /// Orders build directories, with their sizes, for removal when space runs
 /// low: the bytes that cost least to rebuild and are least likely to be
@@ -1682,6 +1762,7 @@ mod tests {
             &BTreeSet::new(),
             &[],
             sweep(&policy, &running, false),
+            &fsutil::free_space,
         );
         assert!(cleanup.actions.is_empty());
     }
@@ -1707,7 +1788,13 @@ mod tests {
         // Already above the target: nothing is evicted.
         policy.target_free = 0;
         let running = Running::default();
-        let cleanup = free_space(&dirs, &BTreeSet::new(), &[], sweep(&policy, &running, true));
+        let cleanup = free_space(
+            &dirs,
+            &BTreeSet::new(),
+            &[],
+            sweep(&policy, &running, true),
+            &fsutil::free_space,
+        );
         assert!(cleanup.actions.is_empty(), "{:?}", cleanup.actions);
         assert!(dirs.iter().all(|d| d.root.exists()));
     }
@@ -1720,7 +1807,13 @@ mod tests {
         policy.min_free = u64::MAX / 2;
         policy.target_free = u64::MAX / 2;
         let running = Running::default();
-        let cleanup = free_space(&dirs, &BTreeSet::new(), &[], sweep(&policy, &running, true));
+        let cleanup = free_space(
+            &dirs,
+            &BTreeSet::new(),
+            &[],
+            sweep(&policy, &running, true),
+            &fsutil::free_space,
+        );
         // The disk never gets that free, so both go.
         assert_eq!(cleanup.actions.len(), 2, "{:?}", cleanup.actions);
         assert!(cleanup.actions.iter().all(|a| a.kind == Kind::LowSpace));
@@ -1805,5 +1898,173 @@ mod tests {
         let kinds: Vec<Kind> = run_clean(&dirs, true).iter().map(|a| a.kind).collect();
         assert_eq!(kinds, [Kind::IdleUnit]);
         assert!(!dead.exists());
+    }
+
+    #[test]
+    fn only_an_applied_cleanup_finishes_interrupted_removals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = build_dir(tmp.path(), "target");
+        make(&root.join("debug/.fingerprint/a-0123456789abcdef/lib-a"));
+        // Left by a cleanup that died (pid 0 is never a running cleanup).
+        let leftover = root.join(format!("{}deps-0-3", fsutil::TRASH_PREFIX));
+        make(&leftover.join("libx.rlib"));
+        let dirs = vec![BuildDir::inspect(&root, None)];
+        assert!(
+            dirs[0]
+                .profiles
+                .iter()
+                .all(|p| !p.path.starts_with(&leftover)),
+            "trash isn't a profile"
+        );
+        run_clean(&dirs, false);
+        assert!(leftover.exists(), "a preview changes nothing");
+        run_clean(&dirs, true);
+        assert!(!leftover.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_interrupted_removal_leaves_its_trash_where_cleanup_looks() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: plain syscall with no arguments.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // Permissions don't stop root.
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = build_dir(tmp.path(), "target");
+        make(&root.join("debug/.fingerprint/a-0123456789abcdef/lib-a"));
+        let cache = root.join("debug/incremental/old-1a2b");
+        let stuck = cache.join("s-abc/stuck");
+        make(&stuck.join("file"));
+        age(&cache, 30 * DAY);
+        // Deleting the cache fails partway, as when cleanup is interrupted.
+        fs::set_permissions(&stuck, fs::Permissions::from_mode(0o555)).unwrap();
+        let dirs = vec![BuildDir::inspect(&root, None)];
+        run_clean(&dirs, true);
+        let trash = |dir: &Path| -> Vec<PathBuf> {
+            fsutil::entries(dir)
+                .filter(|(n, _)| n.starts_with(fsutil::TRASH_PREFIX))
+                .map(|(_, p)| p)
+                .collect()
+        };
+        assert!(trash(&root.join("debug/incremental")).is_empty());
+        let left = trash(&root);
+        assert_eq!(left.len(), 1, "{left:?}");
+        for dir in [&left[0], &left[0].join("s-abc/stuck")] {
+            let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o755));
+        }
+        // The next cleanup finishes it.
+        run_clean(&[BuildDir::inspect(&root, None)], true);
+        assert!(trash(&root).is_empty());
+    }
+
+    #[test]
+    fn a_profile_a_build_started_after_inspection_keeps_the_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let idle = build_dir(tmp.path(), "idle");
+        make(&idle.join("debug/.fingerprint/a-0123456789abcdef/lib-a"));
+        age(&idle, 40 * DAY);
+        let dirs = vec![BuildDir::inspect(&idle, None)];
+        // `cargo build --release` starts once cleanup has looked.
+        fs::create_dir_all(idle.join("release")).unwrap();
+        let held = fsutil::lock_profile(&idle.join("release"));
+        assert!(matches!(held, Lock::Held(_)));
+        assert!(run_clean(&dirs, true).is_empty());
+        assert!(idle.join("release").exists());
+        drop(held);
+    }
+
+    /// Idle build directories holding `bytes` of unshared data each.
+    fn sized_dirs(parent: &Path, names: &[&str], bytes: usize) -> Vec<BuildDir> {
+        names
+            .iter()
+            .map(|name| {
+                let root = build_dir(parent, name);
+                make(&root.join("debug/.fingerprint/a-0123456789abcdef/lib-a"));
+                fs::create_dir_all(root.join("debug/deps")).unwrap();
+                fs::write(root.join("debug/deps/liba.rlib"), vec![1u8; bytes]).unwrap();
+                age(&root, 5 * DAY);
+                BuildDir::inspect(&root, None)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn low_space_eviction_stops_when_removals_free_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = sized_dirs(tmp.path(), &["a", "b", "c", "d"], 4 << 20);
+        let mut policy = policy();
+        policy.min_free = u64::MAX / 2;
+        policy.target_free = u64::MAX / 2;
+        let running = Running::default();
+        // Local snapshots keep what's deleted: free space never moves.
+        let stuck = |_: &Path| Some(1 << 30);
+        let cleanup = free_space(
+            &dirs,
+            &BTreeSet::new(),
+            &[],
+            sweep(&policy, &running, true),
+            &stuck,
+        );
+        assert_eq!(cleanup.actions.len(), 2, "{:?}", cleanup.actions);
+        assert_eq!(cleanup.skipped.len(), 1);
+        assert!(
+            cleanup.skipped[0].reason.contains("isn't freeing space"),
+            "{:?}",
+            cleanup.skipped
+        );
+        assert_eq!(dirs.iter().filter(|d| d.root.exists()).count(), 2);
+
+        // When each removal frees what it should, it goes on to the target.
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = sized_dirs(tmp.path(), &["a", "b", "c"], 4 << 20);
+        let parent = tmp.path().to_path_buf();
+        let freeing = move |_: &Path| {
+            let left = fsutil::entries(&parent).count() as u64;
+            Some((10 - left) << 22)
+        };
+        policy.target_free = 9 << 22;
+        let cleanup = free_space(
+            &dirs,
+            &BTreeSet::new(),
+            &[],
+            sweep(&policy, &running, true),
+            &freeing,
+        );
+        assert!(cleanup.skipped.is_empty(), "{:?}", cleanup.skipped);
+        assert_eq!(cleanup.actions.len(), 2);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn low_space_eviction_weighs_clones_by_what_removing_them_frees() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = sized_dirs(tmp.path(), &["main", "unique"], 8 << 20);
+        let main = tmp.path().join("main");
+        let seeded = tmp.path().join("seeded");
+        if crate::seed::clone::clone_tree(&main, &seeded).ok()
+            != Some(crate::seed::clone::Cloned::Done)
+        {
+            return; // Not APFS.
+        }
+        fs::File::open(main.join("debug/deps/liba.rlib"))
+            .unwrap()
+            .sync_all()
+            .unwrap();
+        let mut dirs = dirs;
+        dirs.push(BuildDir::inspect(&seeded, None));
+        let mut policy = policy();
+        policy.min_free = u64::MAX / 2;
+        policy.target_free = u64::MAX / 2;
+        let running = Running::default();
+        let cleanup = clean(&dirs, sweep(&policy, &running, false));
+        let order: Vec<PathBuf> = cleanup
+            .actions
+            .iter()
+            .filter(|a| a.kind == Kind::LowSpace)
+            .map(|a| a.path.clone())
+            .collect();
+        // `du` counts the clones in full; only the unique one frees its size.
+        assert_eq!(order.first(), Some(&tmp.path().join("unique")), "{order:?}");
     }
 }

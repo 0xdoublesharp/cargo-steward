@@ -270,6 +270,13 @@ pub const TRASH_PREFIX: &str = ".steward-trash-";
 /// Removes a file or directory tree. A directory is first renamed aside, so
 /// nothing ever sees it half deleted; a missing path is not an error.
 pub fn remove(path: &Path) -> io::Result<()> {
+    remove_into(path, path.parent().unwrap_or(path))
+}
+
+/// [`remove`], renaming a directory aside into `trash_dir` (on the same
+/// volume) rather than next to it, so that what an interrupted removal
+/// leaves is where [`sweep_trash`] looks.
+pub fn remove_into(path: &Path, trash_dir: &Path) -> io::Result<()> {
     let meta = match fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -286,7 +293,7 @@ pub fn remove(path: &Path) -> io::Result<()> {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let trash = path.with_file_name(format!(
+    let trash = trash_dir.join(format!(
         "{TRASH_PREFIX}{name}-{}-{}",
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
@@ -297,12 +304,45 @@ pub fn remove(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Finishes deletions that an interrupted cleanup left renamed aside in `dir`.
+/// Finishes deletions that an interrupted cleanup left renamed aside in
+/// `dir`. Trash another running process is still deleting is left to it.
 pub fn sweep_trash(dir: &Path) {
     for (name, path) in entries(dir) {
-        if name.starts_with(TRASH_PREFIX) {
+        if name.starts_with(TRASH_PREFIX) && !owner_running(&name) {
             let _ = fs::remove_dir_all(&path);
         }
+    }
+}
+
+/// Whether the process named in trash `...-<pid>-<n>` is another one that
+/// is still running.
+fn owner_running(name: &str) -> bool {
+    let mut parts = name.rsplitn(3, '-');
+    let (Some(_), Some(pid)) = (parts.next(), parts.next()) else {
+        return false;
+    };
+    pid.parse::<u32>()
+        .is_ok_and(|pid| pid != std::process::id() && process_alive(pid))
+}
+
+/// Whether a process with this ID exists.
+pub fn process_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
+        if pid <= 0 {
+            return false;
+        }
+        // SAFETY: signal 0 sends nothing; it only checks the process exists.
+        let rc = unsafe { libc::kill(pid, 0) };
+        rc == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
     }
 }
 
@@ -576,12 +616,55 @@ mod tests {
     #[test]
     fn sweep_trash_finishes_interrupted_removals_only() {
         let tmp = tempfile::tempdir().unwrap();
-        let trash = tmp.path().join(format!("{TRASH_PREFIX}old-1-0"));
+        let trash = tmp.path().join(format!("{TRASH_PREFIX}old-0-0"));
         fs::create_dir_all(trash.join("deep")).unwrap();
         fs::write(trash.join("deep/file"), "x").unwrap();
         fs::create_dir(tmp.path().join("kept")).unwrap();
         sweep_trash(tmp.path());
         assert!(!trash.exists());
         assert!(tmp.path().join("kept").exists());
+    }
+
+    #[test]
+    fn sweeping_leaves_trash_a_running_process_is_deleting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut live = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let mut dead = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = dead.id();
+        dead.wait().unwrap();
+        let named = |pid: u32| tmp.path().join(format!("{TRASH_PREFIX}deps-{pid}-0"));
+        for pid in [live.id(), dead_pid, std::process::id()] {
+            fs::create_dir_all(named(pid).join("x")).unwrap();
+        }
+        fs::create_dir_all(tmp.path().join("deps")).unwrap();
+        sweep_trash(tmp.path());
+        let _ = live.kill();
+        let _ = live.wait();
+        let mut left: Vec<String> = entries(tmp.path()).map(|(n, _)| n).collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                format!("{TRASH_PREFIX}deps-{}-0", live.id()),
+                "deps".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn removes_into_another_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let victim = tmp.path().join("a/b/victim");
+        fs::create_dir_all(victim.join("c")).unwrap();
+        remove_into(&victim, tmp.path()).unwrap();
+        assert!(!victim.exists());
+        assert_eq!(entries(&tmp.path().join("a/b")).count(), 0);
+        let file = tmp.path().join("a/file");
+        fs::write(&file, "x").unwrap();
+        remove_into(&file, tmp.path()).unwrap();
+        assert!(!file.exists());
     }
 }
