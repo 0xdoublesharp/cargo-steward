@@ -22,8 +22,10 @@ slow down.
   wrapper kept behind it), and starts its cleanup in the background after
   builds. There is no daemon, no cron job and no launchd agent.
 - **Checks your setup**: `cargo steward doctor` reports toolchains and pins in
-  the leak window, configs that bypass the wrapper, and on macOS, scratch
-  volumes that Time Machine backs up or Spotlight indexes.
+  the leak window, toolchains no project uses, configs that bypass the
+  wrapper, split sccache caches, full debug info in dev profiles,
+  rust-analyzer's extra target directory, and on macOS, build output that
+  Time Machine backs up or Spotlight indexes.
 
 Cargo's own answers are coming ([build-dir cleanup][rust-lang/cargo#5026],
 [whole-directory cleanup][rust-lang/cargo#13136], [cross-workspace
@@ -32,10 +34,29 @@ meant to step aside as each one does.
 
 ## Install
 
+On macOS or Linux, from a checkout (needs Rust 1.89 or newer):
+
 ```sh
-cargo install --path .            # from a checkout
+git clone <repository URL> cargo-steward
+cargo-steward/scripts/install.sh
+```
+
+The script runs `cargo install --locked --path` on the checkout, then
+`cargo steward setup` and `cargo steward doctor`. It can also install from
+git (`--git URL`) or a prebuilt release binary (`--release VERSION --repo
+OWNER/NAME`, checksum verified). Options it doesn't know go to `setup`, such
+as `--scan-root DIR`. [docs/install.md](docs/install.md) covers each way,
+first-time setup, upgrading and uninstalling.
+
+## Quick start
+
+The install script runs the first two of these for you.
+
+```sh
 cargo steward setup               # become Cargo's rustc-wrapper; turn on automatic cleanup
-cargo steward doctor              # check everything
+cargo steward doctor              # check everything; it says what to change
+cargo steward status --sizes      # the build directories it manages
+cargo steward gc                  # preview a cleanup (`--apply` to run one now)
 ```
 
 `setup` edits `~/.cargo/config.toml` (keeping its comments, and a backup next
@@ -44,24 +65,39 @@ there, such as `sccache`, becomes cargo-steward's inner wrapper. Undo it with
 `cargo steward setup --undo`.
 
 Build directories are found two ways: those the wrapper sees as you build, and
-any under a scan root. Point it at wherever build output lives:
+any under a scan root. On its first run, `setup` adds where build output
+already goes (the parent of `CARGO_TARGET_DIR`, the root of `build.build-dir`
+or `build.target-dir`, and other volumes holding recorded build directories)
+and prints what it added. Add more with:
 
 ```sh
 cargo steward setup --scan-root /Volumes/Scratch
 ```
 
-Requires Rust 1.89 or newer to build; macOS and Linux.
+On macOS, `cargo steward setup --volume Scratch` creates a separate APFS
+volume for build output; see [Build volume](#build-volume-macos).
 
 ## Commands
 
 ```sh
+cargo steward setup [--scan-root DIR] [--build-dir DIR] [--volume NAME] [--undo] [--dry-run]
+cargo steward doctor              # check the setup and report what to change
 cargo steward status [--sizes]    # build directories, when each was last used, layout, size
 cargo steward gc                  # what a cleanup would remove, by kind
 cargo steward gc --apply [-v]     # remove it now
 cargo steward pin <dir>           # never clean this build directory (except stale objects)
 cargo steward unpin <dir>
-cargo steward doctor
 ```
+
+Warm starts, CI and the cargo proxy:
+
+| Command | What it does | Docs |
+|---|---|---|
+| `cargo steward seed` | Starts a new worktree's build directory as a copy-on-write clone of its main one | [warm-start.md](docs/warm-start.md) |
+| `cargo steward hooks` | Installs or removes the git hooks that seed new worktrees | [warm-start.md](docs/warm-start.md) |
+| `cargo steward dedup` | Replaces identical files across build directories with clones | [warm-start.md](docs/warm-start.md) |
+| `cargo steward ci` | Trims build output to what a CI job used, within a budget | [ci.md](docs/ci.md) |
+| `cargo steward shim` | Installs or removes the `cargo` proxy, which routes each worktree's build output and limits concurrent builds | [proxy.md](docs/proxy.md) |
 
 ## What gets removed
 
@@ -111,6 +147,16 @@ orphan-grace = "2d"
 recent-guard = "1d"
 min-free = "50GiB"
 target-free = "100GiB"
+object-grace = "10m"          # keep replaced object files this long, so running binaries keep backtraces
+process-guard = true          # don't remove a build directory a running process was started from
+seed = true                   # start new worktrees' build directories as clones (`seed`)
+dedup = true                  # let cleanup replace identical files with clones (`dedup`)
+
+# For the cargo proxy (`cargo steward shim`); unset by default:
+# target-root = "/Volumes/Scratch/cargo"   # each worktree's target dir goes under this
+# tmp-root = "/Volumes/Scratch/tmp"        # and its TMPDIR for builds under this
+# max-builds = 4                           # at most this many cargo builds at once
+# real-cargo = "/path/to/cargo"            # the cargo to run; found on PATH if unset
 ```
 
 `CARGO_STEWARD_INNER` overrides `inner-wrapper` (empty for none).
@@ -145,14 +191,15 @@ APFS volume in the same container shares free space with the system disk and
 avoids both. It needs no repartitioning:
 
 ```sh
-diskutil apfs addVolume disk3 APFS Scratch        # `diskutil list` shows your container
-sudo mdutil -i off /Volumes/Scratch               # no Spotlight
-sudo tmutil addexclusion -v /Volumes/Scratch      # no Time Machine
-cargo steward setup --scan-root /Volumes/Scratch
+cargo steward setup --volume Scratch   # creates /Volumes/Scratch and adds it as a scan root
+sudo mdutil -i off /Volumes/Scratch            # no Spotlight (setup prints these two)
+sudo tmutil addexclusion -v /Volumes/Scratch   # no Time Machine
 ```
 
-Then send build output there, either with `CARGO_TARGET_DIR`, or for every
-workspace at once:
+`--volume` runs `diskutil apfs addVolume` on the system disk's container,
+reuses the volume if it already exists, and with `--dry-run` only prints the
+plan. Then send build output there, either with `CARGO_TARGET_DIR`, or for
+every workspace at once:
 
 ```sh
 cargo steward setup --build-dir /Volumes/Scratch/cargo-build
@@ -161,6 +208,11 @@ cargo steward setup --build-dir /Volumes/Scratch/cargo-build
 which sets `build.build-dir = "/Volumes/Scratch/cargo-build/{workspace-path-hash}"`:
 one intermediate build directory per worktree, in one place, which IDEs and
 rust-analyzer follow too.
+
+Build directories that stay on the system disk should at least be out of
+Time Machine. Cargo excludes target directories it creates, but not ones a
+script created first; `doctor` lists those, with the `tmutil addexclusion`
+command for each.
 
 ## CI
 
@@ -173,12 +225,16 @@ export RUSTC_WRAPPER=cargo-steward CARGO_STEWARD_INNER=sccache   # env outranks 
 cargo steward gc --apply                                         # e.g. as a nightly job
 ```
 
+`cargo steward ci` trims a job's build output to what it used; see
+[docs/ci.md](docs/ci.md).
+
 ## Development
 
 ```sh
 cargo test                     # unit and end-to-end tests (real cargo builds)
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
+shellcheck scripts/install.sh
 ```
 
 The end-to-end tests build with the cargo running them. To check another

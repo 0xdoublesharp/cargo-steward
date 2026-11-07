@@ -1,16 +1,28 @@
 //! `cargo steward doctor`: checks the setup and reports what to change.
+//!
+//! The slow parts (external commands such as `rustup`, `sccache` and
+//! `tmutil`, and measuring toolchains) run in parallel threads while the
+//! local checks run; the report is printed in a fixed order once they finish.
+
+mod backup;
+mod binary;
+mod cmd;
+mod editors;
+mod profile;
+mod sccache;
+mod toolchains;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::thread;
 
 use anyhow::{Context, Result};
 
 use crate::config::{self, Paths};
 use crate::fsutil::{self, human};
-use crate::{gc, wrapper};
+use crate::{ledger, scan, wrapper};
 
 #[derive(Clone, Copy)]
 enum Level {
@@ -34,48 +46,120 @@ fn say(level: Level, message: impl AsRef<str>) {
     }
 }
 
+/// How deep under a scan root build directories are searched for, as
+/// cleanup does.
+const SCAN_DEPTH: usize = 6;
+
+/// A finished thread's result, or the default if it panicked.
+fn joined<T: Default>(handle: thread::ScopedJoinHandle<'_, T>) -> T {
+    handle.join().unwrap_or_default()
+}
+
 pub fn run() -> Result<()> {
     let paths = Paths::resolve().context("cannot locate the home directory")?;
     let settings = config::load(&paths)?;
     let policy = settings.policy()?;
+    let configured = configured_wrapper();
+    let home = env::var_os("HOME").map(PathBuf::from);
 
-    println!("Wrapper");
-    check_wrapper(&settings);
+    thread::scope(|s| -> Result<()> {
+        let toolchain_probe = s.spawn(toolchains::probe);
+        let sccache_probe = s.spawn(sccache::probe);
+        let binary_probe = s.spawn(|| binary::probe(configured.as_deref()));
+        let root_probe = s.spawn(|| backup::probe_roots(&settings.scan_roots));
 
-    println!("\nToolchains");
-    check_toolchains();
+        let registry = ledger::compact(&paths)?;
+        // Build directories on the system disk share it with Time Machine's
+        // local snapshots, which keep deleted files around for about a day.
+        let home_device = home.as_deref().and_then(fsutil::device);
+        let on_home = system_disk_build_dirs(&registry, &settings.scan_roots, home_device);
+        let tm_probe = {
+            let dirs = on_home.clone();
+            s.spawn(move || backup::isexcluded(&dirs))
+        };
 
-    println!("\nProjects");
-    let (registry, dirs) = gc::inventory(&paths, &settings.scan_roots)?;
-    let workspaces: BTreeSet<PathBuf> = registry
-        .roots
-        .values()
-        .flat_map(|info| info.workspaces.iter().cloned())
-        .filter(|w| w.exists())
-        .collect();
-    check_projects(&workspaces);
+        let packages: BTreeSet<PathBuf> = registry
+            .roots
+            .values()
+            .flat_map(|info| info.workspaces.iter().cloned())
+            .filter(|w| w.exists())
+            .collect();
+        let workspace_roots = profile::workspace_roots(&packages);
+        let pins = toolchain_pins(&packages);
 
-    println!("\nDisks");
-    check_disks(&settings.scan_roots, &dirs, &settings, &policy);
+        println!("Wrapper");
+        binary::report(&joined(binary_probe));
+        check_wrapper(&settings, configured.as_deref());
 
-    println!("\nCleanup");
-    check_cleanup(&paths, &settings);
-    Ok(())
+        println!("\nToolchains");
+        toolchains::report(
+            joined(toolchain_probe).as_ref(),
+            &pins,
+            workspace_roots.len(),
+        );
+
+        println!("\nProjects");
+        check_projects(&packages, &pins);
+        profile::report(&workspace_roots);
+
+        println!("\nCompiler cache");
+        sccache::report(&joined(sccache_probe), &packages);
+
+        println!("\nEditors");
+        editors::report(home.as_deref(), &workspace_roots);
+
+        println!("\nDisks");
+        check_disks(
+            &settings.scan_roots,
+            &settings,
+            &policy,
+            &joined(root_probe),
+        );
+        backup::report_build_dirs(on_home.len(), &joined(tm_probe));
+
+        println!("\nCleanup");
+        check_cleanup(&paths, &settings);
+        Ok(())
+    })
 }
 
-fn check_wrapper(settings: &config::Config) {
-    let cargo_home = config::cargo_home();
-    let configured = cargo_home
-        .as_ref()
-        .and_then(|home| fs::read_to_string(home.join("config.toml")).ok())
-        .and_then(|text| text.parse::<toml_edit::DocumentMut>().ok())
-        .and_then(|doc| {
-            doc.get("build")?
-                .get("rustc-wrapper")?
-                .as_str()
-                .map(str::to_owned)
-        });
-    match &configured {
+/// Build directories on the device `home_device`: recorded ones, and any
+/// under scan roots on that device. Unlike [`crate::gc::inventory`] this neither
+/// searches scan roots on other volumes nor inspects each directory's
+/// contents, which on a big scratch volume takes a minute.
+fn system_disk_build_dirs(
+    registry: &ledger::Registry,
+    scan_roots: &[PathBuf],
+    home_device: Option<u64>,
+) -> Vec<PathBuf> {
+    let Some(home_device) = home_device else {
+        return Vec::new();
+    };
+    let on_home = |p: &Path| fsutil::device(p) == Some(home_device);
+    let mut roots: Vec<PathBuf> = registry
+        .roots
+        .keys()
+        .filter_map(|r| scan::find_root(r))
+        .filter(|r| on_home(r))
+        .collect();
+    let local_roots: Vec<PathBuf> = scan_roots.iter().filter(|r| on_home(r)).cloned().collect();
+    roots.extend(scan::discover(&local_roots, SCAN_DEPTH));
+    scan::outermost(roots)
+}
+
+/// `build.rustc-wrapper` in the user-wide Cargo config.
+fn configured_wrapper() -> Option<String> {
+    let home = config::cargo_home()?;
+    let text = fs::read_to_string(home.join("config.toml")).ok()?;
+    let doc = text.parse::<toml_edit::DocumentMut>().ok()?;
+    doc.get("build")?
+        .get("rustc-wrapper")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+fn check_wrapper(settings: &config::Config, configured: Option<&str>) {
+    match configured {
         Some(w) if w.contains("cargo-steward") => say(
             Level::Ok,
             format!("Cargo's rustc-wrapper is cargo-steward ({w})"),
@@ -130,91 +214,21 @@ fn check_wrapper(settings: &config::Config) {
     }
 }
 
-/// A toolchain's rustc version: minor version, channel, and commit date.
-#[derive(Debug, Clone, PartialEq)]
-struct RustcVersion {
-    minor: u32,
-    nightly: bool,
-    date: Option<String>,
-}
-
-impl RustcVersion {
-    /// Parses `rustc 1.101.0-nightly (c980177d8 2026-11-06)`.
-    fn parse(text: &str) -> Option<RustcVersion> {
-        let version = text.split_whitespace().nth(1)?;
-        let minor = version.split('.').nth(1)?.parse().ok()?;
-        let date = text
-            .rsplit(' ')
-            .next()
-            .map(|d| d.trim_end_matches(')').to_owned())
-            .filter(|d| d.len() == 10 && d.as_bytes()[4] == b'-');
-        Some(RustcVersion {
-            minor,
-            nightly: version.contains("nightly") || version.contains("dev"),
-            date,
-        })
-    }
-
-    /// Whether this toolchain leaves stale object files behind on its own.
-    /// The leak arrived in 1.88; Cargo 1.101 removes each unit's previous
-    /// output before compiling it (rust-lang/cargo#17675, merged 2026-11-03).
-    fn leaks(&self) -> bool {
-        match self.minor {
-            ..88 => false,
-            88..=100 => true,
-            101 if self.nightly => self.date.as_deref().is_none_or(|d| d < "2026-11-04"),
-            _ => false,
+/// The toolchain each recorded package's project pins, and the projects
+/// pinning it.
+fn toolchain_pins(packages: &BTreeSet<PathBuf>) -> BTreeMap<String, BTreeSet<PathBuf>> {
+    let mut pins: BTreeMap<String, BTreeSet<PathBuf>> = BTreeMap::new();
+    for package in packages {
+        if let Some((file, channel)) = toolchain_pin(package) {
+            pins.entry(channel)
+                .or_default()
+                .insert(file.parent().unwrap_or(&file).to_path_buf());
         }
     }
+    pins
 }
 
-fn rustc_version(toolchain: &str) -> Option<RustcVersion> {
-    let output = Command::new("rustup")
-        .args(["run", toolchain, "rustc", "-V"])
-        .output()
-        .ok()?;
-    RustcVersion::parse(String::from_utf8_lossy(&output.stdout).trim())
-}
-
-fn check_toolchains() {
-    let Ok(output) = Command::new("rustup").args(["toolchain", "list"]).output() else {
-        say(
-            Level::Info,
-            "rustup isn't installed; skipping the toolchain check",
-        );
-        return;
-    };
-    let names: Vec<String> = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|l| l.split_whitespace().next().map(str::to_owned))
-        .collect();
-    let mut leaking = Vec::new();
-    let mut fixed = Vec::new();
-    for name in &names {
-        match rustc_version(name) {
-            Some(v) if v.leaks() => leaking.push(name.clone()),
-            Some(_) => fixed.push(name.clone()),
-            None => {}
-        }
-    }
-    if !leaking.is_empty() {
-        say(
-            Level::Info,
-            format!(
-                "{} of {} installed toolchains leave stale object files behind (Rust 1.88 to 1.100):\n{}\n\
-                 cargo-steward's wrapper removes them as builds run.",
-                leaking.len(),
-                names.len(),
-                leaking.join(", ")
-            ),
-        );
-    }
-    if !fixed.is_empty() {
-        say(Level::Ok, format!("Not affected: {}", fixed.join(", ")));
-    }
-}
-
-fn check_projects(workspaces: &BTreeSet<PathBuf>) {
+fn check_projects(workspaces: &BTreeSet<PathBuf>, pins: &BTreeMap<String, BTreeSet<PathBuf>>) {
     if workspaces.is_empty() {
         say(
             Level::Info,
@@ -222,19 +236,11 @@ fn check_projects(workspaces: &BTreeSet<PathBuf>) {
         );
         return;
     }
-    let mut pins: BTreeMap<String, BTreeSet<PathBuf>> = BTreeMap::new();
-    let mut bypass: BTreeSet<PathBuf> = BTreeSet::new();
-    for workspace in workspaces {
-        if let Some((file, channel)) = toolchain_pin(workspace) {
-            pins.entry(channel)
-                .or_default()
-                .insert(file.parent().unwrap_or(&file).to_path_buf());
-        }
-        if let Some(config) = wrapper_override(workspace) {
-            bypass.insert(config);
-        }
-    }
-    for (channel, projects) in &pins {
+    let bypass: BTreeSet<PathBuf> = workspaces
+        .iter()
+        .filter_map(|w| wrapper_override(w))
+        .collect();
+    for (channel, projects) in pins {
         let leaks = channel
             .strip_prefix("1.")
             .and_then(|rest| rest.split('.').next())
@@ -328,9 +334,9 @@ fn wrapper_override(dir: &Path) -> Option<PathBuf> {
 
 fn check_disks(
     scan_roots: &[PathBuf],
-    dirs: &[gc::BuildDir],
     settings: &config::Config,
     policy: &config::Policy,
+    statuses: &[backup::RootStatus],
 ) {
     if scan_roots.is_empty() {
         say(
@@ -365,65 +371,8 @@ fn check_disks(
                 settings.min_free
             ),
         );
-        macos_checks(root);
-    }
-    // Build directories on the system disk share it with Time Machine's local
-    // snapshots, which keep deleted files around for about a day.
-    let home_device = env::var_os("HOME").and_then(|h| fsutil::device(Path::new(&h)));
-    let on_home: Vec<&gc::BuildDir> = dirs
-        .iter()
-        .filter(|d| d.device.is_some() && d.device == home_device)
-        .collect();
-    if !on_home.is_empty() && cfg!(target_os = "macos") {
-        say(
-            Level::Info,
-            format!(
-                "{} build directories are on the system disk, where local snapshots keep deleted files\n\
-                 for about a day. A separate APFS volume avoids that: see `README.md`, \"Build volume\".",
-                on_home.len()
-            ),
-        );
-    }
-}
-
-fn macos_checks(root: &Path) {
-    if !cfg!(target_os = "macos") {
-        return;
-    }
-    if let Ok(output) = Command::new("tmutil").arg("isexcluded").arg(root).output() {
-        let text = String::from_utf8_lossy(&output.stdout);
-        if text.contains("[Excluded]") {
-            say(
-                Level::Ok,
-                format!("{} is excluded from Time Machine", root.display()),
-            );
-        } else if text.contains("[Included]") {
-            say(
-                Level::Warn,
-                format!(
-                    "{} is backed up by Time Machine.\nFix: tmutil addexclusion {}",
-                    root.display(),
-                    root.display()
-                ),
-            );
-        }
-    }
-    if let Ok(output) = Command::new("mdutil").arg("-s").arg(root).output() {
-        let text = String::from_utf8_lossy(&output.stdout);
-        if text.contains("Indexing enabled") {
-            say(
-                Level::Warn,
-                format!(
-                    "Spotlight indexes {}, which costs CPU on every build.\nFix (volume roots): sudo mdutil -i off {}",
-                    root.display(),
-                    root.display()
-                ),
-            );
-        } else if text.contains("disabled") {
-            say(
-                Level::Ok,
-                format!("Spotlight doesn't index {}", root.display()),
-            );
+        if let Some(status) = statuses.iter().find(|s| &s.root == root) {
+            backup::report_root(status);
         }
     }
 }
@@ -462,18 +411,6 @@ fn check_cleanup(paths: &Paths, settings: &config::Config) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn knows_which_toolchains_leak() {
-        let v = |s: &str| RustcVersion::parse(s).unwrap();
-        assert!(!v("rustc 1.87.0 (17067e9ac 2025-05-09)").leaks());
-        assert!(v("rustc 1.95.0 (59807616e 2026-04-14)").leaks());
-        assert!(v("rustc 1.100.0-beta.12 (b0aaa0fca 2026-11-06)").leaks());
-        assert!(v("rustc 1.101.0-nightly (1a2b3c4d5 2026-10-30)").leaks());
-        assert!(!v("rustc 1.101.0-nightly (c980177d8 2026-11-06)").leaks());
-        assert!(!v("rustc 1.101.0 (aaaaaaaaa 2026-12-20)").leaks());
-        assert!(!v("rustc 1.102.0-nightly (bbbbbbbbb 2026-11-20)").leaks());
-    }
 
     #[test]
     fn finds_toolchain_pins_and_wrapper_overrides() {
