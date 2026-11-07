@@ -73,6 +73,22 @@ impl Fixture {
         );
         text
     }
+
+    /// Runs cargo-steward expecting it to fail; returns its output.
+    fn steward_fails(&self, args: &[&str]) -> String {
+        let out = Command::new(BIN)
+            .args(args)
+            .env("CARGO_STEWARD_HOME", &self.home)
+            .env_remove("CARGO")
+            .output()
+            .unwrap();
+        let text = text(&out);
+        assert!(
+            !out.status.success(),
+            "cargo-steward {args:?} succeeded:\n{text}"
+        );
+        text
+    }
 }
 
 fn text(out: &Output) -> String {
@@ -200,6 +216,120 @@ fn status_shows_both_sizes() {
         .find(|l| l.contains(&*dir.to_string_lossy()))
         .unwrap_or_else(|| panic!("{status}"));
     assert!(row.contains("MiB"), "{row}");
+}
+
+#[test]
+fn gc_preview_hint_names_gc() {
+    let fx = Fixture::new("");
+    fx.build_dir("old", 40 * DAY);
+    let preview = fx.steward(&["gc"]);
+    assert!(
+        preview.contains("Run `cargo steward gc --apply`"),
+        "{preview}"
+    );
+}
+
+#[test]
+fn remove_preview_hint_names_remove_and_keeps_the_dir() {
+    let fx = Fixture::new("");
+    let dir = fx.build_dir("target", Duration::ZERO);
+    let preview = fx.steward(&["remove", dir.to_str().unwrap()]);
+    assert!(dir.exists(), "{preview}");
+    assert!(
+        preview.contains("Run `cargo steward remove --apply`"),
+        "{preview}"
+    );
+    assert!(!preview.contains("steward gc --apply"), "{preview}");
+}
+
+#[test]
+fn remove_skips_non_build_dirs_and_removes_the_rest() {
+    let fx = Fixture::new("");
+    let dir = fx.build_dir("target", Duration::ZERO);
+    let other = fx.root.join("src");
+    fs::create_dir_all(&other).unwrap();
+    fs::write(other.join("lib.rs"), "").unwrap();
+
+    let applied = fx.steward(&[
+        "remove",
+        "--apply",
+        other.to_str().unwrap(),
+        dir.to_str().unwrap(),
+    ]);
+    assert!(!dir.exists(), "{applied}");
+    assert!(other.join("lib.rs").exists(), "{applied}");
+    assert!(
+        applied.contains(&format!("refusing to remove {}", other.display())),
+        "{applied}"
+    );
+}
+
+#[test]
+fn remove_fails_when_nothing_is_a_build_dir() {
+    let fx = Fixture::new("");
+    let a = fx.root.join("a");
+    let b = fx.root.join("b");
+    fs::create_dir_all(&a).unwrap();
+    fs::create_dir_all(&b).unwrap();
+    let out = fx.steward_fails(&[
+        "remove",
+        "--apply",
+        a.to_str().unwrap(),
+        b.to_str().unwrap(),
+    ]);
+    assert!(a.exists() && b.exists(), "{out}");
+    assert!(out.contains("nothing to remove"), "{out}");
+    assert!(
+        out.contains(&format!("refusing to remove {}", a.display())),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!("refusing to remove {}", b.display())),
+        "{out}"
+    );
+}
+
+#[test]
+fn remove_skips_a_missing_path_and_removes_the_rest() {
+    let fx = Fixture::new("");
+    let dir = fx.build_dir("target", Duration::ZERO);
+    let missing = fx.root.join("missing");
+    let applied = fx.steward(&[
+        "remove",
+        "--apply",
+        dir.to_str().unwrap(),
+        missing.to_str().unwrap(),
+    ]);
+    assert!(!dir.exists(), "{applied}");
+    assert!(
+        applied.contains(&format!(
+            "refusing to remove {}: it doesn't exist",
+            missing.display()
+        )),
+        "{applied}"
+    );
+}
+
+#[test]
+fn remove_fails_when_every_path_is_missing() {
+    let fx = Fixture::new("");
+    let missing = fx.root.join("missing");
+    let out = fx.steward_fails(&["remove", "--apply", missing.to_str().unwrap()]);
+    assert!(out.contains("nothing to remove"), "{out}");
+}
+
+#[test]
+fn remove_keeps_pinned_dirs_unless_forced() {
+    let fx = Fixture::new("");
+    let dir = fx.build_dir("target", Duration::ZERO);
+    fx.steward(&["pin", dir.to_str().unwrap()]);
+
+    let applied = fx.steward(&["remove", "--apply", dir.to_str().unwrap()]);
+    assert!(dir.exists(), "{applied}");
+    assert!(applied.contains("pinned"), "{applied}");
+
+    let forced = fx.steward(&["remove", "--apply", "--force", dir.to_str().unwrap()]);
+    assert!(!dir.exists(), "{forced}");
 }
 
 /// A binary crate with a few modules, built through the wrapper.
