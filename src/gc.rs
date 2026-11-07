@@ -613,16 +613,14 @@ pub fn remove_requested(roots: &[PathBuf], apply: bool, force: bool) -> Result<(
         apply,
     };
     let mut out = Cleanup::default();
+    let mut refused: Vec<PathBuf> = Vec::new();
     for root in roots {
         let root = root
             .canonicalize()
             .with_context(|| format!("{} doesn't exist", root.display()))?;
         if !scan::is_cargo_root(&root) {
-            anyhow::bail!(
-                "{} isn't the root of a cargo build directory (no .rustc_info.json or cargo \
-                 CACHEDIR.TAG with build profiles); refusing to remove it",
-                root.display()
-            );
+            refused.push(root);
+            continue;
         }
         let dir = BuildDir::inspect(&root, registry.roots.get(&root));
         if dir.pinned && !force {
@@ -648,6 +646,16 @@ pub fn remove_requested(roots: &[PathBuf], apply: bool, force: bool) -> Result<(
     }
     if apply {
         ledger::save(&paths, &registry)?;
+    }
+    for path in &refused {
+        eprintln!(
+            "refusing to remove {}: not the root of a cargo build directory \
+             (no .rustc_info.json, or cargo CACHEDIR.TAG with build profiles)",
+            path.display()
+        );
+    }
+    if refused.len() == roots.len() {
+        anyhow::bail!("nothing to remove");
     }
     report(
         &out,
