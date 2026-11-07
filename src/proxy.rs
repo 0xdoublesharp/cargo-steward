@@ -201,6 +201,8 @@ pub struct Plan {
     pub slots: String,
     /// The route that applies, if any.
     pub route: Option<PathBuf>,
+    /// Point a missing `<workspace>/target` at the routed directory.
+    pub link_target: bool,
 }
 
 impl Plan {
@@ -225,6 +227,7 @@ impl Plan {
                 max_builds: effective.max_builds,
                 slots: effective.slots,
                 route: effective.route,
+                link_target: false,
             });
         }
         let namespace = Namespace::of(&dir);
@@ -273,6 +276,7 @@ impl Plan {
             seed_from,
             max_builds: effective.max_builds,
             slots: effective.slots,
+            link_target: config.link_target && !effective.force,
             route: effective.route,
         })
     }
@@ -329,11 +333,63 @@ fn route_env(plan: &Plan, me: Option<&Path>) -> Result<Vec<(OsString, OsString)>
         {
             seed(me, target, from, worktree);
         }
+        if plan.link_target {
+            link_workspace_target(&plan.dir, target, plan.namespace.git.is_some());
+        }
     }
     if let Some(tmp) = &plan.tmp {
         fs::create_dir_all(tmp)?;
     }
     Ok(plan.vars())
+}
+
+/// Points a workspace's missing `target` at its routed directory, so
+/// `./target/...` paths in scripts, and builds that don't go through the
+/// proxy (Cargo's default target dir is `<workspace>/target`), reach it too.
+/// Never replaces anything, and inside git only where git ignores `target`,
+/// so the link can't end up committed. Best effort.
+fn link_workspace_target(dir: &Path, target: &Path, in_git: bool) {
+    let Some(workspace) = workspace_root(dir) else {
+        return;
+    };
+    let link = workspace.join("target");
+    if fs::symlink_metadata(&link).is_ok() {
+        return;
+    }
+    if in_git && !git_ignores(&workspace, "target") {
+        return;
+    }
+    #[cfg(unix)]
+    let _ = std::os::unix::fs::symlink(target, &link);
+}
+
+/// The workspace root for a command run in `dir`, without running cargo:
+/// the nearest ancestor whose `Cargo.toml` has a `[workspace]` table, else
+/// the nearest one with a `Cargo.toml`.
+fn workspace_root(dir: &Path) -> Option<PathBuf> {
+    let mut nearest = None;
+    for ancestor in dir.ancestors() {
+        let Ok(text) = fs::read_to_string(ancestor.join("Cargo.toml")) else {
+            continue;
+        };
+        if text.lines().any(|l| l.trim() == "[workspace]") {
+            return Some(ancestor.to_path_buf());
+        }
+        nearest.get_or_insert_with(|| ancestor.to_path_buf());
+    }
+    nearest
+}
+
+/// Whether git ignores `name` in `dir`.
+fn git_ignores(dir: &Path, name: &str) -> bool {
+    Command::new("git")
+        .args(["check-ignore", "-q", name])
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 /// Missing, or a directory with nothing in it.
@@ -390,6 +446,7 @@ mod tests {
             max_builds: None,
             slots: String::new(),
             route: None,
+            link_target: false,
         };
         let vars = plan.vars();
         let get = |k: &str| {
@@ -527,6 +584,58 @@ mod tests {
         // The command line still wins.
         let args = [OsString::from("build"), OsString::from("--target-dir=x")];
         assert!(Plan::new(&forced, &repo, &args).unwrap().skip.is_some());
+    }
+
+    #[test]
+    fn links_an_ignored_missing_target_to_the_routed_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let crate_at = |dir: &Path, ignore: Option<&str>| {
+            std::fs::create_dir_all(dir.join("src")).unwrap();
+            std::fs::write(
+                dir.join("Cargo.toml"),
+                "[package]\nname = \"x\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            )
+            .unwrap();
+            std::fs::write(dir.join("src/lib.rs"), "").unwrap();
+            let status = Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(dir)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            if let Some(pattern) = ignore {
+                std::fs::write(dir.join(".gitignore"), pattern).unwrap();
+            }
+        };
+        let routed = base.join("scratch/x");
+        std::fs::create_dir_all(&routed).unwrap();
+
+        let ignored = base.join("ignored");
+        crate_at(&ignored, Some("/target\n"));
+        link_workspace_target(&ignored.join("src"), &routed, true);
+        assert_eq!(std::fs::read_link(ignored.join("target")).unwrap(), routed);
+        // A second call leaves the link alone.
+        link_workspace_target(&ignored, &base.join("elsewhere"), true);
+        assert_eq!(std::fs::read_link(ignored.join("target")).unwrap(), routed);
+
+        // Not ignored by git: no link, so it can't be committed.
+        let tracked = base.join("tracked");
+        crate_at(&tracked, None);
+        link_workspace_target(&tracked, &routed, true);
+        assert!(std::fs::symlink_metadata(tracked.join("target")).is_err());
+
+        // An existing target directory is never replaced.
+        let existing = base.join("existing");
+        crate_at(&existing, Some("target/\n"));
+        std::fs::create_dir_all(existing.join("target/debug")).unwrap();
+        link_workspace_target(&existing, &routed, true);
+        assert!(existing.join("target/debug").is_dir());
+        assert!(
+            !std::fs::symlink_metadata(existing.join("target"))
+                .unwrap()
+                .is_symlink()
+        );
     }
 
     #[test]

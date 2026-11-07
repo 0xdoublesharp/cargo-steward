@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `link-target` setting for the `cargo` proxy: when it routes a workspace's
+  build output, it also points a missing `<workspace>/target` at the routed
+  directory (only where git ignores `target`), so `./target` paths and builds
+  that bypass the proxy land in the same place.
 - `rustc-wrapper` mode that removes the codegen-unit object files each
   incremental rebuild replaces (rust-lang/rust#161824), for Rust 1.88 and
   later in both build-dir layouts, and runs rustc through an inner wrapper

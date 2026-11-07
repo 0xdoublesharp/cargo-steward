@@ -124,6 +124,11 @@ pub struct Config {
     pub max_builds: Option<u32>,
     /// For the `cargo` proxy: the real cargo to run. Found on PATH if unset.
     pub real_cargo: Option<PathBuf>,
+    /// For the `cargo` proxy: when it routes a workspace's build output, also
+    /// point a missing `<workspace>/target` at it (when git ignores `target`),
+    /// so scripts expecting `./target` and builds that bypass the proxy, such
+    /// as an IDE's, land in the same place. Not for forced routes.
+    pub link_target: bool,
     /// For the `cargo` proxy: settings for commands run under particular
     /// directories, overriding `target-root`, `tmp-root` and `max-builds`.
     /// The longest matching `path` wins.
@@ -179,6 +184,7 @@ impl Default for Config {
             max_builds: None,
             real_cargo: None,
             routes: Vec::new(),
+            link_target: false,
         }
     }
 }
