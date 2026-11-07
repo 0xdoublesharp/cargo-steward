@@ -1,6 +1,6 @@
 #!/bin/sh
-# Installs cargo-steward, then runs `cargo steward setup` and
-# `cargo steward doctor`. macOS and Linux.
+# Installs cargo-steward, then runs `cargo steward setup`, installs the agent
+# skill, and runs `cargo steward doctor`. macOS and Linux.
 #
 # Usage: scripts/install.sh [SOURCE] [--no-setup] [--] [SETUP OPTIONS...]
 #
@@ -240,6 +240,8 @@ esac
 if [ -n "$run_setup" ]; then
     say ""
     "$bin" setup "$@"
+    # Teach Claude Code and Codex agents to use it, where they're installed.
+    "$bin" skill install || say "No agent skills directory found; skipping the agent skill."
 elif [ $# -gt 0 ]; then
     say "Not running setup (--no-setup), so these were ignored: $*"
 fi

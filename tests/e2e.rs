@@ -367,3 +367,36 @@ fn setup_swaps_the_wrapper_in_and_undo_restores_it() {
     assert!(text.contains("rustc-wrapper = \"sccache\""), "{text}");
     assert!(!text.contains("cargo-steward"), "{text}");
 }
+
+#[test]
+fn remove_takes_only_build_dirs_and_previews_first() {
+    let fx = Fixture::new();
+    fx.build(false);
+
+    // Something that isn't a build directory is refused, and left alone.
+    let src = fx.project.join("src");
+    let out = Command::new(BIN)
+        .args(["remove", "--apply"])
+        .arg(&src)
+        .env("CARGO_STEWARD_HOME", &fx.home)
+        .env_remove("CARGO")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("refusing"));
+    assert!(src.join("main.rs").exists());
+
+    let target = fx.target.to_str().unwrap().to_owned();
+    let preview = fx.steward(&["remove", &target]);
+    assert!(preview.contains("Would remove"), "{preview}");
+    assert!(fx.target.exists());
+
+    // A pinned one needs --force.
+    fx.steward(&["pin", &target]);
+    let pinned = fx.steward(&["remove", "--apply", &target]);
+    assert!(pinned.contains("pinned"), "{pinned}");
+    assert!(fx.target.exists());
+
+    fx.steward(&["remove", "--apply", "--force", &target]);
+    assert!(!fx.target.exists());
+}

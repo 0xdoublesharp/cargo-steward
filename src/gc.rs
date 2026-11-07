@@ -54,6 +54,7 @@ pub enum Kind {
     Orphaned,
     Idle,
     LowSpace,
+    Requested,
 }
 
 impl Kind {
@@ -67,6 +68,7 @@ impl Kind {
             Kind::Orphaned => "build dirs of deleted workspaces",
             Kind::Idle => "idle build dirs",
             Kind::LowSpace => "build dirs removed for free space",
+            Kind::Requested => "build dirs removed on request",
         }
     }
 }
@@ -588,6 +590,114 @@ fn remove_build_dir(
     let removal = remove_dir(kind, &dir.root, note, bytes, sweep, out);
     drop(locks);
     removal
+}
+
+/// Removes whole build directories on request (`cargo steward remove`), the
+/// way cleanup removes them: while holding cargo's locks, not while a running
+/// program was started from inside, and renamed aside first. Anything that
+/// isn't a cargo build directory is refused, and pinned ones need `force`.
+pub fn remove_requested(roots: &[PathBuf], apply: bool, force: bool) -> Result<()> {
+    let paths = Paths::resolve().context("cannot locate the home directory")?;
+    let config = config::load(&paths)?;
+    let policy = config.policy()?;
+    let running = if config.process_guard {
+        Running::collect()
+    } else {
+        Running::default()
+    };
+    let mut registry = ledger::compact(&paths)?;
+    let sweep = Sweep {
+        policy: &policy,
+        running: &running,
+        now: SystemTime::now(),
+        apply,
+    };
+    let mut out = Cleanup::default();
+    for root in roots {
+        let root = root
+            .canonicalize()
+            .with_context(|| format!("{} doesn't exist", root.display()))?;
+        if !scan::is_cargo_root(&root) {
+            anyhow::bail!(
+                "{} isn't the root of a cargo build directory (no .rustc_info.json or cargo \
+                 CACHEDIR.TAG with build profiles); refusing to remove it",
+                root.display()
+            );
+        }
+        let dir = BuildDir::inspect(&root, registry.roots.get(&root));
+        if dir.pinned && !force {
+            out.skipped.push(Skipped {
+                kind: Kind::Requested,
+                path: root,
+                reason: "pinned (use --force to remove it anyway)".into(),
+            });
+            continue;
+        }
+        let note = format!("last used {} ago", fsutil::ago(dir.last_used));
+        match remove_build_dir(&dir, Kind::Requested, note, None, sweep, &mut out) {
+            Removal::Busy => out.skipped.push(Skipped {
+                kind: Kind::Requested,
+                path: root.clone(),
+                reason: "a cargo build is using it; try again when it finishes".into(),
+            }),
+            Removal::Done if apply => {
+                registry.roots.remove(&root);
+            }
+            _ => {}
+        }
+    }
+    if apply {
+        ledger::save(&paths, &registry)?;
+    }
+    report(
+        &out,
+        &[],
+        Options {
+            apply,
+            auto: false,
+            verbose: true,
+        },
+    );
+    Ok(())
+}
+
+/// The build directory a worktree builds into: where the `cargo` proxy routes
+/// it, else what `cargo metadata` reports there (ignoring a target dir
+/// exported for some other checkout).
+pub fn build_dir_of(worktree: &Path) -> Result<PathBuf> {
+    let worktree = worktree
+        .canonicalize()
+        .with_context(|| format!("{} doesn't exist", worktree.display()))?;
+    let config = Paths::resolve()
+        .and_then(|p| config::load(&p).ok())
+        .unwrap_or_default();
+    if let Ok(plan) = crate::proxy::Plan::new(&config, &worktree, &[])
+        && plan.skip.is_none()
+        && let Some(target) = plan.target
+    {
+        return Ok(target);
+    }
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let output = std::process::Command::new(cargo)
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .current_dir(&worktree)
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO_BUILD_TARGET_DIR")
+        .output()
+        .context("running cargo metadata")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "cargo metadata failed in {}: {}",
+            worktree.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let meta: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let dir = meta["build_directory"]
+        .as_str()
+        .or_else(|| meta["target_directory"].as_str())
+        .context("cargo metadata reported no target directory")?;
+    Ok(PathBuf::from(dir))
 }
 
 /// Removes build directories from each disk that is below `min-free`, until

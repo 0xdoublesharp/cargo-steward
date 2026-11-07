@@ -37,5 +37,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   sccache layout, dev-profile debug info, Time Machine and Spotlight,
   rust-analyzer target dirs, binary health), `status` (with unshared sizes),
   `pin` and `unpin`.
+- `cargo steward remove`: removes whole build directories (or a retiring
+  worktree's, with `--worktree`) the way cleanup does: under cargo's locks,
+  not while a program runs from them, never anything that isn't a build
+  directory, and pinned ones only with `--force`.
+- An agent skill (`skills/cargo-steward/SKILL.md`, compiled in) that teaches
+  AI coding agents to maintain Rust workspaces with cargo-steward;
+  `cargo steward skill install|uninstall|status|show` installs it for Claude
+  Code and Codex, and `scripts/install.sh` does so after setup.
+- Cleanup removes superseded incremental sessions, which rustc otherwise keeps
+  until that crate's next compile.
 - `scripts/install.sh` for new machines (from source, git, or a release
   binary) and a release workflow building macOS and Linux binaries.

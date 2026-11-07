@@ -15,6 +15,7 @@ mod proxy;
 mod scan;
 mod seed;
 mod setup;
+mod skill;
 mod status;
 mod wrapper;
 
@@ -39,7 +40,7 @@ use clap::{Parser, Subcommand};
         each rebuild leaves behind, and cleans up stale and abandoned build directories \
         in the background after builds."
 )]
-struct Cli {
+pub struct Cli {
     #[command(subcommand)]
     command: Cmd,
 }
@@ -89,9 +90,27 @@ enum Cmd {
     Ci(ci::Args),
     /// Install or remove the `cargo` proxy
     Shim(proxy::ShimArgs),
+    /// Remove whole build directories safely (cargo's locks, running-program
+    /// check), such as a retired worktree's
+    Remove {
+        /// Build directories to remove
+        build_dirs: Vec<PathBuf>,
+        /// Remove the build directory this worktree builds into (run this
+        /// before deleting the worktree)
+        #[arg(long, value_name = "DIR")]
+        worktree: Vec<PathBuf>,
+        /// Remove them; otherwise only report
+        #[arg(long)]
+        apply: bool,
+        /// Also remove pinned directories
+        #[arg(long)]
+        force: bool,
+    },
+    /// Install or remove the agent skill that teaches AI agents to use cargo-steward
+    Skill(skill::Args),
 }
 
-const COMMANDS: [&str; 15] = [
+const COMMANDS: [&str; 17] = [
     "setup",
     "doctor",
     "status",
@@ -103,6 +122,8 @@ const COMMANDS: [&str; 15] = [
     "dedup",
     "ci",
     "shim",
+    "remove",
+    "skill",
     "help",
     "--help",
     "-h",
@@ -155,6 +176,13 @@ fn main() -> ExitCode {
         Cmd::Dedup { apply, verbose } => dedup::run(apply, verbose),
         Cmd::Ci(args) => ci::run(&args),
         Cmd::Shim(args) => proxy::run_shim(&args),
+        Cmd::Remove {
+            build_dirs,
+            worktree,
+            apply,
+            force,
+        } => remove(build_dirs, &worktree, apply, force),
+        Cmd::Skill(args) => skill::run(&args),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -178,6 +206,21 @@ fn is_wrapper_call(first: &OsString) -> bool {
     text.contains('/')
         || name.is_some_and(|n| n.contains("rustc") || n.contains("clippy"))
         || env::var_os("CARGO").is_some()
+}
+
+fn remove(mut dirs: Vec<PathBuf>, worktrees: &[PathBuf], apply: bool, force: bool) -> Result<()> {
+    for worktree in worktrees {
+        let dir = gc::build_dir_of(worktree)?;
+        println!("{} builds into {}", worktree.display(), dir.display());
+        if dir.exists() {
+            dirs.push(dir);
+        }
+    }
+    if dirs.is_empty() {
+        println!("Nothing to remove.");
+        return Ok(());
+    }
+    gc::remove_requested(&dirs, apply, force)
 }
 
 fn pin(dir: &Path, on: bool) -> Result<()> {

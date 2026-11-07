@@ -87,6 +87,8 @@ cargo steward gc                  # what a cleanup would remove, by kind
 cargo steward gc --apply [-v]     # remove it now
 cargo steward pin <dir>           # never clean this build directory (except stale objects)
 cargo steward unpin <dir>
+cargo steward remove --worktree <dir> [--apply]   # remove a retiring worktree's build dir safely
+cargo steward skill install       # teach Claude Code / Codex agents to use cargo-steward
 ```
 
 Warm starts, CI and the cargo proxy:
