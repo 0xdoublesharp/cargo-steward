@@ -55,6 +55,9 @@ pub enum Kind {
     Idle,
     LowSpace,
     Requested,
+    /// The TMPDIR the `cargo` proxy routed for a build directory removed
+    /// whole.
+    RoutedTmp,
 }
 
 impl Kind {
@@ -69,6 +72,7 @@ impl Kind {
             Kind::Idle => "idle build dirs",
             Kind::LowSpace => "build dirs removed for free space",
             Kind::Requested => "build dirs removed on request",
+            Kind::RoutedTmp => "temporary dirs the proxy routed for them",
         }
     }
 }
@@ -290,7 +294,7 @@ pub fn run(options: Options) -> Result<()> {
     } else {
         Vec::new()
     };
-    let cleanup = clean(
+    let mut cleanup = clean(
         &dirs,
         Sweep {
             policy: &policy,
@@ -310,6 +314,8 @@ pub fn run(options: Options) -> Result<()> {
         .filter_map(|v| Some((v.probe.clone(), v.freed()?)))
         .collect();
 
+    let tmp = remove_routed_tmp_dirs(&config, &cleanup.actions, options.apply);
+    cleanup.actions.extend(tmp);
     for action in cleanup.actions.iter().filter(|a| a.kind >= Kind::Orphaned) {
         registry.roots.remove(&action.path);
     }
@@ -751,6 +757,43 @@ fn remove_build_dir(
     removal
 }
 
+/// Removes the TMPDIRs the `cargo` proxy routed for build directories that
+/// `actions` removed whole (`<tmp-root>/<repo>/<worktree>` for
+/// `<target-root>/<repo>/<worktree>`): a deleted worktree's temporary files
+/// otherwise stay forever. Only directories the proxy routed are touched.
+fn remove_routed_tmp_dirs(config: &config::Config, actions: &[Action], apply: bool) -> Vec<Action> {
+    let mut out = Vec::new();
+    for action in actions.iter().filter(|a| {
+        matches!(
+            a.kind,
+            Kind::Orphaned | Kind::Idle | Kind::LowSpace | Kind::Requested
+        )
+    }) {
+        let Some(tmp) = crate::proxy::routed_tmp_dir(config, &action.path) else {
+            continue;
+        };
+        if !fs::symlink_metadata(&tmp).is_ok_and(|m| m.is_dir()) {
+            continue;
+        }
+        let bytes = fsutil::tree_size(&tmp);
+        if apply && let Err(e) = fsutil::remove(&tmp) {
+            eprintln!(
+                "warning: cargo-steward: failed to remove {}: {e}",
+                tmp.display()
+            );
+            continue;
+        }
+        out.push(Action {
+            kind: Kind::RoutedTmp,
+            path: tmp,
+            files: 0,
+            bytes,
+            note: format!("of {}", action.path.display()),
+        });
+    }
+    out
+}
+
 /// Removes whole build directories on request (`cargo steward remove`), the
 /// way cleanup removes them: while holding cargo's locks, not while a running
 /// program was started from inside, and renamed aside first. Anything that
@@ -816,6 +859,8 @@ pub fn remove_requested(roots: &[PathBuf], apply: bool, force: bool) -> Result<(
             _ => {}
         }
     }
+    out.actions
+        .extend(remove_routed_tmp_dirs(&config, &out.actions, apply));
     if apply {
         ledger::save(&paths, &registry)?;
     }

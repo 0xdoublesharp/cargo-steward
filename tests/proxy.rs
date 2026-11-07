@@ -463,3 +463,37 @@ fn installs_and_uninstalls_the_shim() {
         "#!/bin/sh\n"
     );
 }
+
+#[test]
+fn removing_a_deleted_worktrees_build_dir_takes_its_tmpdir_too() {
+    let fx = Fixture::new("orphan-grace = \"0s\"\n");
+    let ns = fx.repo_ns();
+    let wt = fx.root.join("wt");
+    git(&fx.repo, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+    for dir in [&fx.repo, &wt] {
+        // Through the wrapper, so the build is recorded against the worktree.
+        let out = fx
+            .proxy(dir, &["build", "-q"])
+            .env("RUSTC_WRAPPER", BIN)
+            .env("CARGO_STEWARD_INNER", "")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+    }
+    let (main_tmp, wt_tmp) = (fx.tmps.join(&ns).join("main"), fx.tmps.join(&ns).join("wt"));
+    fs::write(wt_tmp.join("left-by-a-test"), "x").unwrap();
+    assert!(main_tmp.is_dir());
+
+    git(
+        &fx.repo,
+        &["worktree", "remove", "--force", wt.to_str().unwrap()],
+    );
+    let out = fx.steward(&fx.repo, &["gc", "--apply"]);
+    let text = stdout(&out);
+    assert!(out.status.success(), "{text}{out:?}");
+    assert!(!fx.targets.join(&ns).join("wt").exists(), "{text}");
+    assert!(!wt_tmp.exists(), "{text}");
+    assert!(text.contains("temporary dirs the proxy routed"), "{text}");
+    assert!(main_tmp.is_dir(), "the main checkout's stays");
+    assert!(fx.targets.join(&ns).join("main").is_dir());
+}

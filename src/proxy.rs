@@ -336,6 +336,39 @@ fn root(path: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// The TMPDIR the proxy gives builds whose target directory is `build_dir`,
+/// when it routed `build_dir`: `<target-root>/<repo>-<hash>/<key>` under a
+/// route's (or the top-level) `target-root` maps to the same place under
+/// that route's `tmp-root`. `None` for any other directory.
+pub fn routed_tmp_dir(config: &Config, build_dir: &Path) -> Option<PathBuf> {
+    let key = build_dir.file_name()?;
+    let namespace = build_dir.parent()?;
+    let repo = namespace.file_name()?.to_str()?;
+    let label = repo.rsplit_once('-').map_or(repo, |(label, _)| label);
+    let expand = |path: &Path| root(Path::new(&path.to_string_lossy().replace("{label}", label)));
+    let same = |a: &Path, b: &Path| {
+        a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
+    };
+    let pairs = std::iter::once((&config.target_root, &config.tmp_root))
+        .chain(config.routes.iter().map(|r| (&r.target_root, &r.tmp_root)));
+    for (target_root, tmp_root) in pairs {
+        let (Some(target_root), Some(tmp_root)) = (target_root, tmp_root) else {
+            continue;
+        };
+        let (Ok(target_root), Ok(tmp_root)) = (expand(target_root), expand(tmp_root)) else {
+            continue;
+        };
+        if namespace.parent().is_some_and(|p| same(p, &target_root)) {
+            let tmp = tmp_root.join(repo).join(key);
+            // Never the build directory itself, or anything holding it.
+            if !build_dir.starts_with(&tmp) && !tmp.starts_with(build_dir) {
+                return Some(tmp);
+            }
+        }
+    }
+    None
+}
+
 /// Works out the routing, creates the directories, seeds a new worktree's
 /// target directory, and returns the variables to set. Nothing (and no
 /// subprocess) when no root is set or a target directory is already chosen.
@@ -948,5 +981,40 @@ mod tests {
         fs::write(target.join("keep"), "").unwrap();
         prepare(&config, None, Ok(wt), &build, Some(&me));
         assert_eq!(fs::read_to_string(&log).unwrap().lines().count(), 1);
+    }
+
+    #[test]
+    fn maps_a_routed_build_dir_to_its_tmpdir() {
+        let config = Config {
+            target_root: Some("/s/{label}/cargo".into()),
+            tmp_root: Some("/s/{label}/tmp".into()),
+            routes: vec![config::Route {
+                path: "/w/big".into(),
+                target_root: Some("/big/cargo".into()),
+                tmp_root: Some("/big/tmp".into()),
+                max_builds: None,
+                force: false,
+            }],
+            ..Config::default()
+        };
+        let at = |p: &str| routed_tmp_dir(&config, Path::new(p));
+        assert_eq!(
+            at("/s/repo/cargo/repo-0123456789/wt"),
+            Some("/s/repo/tmp/repo-0123456789/wt".into())
+        );
+        assert_eq!(
+            at("/big/cargo/big-0123456789/main"),
+            Some("/big/tmp/big-0123456789/main".into())
+        );
+        // Not under a target root, or a root without a tmp-root: nothing.
+        assert_eq!(at("/w/proj/target"), None);
+        let no_tmp = Config {
+            target_root: Some("/s/cargo".into()),
+            ..Config::default()
+        };
+        assert_eq!(
+            routed_tmp_dir(&no_tmp, Path::new("/s/cargo/r-0123456789/main")),
+            None
+        );
     }
 }
