@@ -1,0 +1,109 @@
+name: cargo-steward
+description: Trim a Cargo build directory to what the job used, within a size budget, before it is cached
+author: doublesharp
+branding:
+  icon: scissors
+  color: orange
+
+inputs:
+  mode:
+    description: >-
+      `start` before the job builds (installs cargo-steward if needed and marks the
+      job's start), or `trim` as the job's last step, before the cache is saved.
+    required: true
+  budget:
+    description: For `trim`, the largest size to leave the build directory at, such as `8GiB`. Empty for no limit.
+    required: false
+    default: ''
+  keep-workspace:
+    description: For `trim`, keep the workspace's own crates (`true` or `false`).
+    required: false
+    default: 'false'
+  keep-incremental:
+    description: For `trim`, keep incremental caches (`true` or `false`).
+    required: false
+    default: 'false'
+  target-dir:
+    description: The build directory. By default, the one `cargo metadata` reports in `working-directory`.
+    required: false
+    default: ''
+  working-directory:
+    description: Directory of the Cargo workspace.
+    required: false
+    default: '.'
+  version:
+    description: >-
+      For `start`, the cargo-steward release to install from crates.io. Empty to build
+      the version this action was checked out at.
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Install cargo-steward
+      if: inputs.mode == 'start'
+      shell: bash
+      # Outside the workspace, so its rust-toolchain file doesn't apply.
+      working-directory: ${{ runner.temp }}
+      env:
+        STEWARD_VERSION: ${{ inputs.version }}
+        CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-steward-install
+        # A wrapper set for the job (possibly cargo-steward itself) mustn't
+        # build cargo-steward.
+        RUSTC_WRAPPER: ''
+        CARGO_BUILD_RUSTC_WRAPPER: ''
+      run: |
+        set -eo pipefail
+        want="$STEWARD_VERSION"
+        if [ -z "$want" ]; then
+          want="$(sed -n 's/^version = "\(.*\)"/\1/p' "$GITHUB_ACTION_PATH/Cargo.toml" | head -n 1)"
+        fi
+        if command -v cargo-steward >/dev/null 2>&1; then
+          have="$(cargo-steward --version | awk '{print $NF}')"
+          if [ "$have" = "$want" ]; then
+            echo "cargo-steward $have is installed"
+            exit 0
+          fi
+        fi
+        if [ -n "$STEWARD_VERSION" ]; then
+          cargo install --locked --force cargo-steward --version "$STEWARD_VERSION"
+        else
+          cargo install --locked --force --path "$GITHUB_ACTION_PATH"
+        fi
+        rm -rf "$CARGO_TARGET_DIR"
+
+    - name: cargo steward ci ${{ inputs.mode }}
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        MODE: ${{ inputs.mode }}
+        BUDGET: ${{ inputs.budget }}
+        KEEP_WORKSPACE: ${{ inputs.keep-workspace }}
+        KEEP_INCREMENTAL: ${{ inputs.keep-incremental }}
+        TARGET_DIR: ${{ inputs.target-dir }}
+      run: |
+        set -eo pipefail
+        args=()
+        if [ -n "$TARGET_DIR" ]; then
+          args+=(--target-dir "$TARGET_DIR")
+        fi
+        case "$MODE" in
+          start) ;;
+          trim)
+            if [ -n "$BUDGET" ]; then
+              args+=(--budget "$BUDGET")
+            fi
+            if [ "$KEEP_WORKSPACE" = true ]; then
+              args+=(--keep-workspace)
+            fi
+            if [ "$KEEP_INCREMENTAL" = true ]; then
+              args+=(--keep-incremental)
+            fi
+            ;;
+          *)
+            echo "::error::cargo-steward: mode must be 'start' or 'trim', not '$MODE'"
+            exit 1
+            ;;
+        esac
+        cargo-steward ci "$MODE" ${args[@]+"${args[@]}"}

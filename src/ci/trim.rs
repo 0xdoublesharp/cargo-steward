@@ -1,0 +1,684 @@
+//! `cargo steward ci trim`: leave the build directory holding what the job
+//! used, within a size budget.
+
+use std::collections::BTreeSet;
+use std::fmt::Write as _;
+use std::fs::{self, OpenOptions};
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+use anyhow::{Context, Result};
+
+use super::marker::{self, Marker};
+use super::units::{self, Kind, Unit};
+use crate::fsutil::{self, Lock, human};
+use crate::scan::{self, Profile};
+
+#[derive(Debug, Clone)]
+pub struct Options {
+    pub root: PathBuf,
+    /// Package names of the workspace members.
+    pub members: BTreeSet<String>,
+    pub budget: Option<u64>,
+    pub keep_workspace: bool,
+    pub keep_incremental: bool,
+    pub dry_run: bool,
+    pub verbose: bool,
+    /// `$GITHUB_STEP_SUMMARY`: a markdown file shown on the job's page.
+    pub step_summary: Option<PathBuf>,
+}
+
+/// How `trim` tells what the job used.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Tracking {
+    /// Fingerprints read or written since the start belong to used units.
+    Reads { start: SystemTime },
+    /// The filesystem doesn't record reads: budget only.
+    Frozen,
+    /// `ci start` didn't run here: budget only.
+    NoMarker,
+}
+
+impl Tracking {
+    fn from_marker(marker: Option<Marker>) -> Tracking {
+        match marker {
+            Some(m) if m.atime => Tracking::Reads {
+                start: m.start_time(),
+            },
+            Some(_) => Tracking::Frozen,
+            None => Tracking::NoMarker,
+        }
+    }
+
+    fn describe(self) -> String {
+        match self {
+            Tracking::Reads { start } => format!(
+                "kept what the job used since {}",
+                humantime::format_rfc3339_seconds(start)
+            ),
+            Tracking::Frozen => {
+                "this filesystem doesn't record reads (noatime), so only the budget applied".into()
+            }
+            Tracking::NoMarker => "`ci start` didn't run here, so only the budget applied".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Reason {
+    Unused,
+    Workspace,
+    Incremental,
+    StaleObjects,
+    Budget,
+}
+
+impl Reason {
+    fn label(self, budget: Option<u64>) -> String {
+        match self {
+            Reason::Unused => "not used in this job".into(),
+            Reason::Workspace => "workspace members".into(),
+            Reason::Incremental => "incremental caches".into(),
+            Reason::StaleObjects => "stale object files".into(),
+            Reason::Budget => format!("over the {} budget", human(budget.unwrap_or_default())),
+        }
+    }
+}
+
+/// What a trim removed (or would), by reason, and what it kept.
+#[derive(Debug, Default)]
+struct Report {
+    /// `(reason, items, bytes)`, in the order they happened.
+    removed: Vec<(Reason, usize, u64)>,
+    kept_units: usize,
+    kept_caches: usize,
+    kept_bytes: u64,
+    before: u64,
+    after: u64,
+}
+
+impl Report {
+    fn add(&mut self, reason: Reason, items: usize, bytes: u64) {
+        match self.removed.iter_mut().find(|r| r.0 == reason) {
+            Some(row) => {
+                row.1 += items;
+                row.2 += bytes;
+            }
+            None => self.removed.push((reason, items, bytes)),
+        }
+    }
+
+    fn removed_bytes(&self) -> u64 {
+        self.removed.iter().map(|r| r.2).sum()
+    }
+}
+
+pub fn run(options: &Options) -> Result<()> {
+    let root = &options.root;
+    if !root.is_dir() {
+        println!(
+            "cargo-steward: nothing to trim, {} doesn't exist",
+            root.display()
+        );
+        return Ok(());
+    }
+    let tracking = Tracking::from_marker(marker::read(root)?);
+    let report = trim(options, tracking);
+    if !options.dry_run {
+        marker::remove(root)
+            .with_context(|| format!("removing the marker in {}", root.display()))?;
+    }
+
+    print!("{}", render_text(options, tracking, &report));
+    if let Some(path) = &options.step_summary {
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .and_then(|mut f| f.write_all(render_markdown(options, tracking, &report).as_bytes()))
+            .with_context(|| format!("writing the step summary {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Removes units and tallies them.
+struct Remover {
+    apply: bool,
+    verbose: bool,
+    report: Report,
+    /// Paths removed (or that would be, in a dry run).
+    gone: Vec<PathBuf>,
+}
+
+impl Remover {
+    fn unit(&mut self, unit: Unit, bytes: u64, reason: Reason) {
+        if self.verbose {
+            let what = unit.paths.first().map(|p| p.display().to_string());
+            self.log(
+                bytes,
+                &format!("{} {}", unit.noun(), what.unwrap_or_default()),
+            );
+        }
+        if self.apply {
+            for path in &unit.paths {
+                if let Err(e) = fsutil::remove(path) {
+                    eprintln!(
+                        "warning: cargo-steward: failed to remove {}: {e}",
+                        path.display()
+                    );
+                }
+            }
+        }
+        self.report.add(reason, 1, bytes);
+        self.gone.extend(unit.paths);
+    }
+
+    fn is_gone(&self, path: &Path) -> bool {
+        self.gone.iter().any(|g| path.starts_with(g))
+    }
+
+    fn log(&self, bytes: u64, what: &str) {
+        let verb = if self.apply {
+            "Removed"
+        } else {
+            "Would remove"
+        };
+        println!("{verb:>12} {:>10}  {what}", human(bytes));
+    }
+}
+
+fn trim(options: &Options, tracking: Tracking) -> Report {
+    let root = &options.root;
+    let apply = !options.dry_run;
+    let mut out = Remover {
+        apply,
+        verbose: options.verbose,
+        report: Report::default(),
+        gone: Vec::new(),
+    };
+
+    // Cargo's locks on every profile, held to the end so the budget can
+    // weigh units across all of them.
+    let mut locks = Vec::new();
+    let mut profiles: Vec<Profile> = Vec::new();
+    for profile in scan::profiles(root) {
+        if apply {
+            match fsutil::lock_profile(&profile.path) {
+                Lock::Busy => {
+                    eprintln!(
+                        "warning: cargo-steward: a build is running in {}; left as is",
+                        profile.path.display()
+                    );
+                    continue;
+                }
+                held => locks.push(held),
+            }
+            sweep(&profile.path);
+        }
+        profiles.push(profile);
+    }
+    out.report.before = fsutil::tree_size(root);
+
+    let members = &options.members;
+    let member_crates: BTreeSet<String> = members.iter().map(|m| m.replace('-', "_")).collect();
+    let used_since = match tracking {
+        Tracking::Reads { start } => Some(start),
+        Tracking::Frozen | Tracking::NoMarker => None,
+    };
+
+    // Build units: the workspace's own, and those no build in the job used.
+    let mut kept: Vec<Unit> = Vec::new();
+    for unit in profiles.iter().flat_map(|p| {
+        let mut units = units::legacy_units(&p.path);
+        units.extend(units::v2_units(&p.path));
+        units
+    }) {
+        let reason = if !options.keep_workspace && members.contains(&unit.package) {
+            Some(Reason::Workspace)
+        } else if let Some(start) = used_since
+            // Outputs without a fingerprint can't be dated reliably; leave
+            // them to the budget.
+            && unit.fingerprint.is_some()
+            && unit.last_used < start
+        {
+            Some(Reason::Unused)
+        } else {
+            None
+        };
+        match reason {
+            Some(reason) => {
+                let bytes = unit.bytes();
+                out.unit(unit, bytes, reason);
+            }
+            None => kept.push(unit),
+        }
+    }
+
+    // Incremental caches, which belong with their crate's units.
+    let kept_crates: BTreeSet<&String> = kept.iter().flat_map(|u| &u.crates).collect();
+    let mut kept_caches: Vec<Unit> = Vec::new();
+    for cache in profiles
+        .iter()
+        .flat_map(|p| units::incremental_units(&p.path))
+    {
+        let reason = if !options.keep_incremental {
+            Some(Reason::Incremental)
+        } else if !options.keep_workspace && member_crates.contains(&cache.package) {
+            Some(Reason::Workspace)
+        } else if used_since.is_some() && !kept_crates.contains(&cache.package) {
+            Some(Reason::Unused)
+        } else {
+            None
+        };
+        match reason {
+            Some(reason) => {
+                let bytes = cache.bytes();
+                out.unit(cache, bytes, reason);
+            }
+            None => kept_caches.push(cache),
+        }
+    }
+
+    // Object files that later compiles replaced, in what's left.
+    for profile in &profiles {
+        for dir in scan::object_dirs(profile) {
+            if out.is_gone(&dir) {
+                continue;
+            }
+            let files: Vec<PathBuf> = scan::stale_objects_in(&dir)
+                .into_iter()
+                .flat_map(|s| s.files)
+                .filter(|f| !out.is_gone(f))
+                .collect();
+            if files.is_empty() {
+                continue;
+            }
+            let bytes = fsutil::freed_by(&files);
+            let mut count = files.len();
+            if apply {
+                count = files.iter().filter(|f| fs::remove_file(f).is_ok()).count();
+            }
+            if options.verbose {
+                out.log(
+                    bytes,
+                    &format!("{count} stale object files in {}", dir.display()),
+                );
+            }
+            out.report.add(Reason::StaleObjects, count, bytes);
+        }
+    }
+
+    // Then the least recently used, until under the budget.
+    let mut remaining: Vec<(Unit, u64)> = kept
+        .into_iter()
+        .chain(kept_caches)
+        .map(|u| {
+            let bytes = u.bytes();
+            (u, bytes)
+        })
+        .collect();
+    let size = out.report.before.saturating_sub(out.report.removed_bytes());
+    if let Some(budget) = options.budget
+        && size > budget
+    {
+        let items: Vec<(SystemTime, u64)> =
+            remaining.iter().map(|(u, b)| (u.last_used, *b)).collect();
+        let chosen: BTreeSet<usize> = over_budget(&items, size - budget).into_iter().collect();
+        let mut stay = Vec::new();
+        for (i, (unit, bytes)) in remaining.into_iter().enumerate() {
+            if chosen.contains(&i) {
+                out.unit(unit, bytes, Reason::Budget);
+            } else {
+                stay.push((unit, bytes));
+            }
+        }
+        remaining = stay;
+    }
+
+    // Kept fingerprints get back the access times they had.
+    if apply && used_since.is_some() {
+        for (unit, _) in &remaining {
+            if let Some(dir) = &unit.fingerprint {
+                marker::restore_atimes(dir);
+            }
+        }
+    }
+
+    let mut report = out.report;
+    for (unit, bytes) in &remaining {
+        match unit.kind {
+            Kind::Incremental => report.kept_caches += 1,
+            Kind::Legacy | Kind::V2 => report.kept_units += 1,
+        }
+        report.kept_bytes += bytes;
+    }
+    report.after = if apply {
+        fsutil::tree_size(root)
+    } else {
+        report.before.saturating_sub(report.removed_bytes())
+    };
+    drop(locks);
+    report
+}
+
+/// Indices of the items to remove, least recently used first, so that
+/// removing them frees at least `excess` bytes (or all of them, if together
+/// they come to less).
+fn over_budget(items: &[(SystemTime, u64)], excess: u64) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..items.len()).collect();
+    order.sort_by_key(|&i| items[i].0);
+    let mut freed = 0;
+    let mut chosen = Vec::new();
+    for i in order {
+        if freed >= excess {
+            break;
+        }
+        freed += items[i].1;
+        chosen.push(i);
+    }
+    chosen
+}
+
+/// Finishes deletions that an interrupted trim left renamed aside.
+fn sweep(profile: &Path) {
+    for dir in [".fingerprint", "deps", "examples", "build", "incremental"] {
+        fsutil::sweep_trash(&profile.join(dir));
+    }
+    for package in fsutil::subdirs(&profile.join("build")) {
+        fsutil::sweep_trash(&package);
+    }
+}
+
+fn kept_label(report: &Report) -> String {
+    let count =
+        |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    format!(
+        "{}, {}",
+        count(report.kept_units, "unit", "units"),
+        count(
+            report.kept_caches,
+            "incremental cache",
+            "incremental caches"
+        )
+    )
+}
+
+fn render_text(options: &Options, tracking: Tracking, report: &Report) -> String {
+    let verb = if options.dry_run {
+        "Would remove"
+    } else {
+        "Removed"
+    };
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "cargo-steward ci trim: {} ({})",
+        options.root.display(),
+        tracking.describe()
+    );
+    for (reason, items, bytes) in &report.removed {
+        let _ = writeln!(
+            s,
+            "{verb:>12} {:>10}  {items} {}",
+            human(*bytes),
+            reason.label(options.budget)
+        );
+    }
+    if report.removed.is_empty() {
+        let _ = writeln!(s, "{:>12} {:>10}", "Removed", "nothing");
+    }
+    let _ = writeln!(
+        s,
+        "{:>12} {:>10}  {}",
+        "Kept",
+        human(report.kept_bytes),
+        kept_label(report)
+    );
+    let _ = write!(
+        s,
+        "{:>12} {:>10}  (was {})",
+        "Size",
+        human(report.after),
+        human(report.before)
+    );
+    if let Some(budget) = options.budget {
+        let _ = write!(s, ", budget {}", human(budget));
+    }
+    s.push('\n');
+    s
+}
+
+fn render_markdown(options: &Options, tracking: Tracking, report: &Report) -> String {
+    let verb = if options.dry_run {
+        "Would remove"
+    } else {
+        "Removed"
+    };
+    let mut s = String::new();
+    let _ = writeln!(s, "### cargo-steward ci trim\n");
+    let _ = writeln!(
+        s,
+        "`{}`: {}.\n",
+        options.root.display(),
+        tracking.describe()
+    );
+    let _ = writeln!(s, "| | Items | Size |\n|---|--:|--:|");
+    let _ = writeln!(
+        s,
+        "| Kept | {} | {} |",
+        kept_label(report),
+        human(report.kept_bytes)
+    );
+    for (reason, items, bytes) in &report.removed {
+        let _ = writeln!(
+            s,
+            "| {verb}: {} | {items} | {} |",
+            reason.label(options.budget),
+            human(*bytes)
+        );
+    }
+    let budget = options
+        .budget
+        .map(|b| format!(" (budget {})", human(b)))
+        .unwrap_or_default();
+    let _ = writeln!(
+        s,
+        "| **Build directory**{budget} | was {} | **{}** |\n",
+        human(report.before),
+        human(report.after)
+    );
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    fn at(secs: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn budget_removes_least_recently_used_first_until_under() {
+        let items = [(at(30), 100), (at(10), 50), (at(20), 70), (at(40), 10)];
+        assert_eq!(over_budget(&items, 0), Vec::<usize>::new());
+        assert_eq!(over_budget(&items, 50), [1]);
+        assert_eq!(over_budget(&items, 51), [1, 2]);
+        assert_eq!(over_budget(&items, 121), [1, 2, 0]);
+        // More than everything: all of it, oldest first.
+        assert_eq!(over_budget(&items, 1000), [1, 2, 0, 3]);
+        assert!(over_budget(&[], 10).is_empty());
+    }
+
+    fn fixture() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("target");
+        let profile = root.join("debug");
+        let used = "1111111111111111";
+        let unused = "2222222222222222";
+        let member = "3333333333333333";
+        for path in [
+            format!(".fingerprint/used-{used}/lib-used"),
+            format!("deps/libused-{used}.rlib"),
+            format!(".fingerprint/unused-{unused}/lib-unused"),
+            format!("deps/libunused-{unused}.rlib"),
+            format!(".fingerprint/app-{member}/bin-app"),
+            format!("deps/app-{member}"),
+            "incremental/used-1abc/s-1/dep-graph.bin".into(),
+            "incremental/unused-2abc/s-1/dep-graph.bin".into(),
+        ] {
+            let path = profile.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, vec![1u8; 8192]).unwrap();
+        }
+        fs::write(root.join(".rustc_info.json"), "{}").unwrap();
+        (tmp, root)
+    }
+
+    fn opts(root: &Path) -> Options {
+        Options {
+            root: root.to_path_buf(),
+            members: BTreeSet::from(["app".to_owned()]),
+            budget: None,
+            keep_workspace: false,
+            keep_incremental: false,
+            dry_run: false,
+            verbose: false,
+            step_summary: None,
+        }
+    }
+
+    fn fingerprint_count(root: &Path) -> usize {
+        fsutil::entries(&root.join("debug/.fingerprint")).count()
+    }
+
+    #[test]
+    fn removes_units_the_job_did_not_read() {
+        let (_tmp, root) = fixture();
+        let profile = root.join("debug");
+        marker::write(
+            &root,
+            &Marker {
+                start: marker::now_secs(),
+                atime: true,
+            },
+        )
+        .unwrap();
+        let fingerprint = |name: &str| {
+            fsutil::subdirs(&profile.join(".fingerprint"))
+                .find(|d| d.file_name().unwrap().to_string_lossy().starts_with(name))
+                .unwrap()
+        };
+        // As `ci start` leaves them, then the job reads `used`'s fingerprint.
+        let old = at(1_700_000_000);
+        for dir in fsutil::subdirs(&profile.join(".fingerprint")) {
+            for (_, file) in fsutil::entries(&dir) {
+                fs::File::open(&file)
+                    .unwrap()
+                    .set_times(
+                        fs::FileTimes::new()
+                            .set_accessed(UNIX_EPOCH)
+                            .set_modified(old),
+                    )
+                    .unwrap();
+            }
+            fs::File::open(&dir)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(old))
+                .unwrap();
+        }
+        let read = fingerprint("used").join("lib-used");
+        fs::File::open(&read)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_accessed(SystemTime::now()))
+            .unwrap();
+
+        let dry = opts(&root);
+        let dry = Options {
+            dry_run: true,
+            keep_incremental: true,
+            ..dry
+        };
+        let report = trim(&dry, Tracking::from_marker(marker::read(&root).unwrap()));
+        assert_eq!(fingerprint_count(&root), 3, "a dry run removes nothing");
+        assert_eq!(
+            report
+                .removed
+                .iter()
+                .map(|r| (r.0, r.1))
+                .collect::<Vec<_>>(),
+            [(Reason::Unused, 2), (Reason::Workspace, 1)]
+        );
+        assert!(report.after < report.before);
+
+        let summary = root.join("summary.md");
+        let options = Options {
+            keep_incremental: true,
+            step_summary: Some(summary.clone()),
+            ..opts(&root)
+        };
+        run(&options).unwrap();
+        assert!(fingerprint("used").exists());
+        assert!(profile.join("deps/libused-1111111111111111.rlib").exists());
+        assert!(profile.join("incremental/used-1abc").exists());
+        assert_eq!(fingerprint_count(&root), 1);
+        assert!(
+            !profile
+                .join("deps/libunused-2222222222222222.rlib")
+                .exists()
+        );
+        assert!(!profile.join("deps/app-3333333333333333").exists());
+        assert!(!profile.join("incremental/unused-2abc").exists());
+        // The kept unit's unread files have their access times back, and the
+        // marker is gone.
+        let meta = fs::metadata(&read).unwrap();
+        assert!(meta.accessed().unwrap() > UNIX_EPOCH + Duration::from_secs(86_400));
+        assert_eq!(marker::read(&root).unwrap(), None);
+        let markdown = fs::read_to_string(&summary).unwrap();
+        assert!(
+            markdown.contains("| Removed: not used in this job | 2 |"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("| Kept | 1 unit, 1 incremental cache |"),
+            "{markdown}"
+        );
+    }
+
+    #[test]
+    fn without_a_marker_only_the_budget_applies() {
+        let (_tmp, root) = fixture();
+        let options = Options {
+            members: BTreeSet::new(),
+            keep_incremental: true,
+            budget: Some(1),
+            ..opts(&root)
+        };
+        let report = trim(&options, Tracking::NoMarker);
+        assert_eq!(
+            report
+                .removed
+                .iter()
+                .map(|r| (r.0, r.1))
+                .collect::<Vec<_>>(),
+            [(Reason::Budget, 5)]
+        );
+        assert_eq!(fingerprint_count(&root), 0);
+        assert!(fsutil::entries(&root.join("debug/deps")).next().is_none());
+
+        // Under budget: nothing at all.
+        let (_tmp, root) = fixture();
+        let options = Options {
+            budget: Some(1 << 30),
+            keep_workspace: true,
+            keep_incremental: true,
+            ..opts(&root)
+        };
+        let report = trim(&options, Tracking::Frozen);
+        assert!(report.removed.is_empty(), "{report:?}");
+        assert_eq!(report.kept_units, 3);
+        assert_eq!(report.kept_caches, 2);
+    }
+}
