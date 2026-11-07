@@ -189,4 +189,42 @@ mod tests {
         assert_eq!(registry.roots[&root].last_used, 40);
         assert_eq!(registry.roots[&root].compile_ms, 16);
     }
+
+    #[test]
+    fn absorb_keeps_the_latest_use_and_sums_compile_time() {
+        let mut a = RootInfo {
+            last_used: 10,
+            workspaces: [PathBuf::from("/w/a")].into(),
+            compile_ms: 5,
+        };
+        let b = RootInfo {
+            last_used: 7,
+            workspaces: [PathBuf::from("/w/b")].into(),
+            compile_ms: u64::MAX,
+        };
+        a.absorb(&b);
+        assert_eq!(a.last_used, 10);
+        assert_eq!(a.compile_ms, u64::MAX);
+        assert_eq!(a.workspaces.len(), 2);
+    }
+
+    #[test]
+    fn append_stops_once_the_ledger_is_too_big() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            home: tmp.path().to_path_buf(),
+        };
+        let file = fs::File::create(paths.ledger()).unwrap();
+        file.set_len(MAX_LEDGER + 1).unwrap();
+        append(
+            &paths,
+            &Record {
+                ts: 1,
+                root: PathBuf::from("/x"),
+                workspace: None,
+                ms: 0,
+            },
+        );
+        assert_eq!(fs::metadata(paths.ledger()).unwrap().len(), MAX_LEDGER + 1);
+    }
 }

@@ -103,3 +103,39 @@ fn layout(dir: &BuildDir) -> &'static str {
         (false, false) => "empty",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scan::Profile;
+    use std::path::PathBuf;
+    use std::time::SystemTime;
+
+    fn dir(flags: &[(bool, bool)]) -> BuildDir {
+        BuildDir {
+            root: PathBuf::from("/x"),
+            profiles: flags
+                .iter()
+                .map(|&(legacy, v2)| Profile {
+                    path: PathBuf::from("/x/debug"),
+                    legacy,
+                    v2,
+                })
+                .collect(),
+            last_used: SystemTime::now(),
+            workspaces: Default::default(),
+            pinned: false,
+            device: None,
+            compile_ms: 0,
+        }
+    }
+
+    #[test]
+    fn layout_names_what_the_profiles_hold() {
+        assert_eq!(layout(&dir(&[])), "empty");
+        assert_eq!(layout(&dir(&[(true, false)])), "legacy");
+        assert_eq!(layout(&dir(&[(false, true)])), "v2");
+        assert_eq!(layout(&dir(&[(true, false), (false, true)])), "mixed");
+        assert_eq!(layout(&dir(&[(true, true)])), "mixed");
+    }
+}

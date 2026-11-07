@@ -1446,4 +1446,81 @@ mod tests {
             .collect();
         assert_eq!(kept, [(Kind::LowSpace, tmp.path().join("running"))]);
     }
+
+    #[test]
+    fn every_kind_has_its_own_description() {
+        let kinds = [
+            Kind::StaleObjects,
+            Kind::OldSessions,
+            Kind::LegacyLayout,
+            Kind::IdleIncremental,
+            Kind::IdleUnit,
+            Kind::Orphaned,
+            Kind::Idle,
+            Kind::LowSpace,
+            Kind::Requested,
+        ];
+        let described: BTreeSet<&str> = kinds.iter().map(|k| k.describe()).collect();
+        assert_eq!(described.len(), kinds.len());
+    }
+
+    #[test]
+    fn signed_sizes_keep_their_sign() {
+        assert_eq!(signed(-2048), format!("-{}", human(2048)));
+        assert_eq!(signed(2048), human(2048));
+        assert_eq!(signed(i128::MAX), human(u64::MAX));
+    }
+
+    #[test]
+    fn a_build_dir_with_nothing_built_is_dated_by_its_own_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = build_dir(tmp.path(), "target");
+        age(&root, 3 * DAY);
+        let dir = BuildDir::inspect(&root, None);
+        let idle = dir.idle_for(SystemTime::now());
+        assert!(idle > 2 * DAY && idle < 4 * DAY, "{idle:?}");
+    }
+
+    #[test]
+    fn inventory_merges_entries_recorded_against_a_subdirectory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let root = build_dir(&base, "target");
+        make(&root.join("debug/.fingerprint/a-0123456789abcdef/lib-a"));
+        let paths = Paths {
+            home: base.join("home"),
+        };
+        let mut recorded = Registry::default();
+        recorded.roots.insert(
+            root.join("debug"),
+            RootInfo {
+                last_used: 5,
+                workspaces: [base.join("gone")].into(),
+                compile_ms: 7,
+            },
+        );
+        recorded.roots.insert(
+            root.clone(),
+            RootInfo {
+                last_used: 9,
+                workspaces: Default::default(),
+                compile_ms: 1,
+            },
+        );
+        // An entry whose directory is gone is dropped.
+        recorded
+            .roots
+            .insert(base.join("missing"), RootInfo::default());
+        ledger::save(&paths, &recorded).unwrap();
+
+        let (registry, dirs) = inventory(&paths, &[]).unwrap();
+        assert_eq!(registry.roots.len(), 1);
+        let info = &registry.roots[&root];
+        assert_eq!(info.last_used, 9);
+        assert_eq!(info.compile_ms, 8);
+        assert_eq!(dirs.len(), 1);
+        assert!(dirs[0].orphaned());
+        // The merged registry was saved.
+        assert_eq!(ledger::load(&paths), registry);
+    }
 }

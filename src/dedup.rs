@@ -74,27 +74,33 @@ pub fn run(apply: bool, verbose: bool) -> Result<()> {
         return Ok(());
     }
     let summary = dedup(&dirs, apply)?;
-    report(&summary, dirs.len(), apply, verbose);
+    print!("{}", report(&summary, dirs.len(), apply, verbose));
     Ok(())
 }
 
-fn report(summary: &Summary, dirs: usize, apply: bool, verbose: bool) {
+fn report(summary: &Summary, dirs: usize, apply: bool, verbose: bool) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
     if verbose {
         for group in &summary.groups {
-            println!("{:>10}  {}", human(group.size), group.kept.display());
+            let _ = writeln!(out, "{:>10}  {}", human(group.size), group.kept.display());
             for path in &group.replaced {
-                println!("{:>10}  = {}", "", path.display());
+                let _ = writeln!(out, "{:>10}  = {}", "", path.display());
             }
         }
         if !summary.groups.is_empty() {
-            println!();
+            let _ = writeln!(out);
         }
     }
     if summary.files == 0 {
-        println!("No duplicate files to replace in {dirs} build directories.");
+        let _ = writeln!(
+            out,
+            "No duplicate files to replace in {dirs} build directories."
+        );
     } else {
         let verb = if apply { "Replaced" } else { "Would replace" };
-        println!(
+        let _ = writeln!(
+            out,
             "{verb} {} duplicate files ({}) in {} groups with clones.",
             summary.files,
             human(summary.bytes),
@@ -102,19 +108,22 @@ fn report(summary: &Summary, dirs: usize, apply: bool, verbose: bool) {
         );
     }
     if summary.busy > 0 {
-        println!(
+        let _ = writeln!(
+            out,
             "Skipped {} files in build directories a build was using.",
             summary.busy
         );
     }
     if summary.skipped > 0 {
-        println!(
+        let _ = writeln!(
+            out,
             "Skipped {} files that changed or couldn't be replaced.",
             summary.skipped
         );
     }
     if summary.unsupported_volumes > 0 {
-        println!(
+        let _ = writeln!(
+            out,
             "Skipped {} volume(s) whose filesystem can't clone files.",
             summary.unsupported_volumes
         );
@@ -122,14 +131,24 @@ fn report(summary: &Summary, dirs: usize, apply: bool, verbose: bool) {
     match summary.freed {
         _ if summary.files == 0 => {}
         Some(freed) if freed >= 0 => {
-            println!("Free space went up by {}.", human(freed.unsigned_abs()))
+            let _ = writeln!(
+                out,
+                "Free space went up by {}.",
+                human(freed.unsigned_abs())
+            );
         }
-        Some(freed) => println!(
-            "Free space went down by {} (other activity on the disk counts too).",
-            human(freed.unsigned_abs())
-        ),
-        None => println!("Run `cargo steward dedup --apply` to replace them."),
+        Some(freed) => {
+            let _ = writeln!(
+                out,
+                "Free space went down by {} (other activity on the disk counts too).",
+                human(freed.unsigned_abs())
+            );
+        }
+        None => {
+            let _ = writeln!(out, "Run `cargo steward dedup --apply` to replace them.");
+        }
     }
+    out
 }
 
 /// A file that may have duplicates.
@@ -686,5 +705,86 @@ mod tests {
         fs::write(&paths[2], &other).unwrap();
         assert!(same_contents(&paths[0], &paths[1]).unwrap());
         assert!(!same_contents(&paths[0], &paths[2]).unwrap());
+    }
+
+    #[test]
+    fn report_lists_groups_and_every_skip_reason() {
+        let summary = Summary {
+            groups: vec![Group {
+                size: 2048,
+                kept: PathBuf::from("/a/kept"),
+                replaced: vec![PathBuf::from("/b/dup")],
+            }],
+            files: 1,
+            bytes: 2048,
+            busy: 2,
+            skipped: 3,
+            unsupported_volumes: 4,
+            freed: None,
+        };
+        let text = report(&summary, 2, false, true);
+        assert!(text.contains("/a/kept"), "{text}");
+        assert!(text.contains("= /b/dup"), "{text}");
+        assert!(text.contains("Would replace 1 duplicate files"), "{text}");
+        assert!(text.contains("in 1 groups"), "{text}");
+        assert!(
+            text.contains("Skipped 2 files in build directories a build"),
+            "{text}"
+        );
+        assert!(text.contains("Skipped 3 files that changed"), "{text}");
+        assert!(text.contains("Skipped 4 volume(s)"), "{text}");
+        assert!(text.contains("dedup --apply"), "{text}");
+
+        // Without --verbose the groups aren't listed.
+        let quiet = report(&summary, 2, false, false);
+        assert!(!quiet.contains("/a/kept"), "{quiet}");
+    }
+
+    #[test]
+    fn report_states_the_change_in_free_space_after_applying() {
+        let mut summary = Summary {
+            files: 1,
+            bytes: 2048,
+            freed: Some(4096),
+            ..Summary::default()
+        };
+        let up = report(&summary, 2, true, false);
+        assert!(up.contains("Replaced 1 duplicate files"), "{up}");
+        assert!(up.contains("Free space went up by"), "{up}");
+        assert!(!up.contains("--apply"), "{up}");
+        summary.freed = Some(-4096);
+        let down = report(&summary, 2, true, false);
+        assert!(down.contains("Free space went down by"), "{down}");
+    }
+
+    #[test]
+    fn report_with_nothing_to_replace_says_so_and_nothing_else() {
+        let text = report(&Summary::default(), 3, false, true);
+        assert_eq!(
+            text,
+            "No duplicate files to replace in 3 build directories.\n"
+        );
+    }
+
+    #[test]
+    fn dirs_without_a_device_are_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut dirs = fixture(tmp.path());
+        for dir in &mut dirs {
+            dir.device = None;
+        }
+        let summary = dedup(&dirs, false).unwrap();
+        assert_eq!(summary.files, 0);
+        assert_eq!(summary.unsupported_volumes, 0);
+    }
+
+    #[test]
+    fn a_file_listed_twice_is_not_its_own_duplicate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = fixture(tmp.path());
+        // The same build dir twice: every file is seen twice.
+        let twice = vec![dirs[0].clone(), dirs[0].clone()];
+        let summary = dedup(&twice, false).unwrap();
+        assert_eq!(summary.files, 0);
     }
 }
