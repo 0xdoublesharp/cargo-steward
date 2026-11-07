@@ -274,4 +274,78 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn reads_recorded_dirs_from_the_registry_and_the_ledger() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            home: tmp.path().join("home"),
+        };
+        assert!(recorded_build_dirs(&paths).is_empty());
+        let record = |root: &str| ledger::Record {
+            ts: 1,
+            root: root.into(),
+            workspace: None,
+            ms: 0,
+        };
+        ledger::append(&paths, &record("/b/one"));
+        ledger::compact(&paths).unwrap();
+        ledger::append(&paths, &record("/b/two"));
+        ledger::append(&paths, &record("/b/one"));
+        fs::write(
+            paths.ledger(),
+            format!("{}not json\n", fs::read_to_string(paths.ledger()).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(
+            recorded_build_dirs(&paths),
+            [PathBuf::from("/b/one"), PathBuf::from("/b/two")]
+        );
+    }
+
+    #[test]
+    fn detects_volumes_holding_recorded_build_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let (one, two) = (base.join("one"), base.join("two"));
+        fs::create_dir_all(&one).unwrap();
+        fs::create_dir_all(&two).unwrap();
+        let recorded = vec![one.clone(), two.clone(), base.join("gone")];
+
+        // On the home directory's volume: too broad, left out.
+        let same = Sources {
+            recorded: recorded.clone(),
+            home: Some(base.clone()),
+            ..Sources::default()
+        };
+        assert!(detect(&same).is_empty());
+
+        // On another volume than home: that volume's mount point.
+        let elsewhere = Path::new("/");
+        if fsutil::device(elsewhere) == fsutil::device(&base) {
+            return;
+        }
+        let mount = mount_point(&one).unwrap().canonicalize().unwrap();
+        let detected = detect(&Sources {
+            recorded,
+            home: Some(elsewhere.to_path_buf()),
+            ..Sources::default()
+        });
+        assert_eq!(
+            detected,
+            [Detected {
+                root: mount,
+                reason: "volume holding 2 recorded build directories".into()
+            }]
+        );
+        let detected = detect(&Sources {
+            recorded: vec![one],
+            home: Some(elsewhere.to_path_buf()),
+            ..Sources::default()
+        });
+        assert_eq!(
+            detected[0].reason,
+            "volume holding 1 recorded build directory"
+        );
+    }
 }

@@ -154,6 +154,7 @@ pub fn run(name: &str, dry_run: bool) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn plans_a_new_volume_in_the_system_container() {
@@ -196,5 +197,38 @@ mod tests {
                    \t<key>APFSContainerReference</key>\n\t<string>disk3</string>\n</dict>";
         assert_eq!(container_from_plist(xml).as_deref(), Some("disk3"));
         assert_eq!(container_from_plist("<dict></dict>"), None);
+    }
+
+    #[test]
+    fn tells_a_mounted_volume_from_a_plain_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!mounted(&tmp.path().join("missing")).unwrap());
+        let plain = tmp.path().join("Scratch");
+        fs::create_dir(&plain).unwrap();
+        let err = mounted(&plain).unwrap_err().to_string();
+        assert!(err.contains("isn't a mounted volume"), "{err}");
+        // A mount point lives on another device than its parent.
+        if let Some(mount) = crate::setup::roots::mount_point(tmp.path())
+            && mount.parent().is_some()
+        {
+            assert!(mounted(&mount).unwrap(), "{}", mount.display());
+        }
+    }
+
+    #[test]
+    fn refuses_bad_names_and_other_systems() {
+        let err = run("a/b", true).unwrap_err().to_string();
+        if cfg!(target_os = "macos") {
+            assert!(err.contains("isn't a usable volume name"), "{err}");
+        } else {
+            assert!(err.contains("works only on macOS"), "{err}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn finds_the_system_container() {
+        let container = system_container().unwrap();
+        assert!(container.starts_with("disk"), "{container}");
     }
 }

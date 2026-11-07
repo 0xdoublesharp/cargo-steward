@@ -361,4 +361,59 @@ mod tests {
         assert!(is_steward("cargo-steward"));
         assert!(!is_steward("sccache"));
     }
+
+    #[test]
+    fn prefers_config_toml_but_falls_back_to_the_legacy_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        assert_eq!(cargo_config_path(home), home.join("config.toml"));
+        fs::write(home.join("config"), "").unwrap();
+        assert_eq!(cargo_config_path(home), home.join("config"));
+        fs::write(home.join("config.toml"), "").unwrap();
+        assert_eq!(cargo_config_path(home), home.join("config.toml"));
+    }
+
+    #[test]
+    fn replaces_a_build_key_that_isnt_a_table() {
+        let mut doc: DocumentMut = "build = 3\n".parse().unwrap();
+        build_table(&mut doc)["jobs"] = value(2);
+        let doc: DocumentMut = doc.to_string().parse().unwrap();
+        assert_eq!(doc["build"]["jobs"].as_integer(), Some(2));
+    }
+
+    #[test]
+    fn undo_removes_a_managed_build_dir_and_leaves_another_wrapper() {
+        let mut doc: DocumentMut = "[build]\nrustc-wrapper = \"sccache\"\nbuild-dir = \"/b/{x}\"\n"
+            .parse()
+            .unwrap();
+        let mut settings = Config {
+            managed_build_dir: true,
+            inner_wrapper: Some("other".into()),
+            ..Config::default()
+        };
+        undo(&mut doc, &mut settings, false);
+        assert_eq!(doc.to_string(), "[build]\nrustc-wrapper = \"sccache\"\n");
+        assert!(!settings.managed_build_dir);
+    }
+
+    #[test]
+    fn uses_the_installed_binary_when_there_is_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let current = steward_exe(tmp.path()).unwrap();
+        assert!(current.is_absolute() && current.exists());
+        let installed = tmp.path().join("bin").join(exe_name());
+        fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        fs::write(&installed, "").unwrap();
+        assert_eq!(steward_exe(tmp.path()).unwrap(), installed);
+    }
+
+    #[test]
+    fn makes_relative_paths_absolute() {
+        assert_eq!(absolute(Path::new("/a/b")).unwrap(), PathBuf::from("/a/b"));
+        assert_eq!(
+            absolute(Path::new("a/b")).unwrap(),
+            env::current_dir().unwrap().join("a/b")
+        );
+        assert_eq!(shell_quote(Path::new("")), "''");
+    }
 }

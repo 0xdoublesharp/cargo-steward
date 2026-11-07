@@ -246,3 +246,25 @@ fn pin(dir: &Path, on: bool) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tells_compilers_from_commands() {
+        for command in COMMANDS {
+            assert!(!is_wrapper_call(&command.into()), "{command}");
+        }
+        assert!(!is_wrapper_call(&"--anything".into()));
+        assert!(is_wrapper_call(&"/usr/local/bin/rustc".into()));
+        assert!(is_wrapper_call(&"rustc".into()));
+        assert!(is_wrapper_call(&"clippy-driver".into()));
+        assert!(is_wrapper_call(&"./my-compiler".into()));
+        // A bare name that isn't a known compiler counts only under cargo.
+        assert_eq!(
+            is_wrapper_call(&"mycc".into()),
+            env::var_os("CARGO").is_some()
+        );
+    }
+}
