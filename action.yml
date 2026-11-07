@@ -10,6 +10,8 @@ inputs:
     description: >-
       `start` before the job builds (installs cargo-steward if needed and marks the
       job's start), or `trim` as the job's last step, before the cache is saved.
+      `trim` needs no `if:`: after a failed job, the next `start` puts back the
+      access times this one reset.
     required: true
   budget:
     description: >-

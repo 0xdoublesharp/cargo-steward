@@ -77,7 +77,9 @@ jobs:
   afterwards.
 - Leave `trim` without an `if:` (so it only runs when the job succeeds). A
   failed job stops partway, before it has used everything it would have, and
-  rust-cache doesn't save after a failure by default anyway.
+  rust-cache doesn't save after a failure by default anyway. Nothing is lost
+  by skipping it: the next `start` puts back the access times this one saved
+  (see below).
 - Pick a budget so that every cache key you keep fits in 10 GB together.
   rust-cache compresses what it saves, and keeps one cache per OS, job, and
   toolchain.
@@ -155,14 +157,20 @@ it every time a build considers the unit, including when the unit is up to
 date and nothing compiles. That read is the signal.
 
 `ci start` writes `.cargo-steward-ci-start` at the root of the build directory
-with the time, then sets the access time of every fingerprint file to the
-Unix epoch, leaving modification times alone. An access time older than the
+with the time, saves when each unit's fingerprint was last used to
+`.cargo-steward-ci-atimes` next to it, then sets the access time of every
+fingerprint file to the Unix epoch, leaving modification times alone. An access time older than the
 modification time is the case every common mount updates on the next read:
 Linux `relatime` (the default) and `strictatime`, and macOS, whose APFS
 behaves like `relatime`. So after the job, a unit whose fingerprint files were
 neither read nor written since the start was in none of its builds. `trim`
-removes those units, then gives the fingerprints of the units it keeps their
-modification time as access time again, and removes the marker.
+removes those units, puts back the saved access times of the fingerprints no
+build read, and removes both files.
+
+A job that fails or is cancelled before `trim` leaves the reset access times
+and the saved ones. Until a `start` or `trim` puts them back (the next `start`
+does so before saving them again), `cargo steward gc` goes by the saved
+times, so a unit the job didn't reach doesn't look unused since it was built.
 
 When the build directory doesn't exist yet, `start` leaves it alone: cargo
 marks a build directory as a cache (`CACHEDIR.TAG`, and on macOS a Time

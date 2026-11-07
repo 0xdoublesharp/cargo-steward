@@ -9,6 +9,10 @@
 //! the modification time. So at `trim`, a unit whose fingerprint was neither
 //! read nor written since the start was in no build of the job, and goes.
 //!
+//! `start` saves the access times it resets first, and `trim` puts them
+//! back. When a job never gets to `trim`, the next `start` does, and `gc`
+//! goes by the saved times until then.
+//!
 //! Where the filesystem doesn't record reads (`noatime`), `start` notices,
 //! leaves access times alone, and `trim` only applies the size budget.
 
@@ -16,14 +20,23 @@ mod marker;
 mod trim;
 mod units;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::SystemTime;
 
 use anyhow::{Context, Result, bail};
 use clap::Subcommand;
+
+/// When each unit's fingerprint in `root` was last used before a `ci start`
+/// whose job hasn't reached `ci trim` reset its access times, by fingerprint
+/// directory. Until then those access times only say whether the job read
+/// the unit, so cleanup goes by these instead.
+pub fn saved_last_use(root: &Path) -> BTreeMap<PathBuf, SystemTime> {
+    marker::load_saved(root)
+}
 
 #[derive(Debug, clap::Args)]
 pub struct Args {
@@ -127,10 +140,21 @@ fn start(root: &Path, probe: fn(&Path) -> std::io::Result<bool>) -> Result<()> {
         );
         return Ok(());
     }
+    // A job that never got to `trim` (it failed, or was cancelled) left
+    // access times reset: put them back before saving them again.
+    if root.join(marker::SAVED_FILE).exists() {
+        marker::restore_all(root)
+            .with_context(|| format!("restoring access times in {}", root.display()))?;
+    }
     let start = marker::now_secs();
     let atime =
         probe(root).with_context(|| format!("checking access times in {}", root.display()))?;
-    let reset = if atime { marker::reset_atimes(root) } else { 0 };
+    let reset = if atime {
+        marker::reset_atimes(root)
+            .with_context(|| format!("saving access times in {}", root.display()))?
+    } else {
+        0
+    };
     marker::write(root, &marker::Marker { start, atime })?;
     println!(
         "cargo-steward: marked the job's start in {}",
@@ -194,6 +218,54 @@ fn parse_metadata(json: &[u8]) -> Result<Metadata> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn access_times_survive_a_job_that_never_trims() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("target");
+        let dir = root.join("debug/.fingerprint/serde-0123456789abcdef");
+        let file = dir.join("lib-serde");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&file, b"x").unwrap();
+        let built = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let read = UNIX_EPOCH + Duration::from_secs(1_750_000_000);
+        fs::File::open(&file)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(built).set_accessed(read))
+            .unwrap();
+        let accessed = || fs::metadata(&file).unwrap().accessed().unwrap();
+
+        start(&root, marker::probe_atime).unwrap();
+        if !marker::read(&root).unwrap().unwrap().atime {
+            return; // `noatime`: nothing was reset.
+        }
+        assert_eq!(accessed(), UNIX_EPOCH);
+        // Cleanup meanwhile goes by when the unit was last read, not built.
+        assert_eq!(saved_last_use(&root).get(&dir), Some(&read));
+
+        // The job fails before `trim`; the next job's start keeps that time.
+        start(&root, marker::probe_atime).unwrap();
+        assert_eq!(accessed(), UNIX_EPOCH);
+        assert_eq!(saved_last_use(&root).get(&dir), Some(&read));
+
+        // And `trim` puts it back.
+        trim::run(&trim::Options {
+            root: root.clone(),
+            members: BTreeSet::new(),
+            budget: None,
+            keep_workspace: true,
+            keep_incremental: true,
+            dry_run: false,
+            verbose: false,
+            step_summary: None,
+        })
+        .unwrap();
+        assert_eq!(accessed(), read);
+        assert!(saved_last_use(&root).is_empty());
+        assert_eq!(marker::read(&root).unwrap(), None);
+    }
 
     #[test]
     fn start_leaves_creating_the_build_directory_to_cargo() {

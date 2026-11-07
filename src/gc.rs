@@ -148,6 +148,10 @@ impl BuildDir {
                 last_used = last_used.max(t);
             }
         }
+        // A CI job's start reset fingerprint access times here and saved them.
+        if let Some(t) = crate::ci::saved_last_use(root).into_values().max() {
+            last_used = last_used.max(t);
+        }
         if last_used == UNIX_EPOCH {
             // Never built anything we can date: go by the directory itself.
             last_used = fs::metadata(root)
@@ -466,10 +470,11 @@ fn clean_dir(dir: &BuildDir, sweep: Sweep) -> (Cleanup, bool) {
             }
         }
     }
+    let saved = crate::ci::saved_last_use(&dir.root);
     let live = if dir.pinned {
         None
     } else {
-        live_units(&dir.profiles, sweep)
+        live_units(&dir.profiles, &saved, sweep)
     };
     for profile in &dir.profiles {
         out.absorb(clean_profile(
@@ -477,6 +482,7 @@ fn clean_dir(dir: &BuildDir, sweep: Sweep) -> (Cleanup, bool) {
             &dir.root,
             dir.pinned,
             live.as_ref(),
+            &saved,
             sweep,
         ));
     }
@@ -494,9 +500,16 @@ fn clean_dir(dir: &BuildDir, sweep: Sweep) -> (Cleanup, bool) {
 /// build links against looks as old as its last rebuild, and only what
 /// depends on it shows it's in use.
 ///
+/// `saved`: when units were last used before a CI job's start reset their
+/// fingerprints' access times ([`crate::ci::saved_last_use`]).
+///
 /// `None` when a unit in use has a fingerprint that doesn't parse: what it
 /// depends on is unknown, so no unit is removed.
-fn live_units(profiles: &[Profile], sweep: Sweep) -> Option<BTreeSet<PathBuf>> {
+fn live_units(
+    profiles: &[Profile],
+    saved: &BTreeMap<PathBuf, SystemTime>,
+    sweep: Sweep,
+) -> Option<BTreeSet<PathBuf>> {
     let nodes: Vec<scan::UnitNode> = profiles
         .iter()
         .filter(|p| p.v2)
@@ -509,11 +522,10 @@ fn live_units(profiles: &[Profile], sweep: Sweep) -> Option<BTreeSet<PathBuf>> {
         }
     }
     let recent = |node: &scan::UnitNode| {
-        sweep
-            .now
-            .duration_since(node.unit.last_used)
-            .unwrap_or_default()
-            < sweep.policy.unit_idle
+        let last_used = saved
+            .get(&node.unit.path.join("fingerprint"))
+            .map_or(node.unit.last_used, |t| node.unit.last_used.max(*t));
+        sweep.now.duration_since(last_used).unwrap_or_default() < sweep.policy.unit_idle
     };
     let mut live = vec![false; nodes.len()];
     let mut stack: Vec<usize> = (0..nodes.len()).filter(|&i| recent(&nodes[i])).collect();
@@ -539,13 +551,16 @@ fn live_units(profiles: &[Profile], sweep: Sweep) -> Option<BTreeSet<PathBuf>> {
 }
 
 /// `live`: the new-layout units builds still need ([`live_units`]); `None`
-/// keeps every unit. What's removed is renamed aside into `root`, the build
-/// directory, first.
+/// keeps every unit. `saved`: when units were last used before a CI job's
+/// start reset their fingerprints' access times
+/// ([`crate::ci::saved_last_use`]). What's removed is renamed aside into
+/// `root`, the build directory, first.
 fn clean_profile(
     profile: &Profile,
     root: &Path,
     pinned: bool,
     live: Option<&BTreeSet<PathBuf>>,
+    saved: &BTreeMap<PathBuf, SystemTime>,
     sweep: Sweep,
 ) -> Cleanup {
     let _lock = if sweep.apply {
@@ -591,7 +606,9 @@ fn clean_profile(
     // build (an older pinned toolchain) has run for a while.
     if profile.legacy
         && profile.v2
-        && scan::legacy_last_used(&profile.path).is_none_or(|t| idle(t, policy.legacy_idle))
+        && scan::legacy_last_used(&profile.path)
+            .max(saved_under(saved, &profile.path.join(".fingerprint")))
+            .is_none_or(|t| idle(t, policy.legacy_idle))
     {
         for path in scan::legacy_paths(&profile.path) {
             remove_dir(
@@ -606,7 +623,10 @@ fn clean_profile(
         }
     }
     if let Some(live) = live {
-        for unit in scan::v2_units(&profile.path) {
+        for mut unit in scan::v2_units(&profile.path) {
+            if let Some(t) = saved.get(&unit.path.join("fingerprint")) {
+                unit.last_used = unit.last_used.max(*t);
+            }
             if idle(unit.last_used, policy.unit_idle) && !live.contains(&unit.path) {
                 remove_dated(Kind::IdleUnit, &unit, root, sweep, &mut out);
             }
@@ -655,6 +675,15 @@ enum Removal {
     /// A build holds its locks.
     Busy,
     Failed,
+}
+
+/// The latest of the saved times of fingerprint directories under `dir`.
+fn saved_under(saved: &BTreeMap<PathBuf, SystemTime>, dir: &Path) -> Option<SystemTime> {
+    saved
+        .range(dir.to_path_buf()..)
+        .take_while(|(path, _)| path.starts_with(dir))
+        .map(|(_, t)| *t)
+        .max()
 }
 
 fn remove_dated(
@@ -1336,6 +1365,52 @@ mod tests {
         assert!(debug.join("build/new/fedcba9876543210").exists());
         assert!(!debug.join("incremental/old-1a2b").exists());
         assert!(debug.join("incremental/new-3c4d").exists());
+    }
+
+    #[test]
+    fn goes_by_the_access_times_a_ci_job_saved_until_they_are_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = build_dir(tmp.path(), "target");
+        let debug = root.join("debug");
+        let unit = debug.join("build/old/0123456789abcdef");
+        make(&unit.join("fingerprint/lib-old"));
+        make(&unit.join("out/libold.rlib"));
+        make(&debug.join(".fingerprint/old-fedcba9876543210/lib-old"));
+        make(&debug.join("build/new/fedcba9876543210/fingerprint/lib-new"));
+        age(&root, 30 * DAY);
+        // Built a month ago, read yesterday, then `ci start` reset the
+        // access times and the job failed before `ci trim`.
+        let yesterday = ledger::now_secs() - 86_400;
+        fs::write(
+            root.join(".cargo-steward-ci-atimes"),
+            format!(
+                "{yesterday}\tdebug/build/old/0123456789abcdef/fingerprint\n\
+                 {yesterday}\tdebug/.fingerprint/old-fedcba9876543210\n"
+            ),
+        )
+        .unwrap();
+        for file in [
+            unit.join("fingerprint/lib-old"),
+            debug.join(".fingerprint/old-fedcba9876543210/lib-old"),
+        ] {
+            File::open(&file)
+                .unwrap()
+                .set_times(FileTimes::new().set_accessed(UNIX_EPOCH))
+                .unwrap();
+        }
+
+        let dir = BuildDir::inspect(&root, None);
+        assert!(dir.idle_for(SystemTime::now()) < 2 * DAY, "{dir:?}");
+        let actions = run_clean(&[dir], true);
+        // Only the unit no build used for a month.
+        assert_eq!(
+            actions.iter().map(|a| a.kind).collect::<Vec<_>>(),
+            [Kind::IdleUnit],
+            "{actions:?}"
+        );
+        assert!(unit.exists());
+        assert!(debug.join(".fingerprint/old-fedcba9876543210").exists());
+        assert!(!debug.join("build/new/fedcba9876543210").exists());
     }
 
     #[test]

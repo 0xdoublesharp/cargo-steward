@@ -11,6 +11,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   outputs, and says when those leave the directory over the budget.
 - `ci start` no longer creates a missing build directory, so cargo still
   creates it with `CACHEDIR.TAG` (and, on macOS, a Time Machine exclusion).
+- `ci start` saves the fingerprint access times it resets, so a job that
+  fails or is cancelled before `ci trim` no longer loses when its units were
+  last used: `gc` goes by the saved times, and the next `ci start` (or
+  `ci trim`) puts them back.
 
 ### Added
 

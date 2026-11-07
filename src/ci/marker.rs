@@ -1,20 +1,29 @@
 //! The job-start marker, and the fingerprint access times that tell which
 //! units a job used.
 
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::fs::{self, File, FileTimes};
 use std::io::{self, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 
 use super::units;
-use crate::fsutil::entries;
+use crate::fsutil::{entries, touched};
 use crate::scan;
 
 /// Written by `ci start` at the root of the build directory, removed by
 /// `ci trim`.
 pub const MARKER_FILE: &str = ".cargo-steward-ci-start";
+
+/// Written by `ci start` next to the marker before it resets access times:
+/// when each fingerprint directory was last used, one `<unix seconds>\t<path
+/// under the build directory>` line each. Access times are put back from it
+/// by `trim`, or by the next `start` when a job never got to `trim`, and
+/// `gc` reads it meanwhile.
+pub const SAVED_FILE: &str = ".cargo-steward-ci-atimes";
 
 const PROBE_FILE: &str = ".cargo-steward-atime-probe";
 
@@ -85,11 +94,32 @@ pub fn read(root: &Path) -> Result<Option<Marker>> {
     }
 }
 
+/// Removes the marker and the saved access times.
 pub fn remove(root: &Path) -> io::Result<()> {
-    match fs::remove_file(root.join(MARKER_FILE)) {
+    remove_file(&root.join(SAVED_FILE))?;
+    remove_file(&root.join(MARKER_FILE))
+}
+
+fn remove_file(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         other => other,
     }
+}
+
+/// When each fingerprint directory was last used before `ci start` reset its
+/// access times, by path; empty when nothing is saved (or it can't be read).
+pub fn load_saved(root: &Path) -> BTreeMap<PathBuf, SystemTime> {
+    let Ok(text) = fs::read_to_string(root.join(SAVED_FILE)) else {
+        return BTreeMap::new();
+    };
+    text.lines()
+        .filter_map(|line| {
+            let (secs, rel) = line.split_once('\t')?;
+            let secs: u64 = secs.parse().ok()?;
+            Some((root.join(rel), UNIX_EPOCH + Duration::from_secs(secs)))
+        })
+        .collect()
 }
 
 /// Whether reading a file in `dir` updates its access time once that is set
@@ -118,28 +148,58 @@ fn set_atime(path: &Path, when: SystemTime) -> io::Result<bool> {
     Ok(fs::metadata(path)?.accessed()? == when)
 }
 
-/// Sets the access time of every fingerprint file in the build directory to
-/// the epoch. Returns how many were set.
-pub fn reset_atimes(root: &Path) -> usize {
-    let mut count = 0;
+/// Saves when each fingerprint directory in the build directory was last
+/// used ([`SAVED_FILE`]), then sets the access time of every fingerprint file
+/// to the epoch. Returns how many were set.
+pub fn reset_atimes(root: &Path) -> Result<usize> {
+    let mut saved = String::new();
+    let mut files = Vec::new();
     for profile in scan::profiles(root) {
         for dir in units::fingerprint_dirs(&profile.path) {
+            let mut last_used = None;
             for (_, file) in entries(&dir) {
-                if fs::symlink_metadata(&file).is_ok_and(|m| m.is_file())
-                    && set_atime(&file, UNIX_EPOCH).is_ok()
+                if let Ok(meta) = fs::symlink_metadata(&file)
+                    && meta.is_file()
                 {
-                    count += 1;
+                    last_used = last_used.max(Some(touched(&meta)));
+                    files.push(file);
                 }
+            }
+            let rel = dir.strip_prefix(root).ok().and_then(Path::to_str);
+            if let (Some(time), Some(rel)) = (last_used, rel)
+                && !rel.contains(['\n', '\t'])
+            {
+                let secs = time.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+                let _ = writeln!(saved, "{secs}\t{rel}");
             }
         }
     }
-    count
+    // Before anything is reset, so nothing is lost if this stops partway.
+    crate::config::write_atomic(&root.join(SAVED_FILE), saved.as_bytes())?;
+    Ok(files
+        .iter()
+        .filter(|file| set_atime(file, UNIX_EPOCH).is_ok())
+        .count())
 }
 
-/// Gives fingerprint files in `dir` that no build read since the reset their
-/// modification time as access time again, so other tools don't see them as
-/// untouched for decades.
-pub fn restore_atimes(dir: &Path) {
+/// Puts back the access times `ci start` reset in every profile, from
+/// [`SAVED_FILE`], and removes it. Setting access times removes nothing, so
+/// profiles a build is using are included.
+pub fn restore_all(root: &Path) -> io::Result<()> {
+    let saved = load_saved(root);
+    for profile in scan::profiles(root) {
+        for dir in units::fingerprint_dirs(&profile.path) {
+            restore_atimes(&dir, saved.get(&dir).copied());
+        }
+    }
+    remove_file(&root.join(SAVED_FILE))
+}
+
+/// Gives fingerprint files in `dir` that no build read since the reset the
+/// access time they had before it, as far as `saved` (the directory's last
+/// use) tells, and at least their modification time, so that neither `gc` nor
+/// other tools see them as untouched for decades.
+pub fn restore_atimes(dir: &Path, saved: Option<SystemTime>) {
     for (_, file) in entries(dir) {
         let Ok(meta) = fs::symlink_metadata(&file) else {
             continue;
@@ -148,7 +208,7 @@ pub fn restore_atimes(dir: &Path) {
             continue;
         };
         if meta.is_file() && accessed < UNIX_EPOCH + RESET_WINDOW {
-            let _ = set_atime(&file, modified);
+            let _ = set_atime(&file, saved.map_or(modified, |s| s.max(modified)));
         }
     }
 }
@@ -219,7 +279,7 @@ mod tests {
         // Listable but not searchable: names are read, but not metadata.
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o444)).unwrap();
         assert_eq!(entries(&dir).count(), 1);
-        restore_atimes(&dir);
+        restore_atimes(&dir, None);
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(fs::metadata(&file).unwrap().accessed().unwrap(), UNIX_EPOCH);
     }
@@ -243,7 +303,7 @@ mod tests {
                 .unwrap();
         }
 
-        assert_eq!(reset_atimes(root), 2);
+        assert_eq!(reset_atimes(root).unwrap(), 2);
         for file in [&legacy, &v2] {
             let meta = fs::metadata(file).unwrap();
             assert_eq!(meta.accessed().unwrap(), UNIX_EPOCH, "{}", file.display());
@@ -252,7 +312,7 @@ mod tests {
         // Outputs aren't fingerprints.
         assert!(fs::metadata(&output).unwrap().accessed().unwrap() > UNIX_EPOCH + RESET_WINDOW);
 
-        restore_atimes(legacy.parent().unwrap());
+        restore_atimes(legacy.parent().unwrap(), None);
         assert_eq!(fs::metadata(&legacy).unwrap().accessed().unwrap(), modified);
         assert_eq!(fs::metadata(&v2).unwrap().accessed().unwrap(), UNIX_EPOCH);
     }

@@ -365,13 +365,16 @@ fn trim(options: &Options, tracking: Tracking) -> Report {
         remaining = stay;
     }
 
-    // Kept fingerprints get back the access times they had.
-    if apply && used_since.is_some() {
-        for (unit, _) in &remaining {
-            if let Some(dir) = &unit.fingerprint {
-                marker::restore_atimes(dir);
-            }
-        }
+    // Kept fingerprints, and those in profiles a build is using, get back the
+    // access times they had.
+    if apply
+        && used_since.is_some()
+        && let Err(e) = marker::restore_all(root)
+    {
+        eprintln!(
+            "warning: cargo-steward: failed to restore access times in {}: {e}",
+            root.display()
+        );
     }
 
     let mut report = out.report;
