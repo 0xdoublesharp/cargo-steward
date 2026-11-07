@@ -178,6 +178,10 @@ mod tests {
         assert_eq!(value["url"], "http://example.com/*not a comment*/");
         assert_eq!(value["list"], serde_json::json!([1, 2]));
         assert_eq!(value["escaped"], "a \" // still a string");
+        // A line comment between a trailing comma and the bracket.
+        let value: serde_json::Value =
+            serde_json::from_str(&strip_jsonc("[1, // last\n]")).unwrap();
+        assert_eq!(value, serde_json::json!([1]));
     }
 
     #[test]

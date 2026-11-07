@@ -275,6 +275,169 @@ fn install_needs_a_home() {
     assert!(err.contains("can't find the steward home"), "{err}");
 }
 
+#[test]
+fn install_reports_a_bin_dir_or_startup_file_it_cant_read() {
+    let env = Env::new();
+    // A bin dir it can't look into.
+    let locked = env.root.join("locked");
+    fs::create_dir_all(&locked).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    let mut cmd = env.cmd(
+        &env.root,
+        &["shim", "install", "--bin-dir", locked.to_str().unwrap()],
+    );
+    let err = env.fails(&mut cmd);
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        err.contains(&locked.join("cargo").display().to_string()),
+        "{err}"
+    );
+    assert!(fs::read_dir(&locked).unwrap().next().is_none());
+
+    // A startup file that is a directory.
+    let bin = env.root.join("bin");
+    fs::create_dir_all(env.user.join(".bashrc")).unwrap();
+    let mut cmd = env.cmd(
+        &env.root,
+        &[
+            "shim",
+            "install",
+            "--bin-dir",
+            bin.to_str().unwrap(),
+            "--shell",
+            "bash",
+        ],
+    );
+    let err = env.fails(&mut cmd);
+    assert!(err.contains(".bashrc"), "{err}");
+    assert!(env.user.join(".bashrc").is_dir());
+}
+
+#[test]
+fn uninstall_leaves_startup_files_without_the_block_alone() {
+    let env = Env::new();
+    let bin = env.root.join("bin");
+    let bashrc = env.user.join(".bashrc");
+    fs::write(&bashrc, "alias ll='ls -l'\n").unwrap();
+    let out = env.ok(&mut env.cmd(
+        &env.root,
+        &["shim", "uninstall", "--bin-dir", bin.to_str().unwrap()],
+    ));
+    assert!(!out.contains("Removed the PATH line"), "{out}");
+    assert_eq!(fs::read_to_string(&bashrc).unwrap(), "alias ll='ls -l'\n");
+}
+
+#[test]
+fn explain_without_any_home_uses_the_defaults() {
+    let env = Env::new();
+    let mut cmd = env.cmd(&env.root, &["shim", "explain"]);
+    cmd.env_remove("HOME")
+        .env_remove("CARGO_STEWARD_HOME")
+        .env_remove("CARGO_HOME");
+    let out = env.ok(&mut cmd);
+    assert!(
+        out.contains("settings:     none (no HOME): defaults"),
+        "{out}"
+    );
+}
+
+// ---- the proxy, up to running cargo ----
+
+/// The proxy as `cargo` in `bin`, with a "real cargo" that can't be run: a
+/// script whose interpreter doesn't exist. The proxy does all its work, then
+/// fails to exec, so coverage of that work is recorded.
+fn broken_cargo(env: &Env) -> (PathBuf, PathBuf) {
+    let bin = env.root.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    symlink(BIN, bin.join("cargo")).unwrap();
+    let bogus = env.root.join("real/cargo");
+    fs::create_dir_all(bogus.parent().unwrap()).unwrap();
+    fs::write(&bogus, "#!/nonexistent/interpreter\n").unwrap();
+    fs::set_permissions(&bogus, fs::Permissions::from_mode(0o755)).unwrap();
+    (bin, bogus)
+}
+
+#[test]
+fn the_proxy_reports_a_real_cargo_it_cant_run() {
+    let env = Env::new();
+    let (bin, bogus) = broken_cargo(&env);
+    let work = env.root.join("work");
+    fs::create_dir_all(&work).unwrap();
+    env.config(&format!(
+        "real-cargo = {:?}\ntarget-root = \"~/targets\"\nseed = false\n",
+        bogus.display().to_string()
+    ));
+    // `~/` needs HOME: the build isn't routed, but cargo is still run.
+    let mut cmd = Command::new(bin.join("cargo"));
+    cmd.arg("build")
+        .current_dir(&work)
+        .env("CARGO_STEWARD_HOME", &env.home)
+        .env_remove("HOME")
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO_BUILD_TARGET_DIR");
+    let out = cmd.output().unwrap();
+    assert_eq!(out.status.code(), Some(127), "{}", text(&out));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("not routing this build") && err.contains("needs HOME"),
+        "{err}"
+    );
+    assert!(
+        err.contains(&format!("failed to run {}", bogus.display())),
+        "{err}"
+    );
+}
+
+#[test]
+fn the_proxy_reuses_a_slot_its_parent_holds() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    let env = Env::new();
+    let (bin, bogus) = broken_cargo(&env);
+    env.config(&format!(
+        "real-cargo = {:?}\nmax-builds = 1\nseed = false\n",
+        bogus.display().to_string()
+    ));
+    let slots = env.home.join("slots");
+    fs::create_dir_all(&slots).unwrap();
+    let slot = slots.join("0.lock");
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&slot)
+        .unwrap();
+    held.lock().unwrap();
+    let fd = held.as_raw_fd();
+    let mut cmd = Command::new(bin.join("cargo"));
+    cmd.arg("build")
+        .current_dir(&env.root)
+        .env("CARGO_STEWARD_HOME", &env.home)
+        .env("HOME", &env.user)
+        .env_remove("CARGO_TARGET_DIR")
+        .env("CARGO_STEWARD_SLOT_FD", fd.to_string())
+        .env("CARGO_STEWARD_SLOT", &slot);
+    // SAFETY: fcntl is async-signal-safe; this clears close-on-exec on the
+    // slot descriptor in the child only, as an outer proxy leaves it.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let out = cmd.output().unwrap();
+    // It didn't wait for the slot this process holds, and got as far as
+    // running cargo.
+    assert_eq!(out.status.code(), Some(127), "{}", text(&out));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!err.contains("waiting for one of"), "{err}");
+    assert!(err.contains("failed to run"), "{err}");
+    drop(held);
+}
+
 // ---- shim status / explain ----
 
 #[test]

@@ -267,6 +267,30 @@ mod tests {
     }
 
     #[test]
+    fn old_layout_names_without_a_hash_belong_to_no_unit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = tmp.path().join("debug");
+        let hash = "5555555555555555";
+        for path in [
+            // A build script directory whose fingerprint is gone.
+            format!("build/left-over-{hash}/out/x"),
+            "build/plain/x".to_owned(),
+            "deps/plain.txt".to_owned(),
+        ] {
+            touch(&profile.join(path));
+        }
+        let units = legacy_units(&profile);
+        assert_eq!(units.len(), 1, "{units:?}");
+        assert_eq!(units[0].package, "left-over");
+        assert_eq!(units[0].fingerprint, None);
+        assert!(units[0].crates.contains("left_over"));
+        assert_eq!(
+            names(&units[0].paths, &profile),
+            [format!("build/left-over-{hash}")]
+        );
+    }
+
+    #[test]
     fn groups_old_layout_files_by_unit_hash() {
         let tmp = tempfile::tempdir().unwrap();
         let profile = tmp.path().join("debug");
@@ -297,9 +321,7 @@ mod tests {
         let mut units = legacy_units(&profile);
         units.sort_by(|a, b| a.paths[0].cmp(&b.paths[0]));
         assert_eq!(units.len(), 4);
-        let [lib_unit, script_unit, run_unit, stray] = &units[..] else {
-            unreachable!()
-        };
+        let [lib_unit, script_unit, run_unit, stray]: &[Unit; 4] = units[..].try_into().unwrap();
 
         assert_eq!(
             names(&stray.paths, &profile),

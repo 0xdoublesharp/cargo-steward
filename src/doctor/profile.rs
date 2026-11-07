@@ -154,6 +154,9 @@ mod tests {
             dev_debug("[profile.dev]\ndebug = \"line-tables-only\"\n"),
             Debug::Reduced
         );
+        // Malformed TOML, or a value cargo would reject: the default.
+        assert_eq!(dev_debug("[profile.dev\n"), Debug::Unset);
+        assert_eq!(dev_debug("[profile.dev]\ndebug = 1.5\n"), Debug::Unset);
         assert_eq!(env_debug("line-tables-only"), Debug::Reduced);
         assert_eq!(env_debug("true"), Debug::Full);
     }

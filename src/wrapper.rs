@@ -384,6 +384,18 @@ mod tests {
     }
 
     #[test]
+    fn skips_arguments_that_arent_utf8() {
+        use std::os::unix::ffi::OsStringExt;
+        let mut list = args(&["--crate-name"]);
+        // Not UTF-8: holds the value's place, so it isn't taken as the name.
+        list.push(OsString::from_vec(vec![0xff, 0xfe]));
+        list.extend(args(&["--out-dir", "/o"]));
+        let parsed = RustcArgs::parse(&list);
+        assert_eq!(parsed.crate_name.as_deref(), Some(""));
+        assert_eq!(parsed.out_dir, Some(PathBuf::from("/o")));
+    }
+
+    #[test]
     fn metadata_only_compiles_write_no_objects() {
         let check = RustcArgs::parse(&args(&["--crate-name", "a", "--emit=dep-info,metadata"]));
         assert!(!check.writes_objects());
@@ -537,6 +549,8 @@ mod tests {
         assert_eq!(exit_code(ExitStatus::from_raw(3 << 8)), 3);
         // Killed by SIGKILL, as a shell reports it.
         assert_eq!(exit_code(ExitStatus::from_raw(9)), 137);
+        // Stopped by SIGSTOP: neither an exit code nor a terminating signal.
+        assert_eq!(exit_code(ExitStatus::from_raw(0x137f)), 1);
     }
 
     #[test]

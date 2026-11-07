@@ -103,4 +103,20 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(4));
         assert!(stdout(&mut Command::new("/nonexistent/program")).is_none());
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_daemon_holding_the_pipes_doesnt_hold_up_the_result() {
+        // The command exits at once, but leaves a child (as `sccache` leaves
+        // its server) with its stdout and stderr open.
+        let started = Instant::now();
+        let ran = run(
+            Command::new("sh").args(["-c", "sleep 3 & exit 0"]),
+            Duration::from_millis(500),
+        )
+        .unwrap();
+        assert!(ran.success);
+        assert!(ran.stdout.is_empty() && ran.stderr.is_empty());
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
 }

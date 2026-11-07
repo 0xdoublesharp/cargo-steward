@@ -400,10 +400,9 @@ mod tests {
         // A `.git` directory that isn't a repository is skipped, as git does.
         fs::create_dir_all(root.join("loose/.git")).unwrap();
         let ns = Namespace::of(&dir);
-        if ns.git.is_none() {
-            assert_eq!(ns.key, "standalone");
-            assert_eq!(ns.repo, repo_name("loose", dir.as_os_str()));
-        }
+        assert!(ns.git.is_none());
+        assert_eq!(ns.key, "standalone");
+        assert_eq!(ns.repo, repo_name("loose", dir.as_os_str()));
         let broken = root.join("broken");
         fs::create_dir_all(&broken).unwrap();
         fs::write(broken.join(".git"), "gitdir: /nonexistent/x\n").unwrap();
@@ -445,6 +444,8 @@ mod tests {
         );
         // A missing value is cargo's error to report.
         assert_eq!(command_dir(&cwd, &os(&["build", "--manifest-path"])), cwd);
+        // A manifest path with no parent directory is skipped.
+        assert_eq!(command_dir(&cwd, &os(&["build", "--manifest-path=/"])), cwd);
     }
 
     #[test]
@@ -489,6 +490,9 @@ mod tests {
         // Other build settings, or target-dir elsewhere, don't count.
         fs::create_dir_all(root.join("ws/.cargo")).unwrap();
         let config = root.join("ws/.cargo/config.toml");
+        fs::write(&config, "[build]\njobs = 4\n").unwrap();
+        assert!(!config_sets_target_dir(&config));
+        assert_eq!(target_dir_chosen(&os(&["build"]), none, &[&ws], None), None);
         fs::write(&config, "[build]\njobs = 4\n[env]\ntarget-dir = \"x\"\n").unwrap();
         assert_eq!(target_dir_chosen(&os(&["build"]), none, &[&ws], None), None);
         fs::write(&config, "[build]\ntarget-dir = \"/x\"\n").unwrap();
@@ -519,6 +523,11 @@ mod tests {
         assert_eq!(
             resolve(&root.join("link/missing/../other")),
             root.join("real/other")
+        );
+        // A leading `.` of a relative path that doesn't exist is dropped.
+        assert_eq!(
+            resolve(Path::new("./no-such-dir-here/x")),
+            PathBuf::from("no-such-dir-here/x")
         );
     }
 }

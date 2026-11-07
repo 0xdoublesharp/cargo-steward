@@ -294,6 +294,8 @@ mod tests {
         );
         assert_eq!(env_sccache_dir("[build]\njobs = 4\n", base), None);
         assert_eq!(env_sccache_dir("not toml [", base), None);
+        // Neither a string nor a table.
+        assert_eq!(env_sccache_dir("[env]\nSCCACHE_DIR = 5\n", base), None);
     }
 
     #[test]

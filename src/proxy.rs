@@ -445,12 +445,54 @@ mod tests {
     fn roots_must_be_absolute() {
         assert_eq!(root(Path::new("/r")).unwrap(), PathBuf::from("/r"));
         assert!(root(Path::new("rel/dir")).is_err());
-        if let Some(home) = env::var_os("HOME") {
-            assert_eq!(
-                root(Path::new("~/x")).unwrap(),
-                PathBuf::from(home).join("x")
-            );
-        }
+        // Without HOME, `~/` roots fail; covered end to end in
+        // tests/plumbing.rs, as the test can't unset HOME for itself.
+        let home = env::var_os("HOME").expect("tests run with HOME set");
+        assert_eq!(
+            root(Path::new("~/x")).unwrap(),
+            PathBuf::from(home).join("x")
+        );
+    }
+
+    #[test]
+    fn route_env_links_the_workspace_root_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let ws = base.join("ws");
+        fs::create_dir_all(ws.join("crates/a")).unwrap();
+        fs::write(
+            ws.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/a\"]\n",
+        )
+        .unwrap();
+        fs::write(ws.join("crates/a/Cargo.toml"), "[package]\nname = \"a\"\n").unwrap();
+        let target = base.join("routed/target");
+        let plan = Plan {
+            dir: ws.join("crates/a"),
+            namespace: Namespace::of(Path::new("/")),
+            skip: None,
+            target: Some(target.clone()),
+            tmp: None,
+            seed_from: None,
+            max_builds: None,
+            slots: String::new(),
+            route: None,
+            link_target: true,
+        };
+        assert!(plan.namespace.git.is_none());
+        let vars = route_env(&plan, None).unwrap();
+        assert_eq!(var(&vars, "CARGO_TARGET_DIR"), Some(&target.clone().into()));
+        assert!(target.is_dir());
+        // The `[workspace]` root gets the link, not the member.
+        assert_eq!(fs::read_link(ws.join("target")).unwrap(), target);
+        assert!(fs::symlink_metadata(ws.join("crates/a/target")).is_err());
+
+        // Outside any Cargo project there is nothing to link.
+        let loose = base.join("loose");
+        fs::create_dir_all(&loose).unwrap();
+        assert_eq!(workspace_root(&loose), None);
+        link_workspace_target(&loose, &target, false);
+        assert!(fs::symlink_metadata(loose.join("target")).is_err());
     }
 
     #[test]

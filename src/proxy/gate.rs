@@ -378,6 +378,20 @@ mod tests {
         assert!(env.is_empty());
     }
 
+    /// macOS can't flock a FIFO (EOPNOTSUPP): an error, not a busy slot.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_slot_that_cant_be_locked_is_an_error() {
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo =
+            std::ffi::CString::new(tmp.path().join("0.lock").as_os_str().as_bytes()).unwrap();
+        // SAFETY: mkfifo reads only the NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let taken = try_any(tmp.path(), 1);
+        assert!(taken.is_err(), "{taken:?}");
+    }
+
     #[test]
     fn an_inherited_slot_must_be_a_regular_file() {
         let tmp = tempfile::tempdir().unwrap();

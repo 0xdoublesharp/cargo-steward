@@ -784,6 +784,98 @@ mod tests {
     }
 
     #[test]
+    fn a_dry_run_counts_stale_objects_without_removing_them() {
+        let (_tmp, root) = fixture();
+        let deps = root.join("debug/deps");
+        let old = deps.join("used-1111111111111111.x.0aaa.rcgu.o");
+        fs::write(&old, vec![0u8; 4096]).unwrap();
+        fs::write(
+            deps.join("used-1111111111111111.x.0bbb.rcgu.o"),
+            vec![0u8; 4096],
+        )
+        .unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(at(1_700_000_000))
+            .unwrap();
+        let options = Options {
+            keep_workspace: true,
+            keep_incremental: true,
+            dry_run: true,
+            ..opts(&root)
+        };
+        let report = trim(&options, Tracking::NoMarker);
+        assert_eq!(
+            report
+                .removed
+                .iter()
+                .map(|r| (r.0, r.1))
+                .collect::<Vec<_>>(),
+            [(Reason::StaleObjects, 1)]
+        );
+        assert!(old.exists(), "a dry run");
+        let text = render_text(&options, Tracking::NoMarker, &report);
+        assert!(text.contains("1 stale object files"), "{text}");
+    }
+
+    #[test]
+    fn the_budget_keeps_the_most_recently_used() {
+        let (_tmp, root) = fixture();
+        let all = Options {
+            keep_workspace: true,
+            keep_incremental: true,
+            dry_run: true,
+            ..opts(&root)
+        };
+        let before = trim(&all, Tracking::NoMarker).before;
+        // One byte over: only the least recently used item goes.
+        let options = Options {
+            budget: Some(before - 1),
+            ..all
+        };
+        let report = trim(&options, Tracking::NoMarker);
+        assert_eq!(
+            report
+                .removed
+                .iter()
+                .map(|r| (r.0, r.1))
+                .collect::<Vec<_>>(),
+            [(Reason::Budget, 1)]
+        );
+        assert_eq!(report.kept_units + report.kept_caches, 4, "{report:?}");
+    }
+
+    #[test]
+    fn a_unit_that_cant_be_removed_is_a_warning() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_tmp, root) = fixture();
+        let deps = root.join("debug/deps");
+        fs::set_permissions(&deps, fs::Permissions::from_mode(0o555)).unwrap();
+        let options = Options {
+            budget: Some(1),
+            keep_workspace: true,
+            keep_incremental: true,
+            ..opts(&root)
+        };
+        let report = trim(&options, Tracking::NoMarker);
+        fs::set_permissions(&deps, fs::Permissions::from_mode(0o755)).unwrap();
+        // Counted as trimmed, but what couldn't go is still there and the
+        // trim carried on with the rest.
+        assert_eq!(
+            report
+                .removed
+                .iter()
+                .map(|r| (r.0, r.1))
+                .collect::<Vec<_>>(),
+            [(Reason::Budget, 5)]
+        );
+        assert_eq!(fingerprint_count(&root), 0);
+        assert!(deps.join("libunused-2222222222222222.rlib").exists());
+    }
+
+    #[test]
     fn leaves_a_profile_a_build_is_using() {
         let (_tmp, root) = fixture();
         let lock = fsutil::try_lock_file(&root.join("debug/.cargo-lock"))

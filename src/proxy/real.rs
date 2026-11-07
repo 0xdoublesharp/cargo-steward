@@ -183,4 +183,19 @@ mod tests {
         };
         assert_eq!(none.find(), None);
     }
+
+    #[test]
+    fn an_empty_path_entry_is_the_current_directory() {
+        // Tests run in the package root, which has no `cargo` or `rustup`:
+        // the empty entry is searched as `.` and finds nothing there.
+        assert!(!Path::new("cargo").exists() && !Path::new("rustup").exists());
+        let path = std::ffi::OsString::from(":/nonexistent-dir");
+        let search = Search {
+            configured: None,
+            path: Some(&path),
+            cargo_home: None,
+            me: None,
+        };
+        assert_eq!(search.find(), None);
+    }
 }

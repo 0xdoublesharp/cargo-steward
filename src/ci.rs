@@ -76,7 +76,7 @@ pub fn run(args: &Args) -> Result<()> {
                 Some(dir) => dir.clone(),
                 None => metadata()?.build_dir,
             };
-            start(&root)
+            start(&root, marker::probe_atime)
         }
         CiCommand::Trim(args) => {
             let budget = args
@@ -114,11 +114,12 @@ pub fn run(args: &Args) -> Result<()> {
     }
 }
 
-fn start(root: &Path) -> Result<()> {
+/// `probe` is [`marker::probe_atime`]; tests pass one for a `noatime` mount.
+fn start(root: &Path, probe: fn(&Path) -> std::io::Result<bool>) -> Result<()> {
     fs::create_dir_all(root).with_context(|| format!("creating {}", root.display()))?;
     let start = marker::now_secs();
-    let atime = marker::probe_atime(root)
-        .with_context(|| format!("checking access times in {}", root.display()))?;
+    let atime =
+        probe(root).with_context(|| format!("checking access times in {}", root.display()))?;
     let reset = if atime { marker::reset_atimes(root) } else { 0 };
     marker::write(root, &marker::Marker { start, atime })?;
     println!(
@@ -200,5 +201,17 @@ mod tests {
             PathBuf::from("/w/target")
         );
         assert!(parse_metadata(b"{}").is_err());
+    }
+
+    #[test]
+    fn start_on_a_noatime_mount_records_budget_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("target");
+        start(&root, |_| Ok(false)).unwrap();
+        let marker = marker::read(&root).unwrap().unwrap();
+        assert!(!marker.atime);
+        // The real probe on this machine's filesystem, for comparison.
+        start(&root, marker::probe_atime).unwrap();
+        assert!(marker::read(&root).unwrap().is_some());
     }
 }

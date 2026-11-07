@@ -196,6 +196,35 @@ mod tests {
     }
 
     #[test]
+    fn an_unreadable_marker_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Something other than a file in the marker's place.
+        fs::create_dir(tmp.path().join(MARKER_FILE)).unwrap();
+        let err = read(tmp.path()).unwrap_err();
+        assert!(format!("{err:#}").contains("reading"), "{err:#}");
+    }
+
+    #[test]
+    fn restoring_skips_files_it_cant_stat() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("fingerprint");
+        fs::create_dir(&dir).unwrap();
+        let file = dir.join("lib-x");
+        fs::write(&file, b"x").unwrap();
+        File::open(&file)
+            .unwrap()
+            .set_times(FileTimes::new().set_accessed(UNIX_EPOCH))
+            .unwrap();
+        // Listable but not searchable: names are read, but not metadata.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o444)).unwrap();
+        assert_eq!(entries(&dir).count(), 1);
+        restore_atimes(&dir);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(fs::metadata(&file).unwrap().accessed().unwrap(), UNIX_EPOCH);
+    }
+
+    #[test]
     fn resets_fingerprint_access_times_and_keeps_modification_times() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();

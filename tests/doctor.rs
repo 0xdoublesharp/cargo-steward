@@ -490,3 +490,106 @@ fn reduced_debug_info_everywhere_is_ok() {
         "{out}"
     );
 }
+
+#[test]
+fn a_sparse_setup_is_reported_without_guessing() {
+    let mut fx = Fixture::new();
+    let root = fx.root.clone();
+    // HOME doesn't exist, so no device to compare build directories with.
+    fx.set("HOME", root.join("no-such-home"));
+    // CARGO_HOME is `<w>/.cargo`: its config sits where a project under `w`
+    // would have its own, and isn't taken for one.
+    let cargo_home = root.join("w/.cargo");
+    fx.set("CARGO_HOME", &cargo_home);
+    write(
+        &cargo_home.join("config.toml"),
+        "[build]\nrustc-wrapper = \"/x/cargo-steward\"\n",
+    );
+    // Nine workspaces keeping full debug info; one with its own sccache dir.
+    let mut projects = Vec::new();
+    for i in 0..9 {
+        let project = root.join(format!("w/p{i}"));
+        write(
+            &project.join("Cargo.toml"),
+            &format!("[package]\nname = \"p{i}\"\n"),
+        );
+        projects.push(project);
+    }
+    write(
+        &projects[0].join(".cargo/config.toml"),
+        "[env]\nSCCACHE_DIR = \"/cache/p\"\n",
+    );
+    let build = root.join("w/p0/target");
+    build_dir(&build);
+    fx.record(
+        &projects.iter().map(PathBuf::as_path).collect::<Vec<_>>(),
+        &build,
+    );
+    // sccache that doesn't report its maximum size.
+    script(
+        &fx.bin.join("sccache"),
+        "printf 'Cache location                  Local disk: \"/cache/server\"\\n'",
+    );
+    fx.set("SCCACHE_DIR", "/cache/env");
+    // A scan root that tmutil and mdutil can't say anything about.
+    let scan = root.join("scratch");
+    fs::create_dir_all(&scan).unwrap();
+    write(
+        &fx.steward.join("config.toml"),
+        &format!("scan-roots = [{:?}]\n", scan.display().to_string()),
+    );
+    script(&fx.bin.join("tmutil"), "exit 1");
+    script(&fx.bin.join("mdutil"), "exit 1");
+
+    let out = fx.doctor();
+    assert!(!out.contains("sets build.rustc-wrapper"), "{out}");
+    assert!(
+        out.contains("9 recorded project(s) build through cargo-steward"),
+        "{out}"
+    );
+    assert!(
+        out.contains("9 of 9 recorded workspaces build with full debug info")
+            && out.contains("and 1 more"),
+        "{out}"
+    );
+    assert!(out.contains("sccache directories are in use"), "{out}");
+    assert!(out.contains("a larger size"), "{out}");
+    let scan_text = scan.display().to_string();
+    assert!(
+        !out.lines()
+            .any(|l| l.contains(&scan_text)
+                && (l.contains("Time Machine") || l.contains("Spotlight"))),
+        "{out}"
+    );
+}
+
+#[test]
+fn toolchains_are_summed_before_any_project_has_built() {
+    let fx = Fixture::new();
+    script(&fx.bin.join("tmutil"), "exit 1");
+    script(&fx.bin.join("mdutil"), "exit 1");
+    script(
+        &fx.bin.join("rustup"),
+        r#"case "$1 $2" in
+"toolchain list") printf 'stable-aarch64-apple-darwin (active, default)\nnightly-aarch64-apple-darwin\n' ;;
+"override list") echo 'no overrides' ;;
+"run stable-aarch64-apple-darwin") echo 'rustc 1.101.0 (aaaaaaaaa 2026-12-20)' ;;
+*) exit 1 ;;
+esac"#,
+    );
+    let toolchains = fx.root.join("rustup/toolchains");
+    write(
+        &toolchains.join("stable-aarch64-apple-darwin/lib/x"),
+        "12345",
+    );
+    write(
+        &toolchains.join("nightly-aarch64-apple-darwin/lib/x"),
+        "12345",
+    );
+    let out = fx.doctor();
+    assert!(out.contains("2 toolchains take"), "{out}");
+    assert!(
+        out.contains("ones no project uses are reported once projects"),
+        "{out}"
+    );
+}

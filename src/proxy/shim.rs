@@ -449,5 +449,10 @@ mod tests {
         );
         assert_eq!(without_block(rc), None);
         assert_eq!(with_block("", "x"), format!("{BEGIN}\nx\n{END}\n"));
+        // A block at the very end, without a final newline, goes too.
+        assert_eq!(
+            without_block(&format!("a\n{BEGIN}\nx\n{END}")).unwrap(),
+            "a\n"
+        );
     }
 }
