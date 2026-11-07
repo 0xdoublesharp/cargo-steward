@@ -102,37 +102,43 @@ pub fn run_seed(args: &SeedArgs) -> Result<()> {
         ));
     }
     for (target, baseline) in pairs {
-        let line = match seed_dir(&target, &baseline, LOCK_WAIT)? {
-            Outcome::Seeded(took) => format!(
-                "Seeded {} from {} ({:.2} s, copy-on-write)",
-                target.display(),
-                baseline.display(),
-                took.as_secs_f64()
-            ),
-            Outcome::AlreadyBuilt => format!("{} already holds a build", target.display()),
-            Outcome::Occupied => format!(
-                "Not seeding {}: it exists and isn't empty",
-                target.display()
-            ),
-            Outcome::NoBaseline => format!("No build to seed from at {}", baseline.display()),
-            Outcome::Same => format!(
-                "{} is the main build directory; nothing to seed",
-                target.display()
-            ),
-            Outcome::Busy => format!(
-                "Not seeding {}: a build is using {}",
-                target.display(),
-                baseline.display()
-            ),
-            Outcome::Unsupported => format!(
-                "Not seeding {}: its filesystem can't clone from {}",
-                target.display(),
-                baseline.display()
-            ),
-        };
+        let outcome = seed_dir(&target, &baseline, LOCK_WAIT)?;
+        let line = describe(&outcome, &target, &baseline);
         say(line);
     }
     Ok(())
+}
+
+/// The line `seed` prints for what seeding `target` from `baseline` did.
+fn describe(outcome: &Outcome, target: &Path, baseline: &Path) -> String {
+    match outcome {
+        Outcome::Seeded(took) => format!(
+            "Seeded {} from {} ({:.2} s, copy-on-write)",
+            target.display(),
+            baseline.display(),
+            took.as_secs_f64()
+        ),
+        Outcome::AlreadyBuilt => format!("{} already holds a build", target.display()),
+        Outcome::Occupied => format!(
+            "Not seeding {}: it exists and isn't empty",
+            target.display()
+        ),
+        Outcome::NoBaseline => format!("No build to seed from at {}", baseline.display()),
+        Outcome::Same => format!(
+            "{} is the main build directory; nothing to seed",
+            target.display()
+        ),
+        Outcome::Busy => format!(
+            "Not seeding {}: a build is using {}",
+            target.display(),
+            baseline.display()
+        ),
+        Outcome::Unsupported => format!(
+            "Not seeding {}: its filesystem can't clone from {}",
+            target.display(),
+            baseline.display()
+        ),
+    }
 }
 
 /// A workspace's directories: where intermediate build output goes (the
@@ -231,7 +237,13 @@ fn main_worktree(dir: &Path) -> Option<PathBuf> {
         if lines.next() == Some("bare") {
             return None;
         }
-        PathBuf::from(first)
+        // Git lists the git directory itself when it doesn't know where the
+        // main worktree is (`git init --separate-git-dir`).
+        let first = PathBuf::from(first);
+        if first == common {
+            return None;
+        }
+        first
     };
     let top = PathBuf::from(git(dir, &["rev-parse", "--show-toplevel"])?);
     let here = dir.canonicalize().ok()?;
@@ -579,5 +591,106 @@ mod tests {
             Some(repo.join("crates/app"))
         );
         assert_eq!(main_worktree(&repo), Some(repo.clone()));
+    }
+
+    #[test]
+    fn describes_every_outcome() {
+        let (t, b) = (Path::new("/w/target"), Path::new("/m/target"));
+        let cases = [
+            (
+                Outcome::Seeded(Duration::from_millis(1250)),
+                "Seeded /w/target from /m/target (1.25 s, copy-on-write)",
+            ),
+            (Outcome::AlreadyBuilt, "/w/target already holds a build"),
+            (
+                Outcome::Occupied,
+                "Not seeding /w/target: it exists and isn't empty",
+            ),
+            (Outcome::NoBaseline, "No build to seed from at /m/target"),
+            (
+                Outcome::Same,
+                "/w/target is the main build directory; nothing to seed",
+            ),
+            (
+                Outcome::Busy,
+                "Not seeding /w/target: a build is using /m/target",
+            ),
+            (
+                Outcome::Unsupported,
+                "Not seeding /w/target: its filesystem can't clone from /m/target",
+            ),
+        ];
+        for (outcome, line) in cases {
+            assert_eq!(describe(&outcome, t, b), line);
+        }
+    }
+
+    #[test]
+    fn plans_explicit_dirs_and_nothing_without_a_baseline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = SeedArgs {
+            target_dir: Some("/w/target".into()),
+            from: Some("/m/target".into()),
+            ..SeedArgs::default()
+        };
+        assert_eq!(
+            plan(&args, tmp.path()),
+            [(PathBuf::from("/w/target"), PathBuf::from("/m/target"))]
+        );
+        // Outside git there's no main worktree to clone from.
+        let args = SeedArgs {
+            target_dir: Some("/w/target".into()),
+            ..SeedArgs::default()
+        };
+        assert!(plan(&args, tmp.path()).is_empty());
+        assert_eq!(main_worktree(tmp.path()), None);
+    }
+
+    #[test]
+    fn handles_repositories_whose_git_dir_is_elsewhere() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let repo = root.join("repo");
+        fs::create_dir_all(repo.join("sub")).unwrap();
+        let gitdir = root.join("gitdir");
+        git_ok(
+            &repo,
+            &[
+                "init",
+                "-q",
+                "-b",
+                "main",
+                "--separate-git-dir",
+                gitdir.to_str().unwrap(),
+            ],
+        );
+        // Git doesn't record where this repository's worktree is, and lists
+        // the git directory in its place: that's no worktree to seed from.
+        assert_eq!(main_worktree(&repo.join("sub")), None);
+
+        // Nor from a linked worktree of it.
+        git_ok(
+            &repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        );
+        let wt = root.join("wt");
+        git_ok(&repo, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+        assert_eq!(main_worktree(&wt), None);
+
+        // A bare repository has no main worktree.
+        let bare = root.join("bare.git");
+        fs::create_dir_all(&bare).unwrap();
+        git_ok(&bare, &["init", "-q", "--bare"]);
+        assert_eq!(main_worktree(&bare), None);
     }
 }

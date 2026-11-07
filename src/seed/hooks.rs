@@ -388,4 +388,33 @@ mod tests {
     fn quotes_for_the_shell() {
         assert_eq!(quote("/a b/it's"), r"'/a b/it'\''s'");
     }
+
+    #[test]
+    fn reports_status_of_each_kind_of_hook() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("hooks");
+        fs::create_dir_all(&dir).unwrap();
+        assert!(status(&dir).starts_with("Not installed (no post-checkout hook in"));
+
+        fs::write(dir.join(HOOK), "#!/bin/sh\necho mine\n").unwrap();
+        assert!(status(&dir).contains("is another hook"), "{}", status(&dir));
+        assert!(!uninstall(&dir).unwrap(), "someone else's hook stays");
+        assert!(dir.join(HOOK).exists());
+
+        assert!(install(&dir, "/bin/cargo-steward").unwrap());
+        let line = status(&dir);
+        assert!(line.starts_with("Installed: "), "{line}");
+        assert!(line.contains(&format!("(runs {CHAINED} first)")), "{line}");
+    }
+
+    #[test]
+    fn hooks_dir_needs_a_git_repository() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = hooks_dir(tmp.path()).unwrap_err().to_string();
+        assert!(err.contains("isn't in a git repository"), "{err}");
+
+        git_ok(tmp.path(), &["init", "-q"]);
+        // `.git/hooks`, unless the user's git config sets `core.hooksPath`.
+        assert!(hooks_dir(tmp.path()).unwrap().is_absolute());
+    }
 }

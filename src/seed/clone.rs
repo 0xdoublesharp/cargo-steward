@@ -499,4 +499,16 @@ mod tests {
         assert_eq!(result.unwrap(), Cloned::Unsupported);
         assert!(!leftover);
     }
+
+    #[test]
+    fn clone_file_rejects_what_isnt_a_regular_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("dir");
+        fs::create_dir(&dir).unwrap();
+        let dst = tmp.path().join("copy");
+        let err = clone_file(&dir, &dst).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(!dst.exists());
+        assert!(clone_file(&tmp.path().join("missing"), &dst).is_err());
+    }
 }
