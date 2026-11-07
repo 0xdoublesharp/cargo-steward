@@ -3,7 +3,8 @@
 cargo-steward can stand in for `cargo` itself. Installed as `cargo` ahead of
 the real one on PATH, it decides where each build's output and temporary
 files go, warms up new worktrees, and limits how many builds run at once.
-Then it `exec`s the real cargo with the same arguments. It replaces the
+Then it `exec`s the real cargo with the same arguments (or, holding a build
+slot, runs it and waits). It replaces the
 per-project `cargo` shims that many multi-worktree setups grow, and uses the
 same directory names, so build directories those shims made keep working.
 
@@ -23,7 +24,13 @@ For each `cargo ...` it:
    with `seed = false`.
 4. **Waits for a build slot.** With `max-builds = N`, at most N builds run
    at once across the machine. A build that has to wait prints
-   `cargo-steward: waiting for one of N Cargo build slots` once.
+   `cargo-steward: waiting for one of N Cargo build slots (held by ...)`
+   once, naming each holder's process, command and directory. The proxy
+   holds the slot while cargo runs (tests included) and no longer: programs
+   a build leaves running don't keep it, and `cargo run` gives it up once
+   its program starts. Cargo run from inside a build (a build script, a
+   `cargo-*` subcommand) reuses the slot. `cargo watch` takes none itself;
+   each build it starts takes its own.
 5. **Runs the real cargo**, with `argv[0]` still `cargo`.
 
 The proxy never runs `git` or any other program, except `seed` in step 3.

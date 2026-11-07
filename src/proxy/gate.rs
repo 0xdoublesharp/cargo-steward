@@ -9,9 +9,11 @@
 //! for a second one (which could deadlock at `max-builds = 1`).
 
 use std::ffi::OsString;
+use std::fs::File;
 use std::fs::{self, OpenOptions, TryLockError};
 use std::io;
-use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
+use std::io::{Seek, SeekFrom, Write};
+use std::os::fd::RawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::thread::sleep;
@@ -29,7 +31,7 @@ const POLL: Duration = Duration::from_millis(100);
 /// Commands that never compile, so they never wait for a slot. Anything
 /// else does, including unknown commands: cargo expands aliases itself, and
 /// an alias for a build must not bypass the gate.
-const NON_BUILD: [&str; 22] = [
+const NON_BUILD: [&str; 23] = [
     "metadata",
     "fmt",
     "tree",
@@ -52,6 +54,9 @@ const NON_BUILD: [&str; 22] = [
     "new",
     "init",
     "steward",
+    // A watcher, not a build: each build it starts goes through the proxy
+    // and takes a slot of its own, rather than one held while it idles.
+    "watch",
 ];
 
 /// Whether a cargo invocation may compile, and so takes a build slot.
@@ -81,56 +86,166 @@ pub fn command(args: &[OsString]) -> Option<String> {
     None
 }
 
-/// Takes a slot under `dir`, waiting (with one message) while all `limit`
-/// are taken, or reuses the one this process inherited. Adds the variables
-/// that name the slot to `env`.
-pub fn acquire(dir: &Path, limit: u32, env: &mut Vec<(OsString, OsString)>) -> io::Result<()> {
-    if reuse_inherited(
-        dir,
-        std::env::var_os(FD_VAR).as_deref(),
-        std::env::var_os(SLOT_VAR).as_deref(),
-    ) {
-        return Ok(());
+/// The proxy holding the slot a build runs in. A nested cargo (run from a
+/// build script, or by a cargo subcommand) reuses that slot only while this
+/// process is one of its ancestors, so a program the build left running
+/// (a test's daemon) can't pass the gate with it.
+pub const HOLDER_VAR: &str = "CARGO_STEWARD_SLOT_PID";
+
+/// A build slot.
+#[derive(Debug)]
+pub enum Slot {
+    /// One an enclosing build holds, reused.
+    Inherited,
+    /// Taken by this process: its lock lives as long as `file` stays open.
+    /// The descriptor is closed on exec, so nothing cargo starts holds it.
+    Held { file: File, path: PathBuf },
+}
+
+/// Takes a slot under `dir`, waiting (with one message naming who holds
+/// them) while all `limit` are taken, or reuses the one an enclosing build
+/// holds. `about` describes this build for anyone waiting on it.
+pub fn acquire(dir: &Path, limit: u32, about: &str) -> io::Result<Slot> {
+    let slot = std::env::var_os(SLOT_VAR);
+    if reuse_inherited(dir, std::env::var_os(FD_VAR).as_deref(), slot.as_deref())
+        || held_by_ancestor(
+            dir,
+            slot.as_deref(),
+            std::env::var_os(HOLDER_VAR).as_deref(),
+        )
+    {
+        return Ok(Slot::Inherited);
     }
     fs::create_dir_all(dir)?;
     let mut waiting = false;
     loop {
-        if let Some((fd, path)) = try_any(dir, limit)? {
-            env.push((FD_VAR.into(), fd.to_string().into()));
-            env.push((SLOT_VAR.into(), path.into()));
-            return Ok(());
+        if let Some((mut file, path)) = try_any(dir, limit)? {
+            let _ = describe(&mut file, about);
+            return Ok(Slot::Held { file, path });
         }
         if !waiting {
-            eprintln!("cargo-steward: waiting for one of {limit} Cargo build slots");
+            let holders = holders(dir, limit);
+            if holders.is_empty() {
+                eprintln!("cargo-steward: waiting for one of {limit} Cargo build slots");
+            } else {
+                eprintln!(
+                    "cargo-steward: waiting for one of {limit} Cargo build slots (held by {})",
+                    holders.join("; ")
+                );
+            }
             waiting = true;
         }
         sleep(POLL);
     }
 }
 
-/// One pass over the slots. The descriptor of the one taken is left open
-/// and inheritable.
-fn try_any(dir: &Path, limit: u32) -> io::Result<Option<(RawFd, PathBuf)>> {
+/// One pass over the slots: the first free one, locked.
+fn try_any(dir: &Path, limit: u32) -> io::Result<Option<(File, PathBuf)>> {
     for index in 0..limit {
         let path = dir.join(format!("{index}.lock"));
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)?;
+        let file = open_slot(&path)?;
         match file.try_lock() {
-            Ok(()) => {
-                set_inheritable(file.as_raw_fd())?;
-                return Ok(Some((file.into_raw_fd(), path)));
-            }
+            Ok(()) => return Ok(Some((file, path))),
             Err(TryLockError::WouldBlock) => continue,
             Err(TryLockError::Error(e)) => return Err(e),
         }
     }
     Ok(None)
+}
+
+fn open_slot(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+/// Writes who holds a slot into its file: `pid <pid>: <about>`.
+fn describe(file: &mut File, about: &str) -> io::Result<()> {
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
+    writeln!(file, "pid {}: {about}", std::process::id())
+}
+
+/// What the held slots' files say about their holders.
+fn holders(dir: &Path, limit: u32) -> Vec<String> {
+    (0..limit)
+        .filter_map(|index| {
+            let path = dir.join(format!("{index}.lock"));
+            let file = open_slot(&path).ok()?;
+            if file.try_lock().is_ok() {
+                return None; // Free since.
+            }
+            let text = fs::read_to_string(&path).ok()?;
+            let line = text.lines().next()?.trim();
+            (!line.is_empty()).then(|| line.to_owned())
+        })
+        .collect()
+}
+
+/// Whether an enclosing build's proxy holds the slot named in `slot`: the
+/// variables name a slot file in `dir` and a process that is one of this
+/// process's ancestors.
+pub fn held_by_ancestor(
+    dir: &Path,
+    slot: Option<&std::ffi::OsStr>,
+    holder: Option<&std::ffi::OsStr>,
+) -> bool {
+    let (Some(slot), Some(holder)) = (slot, holder) else {
+        return false;
+    };
+    let Some(holder) = holder.to_str().and_then(|s| s.parse::<u32>().ok()) else {
+        return false;
+    };
+    Path::new(slot).parent() == Some(dir)
+        && fs::symlink_metadata(slot).is_ok_and(|m| m.is_file())
+        && holder != std::process::id()
+        && is_ancestor(holder)
+}
+
+/// Whether `pid` is this process's parent, or its parent's, and so on.
+pub fn is_ancestor(pid: u32) -> bool {
+    // SAFETY: plain syscall with no arguments.
+    let mut current = unsafe { libc::getppid() };
+    for _ in 0..256 {
+        let Ok(id) = u32::try_from(current) else {
+            return false;
+        };
+        if id == pid {
+            return true;
+        }
+        if id <= 1 {
+            return false;
+        }
+        match parent_of(current) {
+            Some(parent) => current = parent,
+            None => return false,
+        }
+    }
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn parent_of(pid: libc::pid_t) -> Option<libc::pid_t> {
+    // SAFETY: `proc_bsdinfo` is plain data, for which all zeroes is valid.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = libc::c_int::try_from(size_of::<libc::proc_bsdinfo>()).ok()?;
+    // SAFETY: `info` is writable for `size` bytes and outlives the call.
+    let written =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
+    (written == size).then(|| libc::pid_t::try_from(info.pbi_ppid).ok())?
+}
+
+#[cfg(not(target_os = "macos"))]
+fn parent_of(pid: libc::pid_t) -> Option<libc::pid_t> {
+    // `<pid> (<command>) <state> <ppid> ...`; the command may hold spaces.
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_, rest) = stat.rsplit_once(')')?;
+    rest.split_whitespace().nth(1)?.parse().ok()
 }
 
 /// Whether this process inherited a slot it can keep using: the variables
@@ -193,7 +308,7 @@ fn set_inheritable(fd: RawFd) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::File;
+    use std::os::fd::AsRawFd;
 
     fn os(args: &[&str]) -> Vec<OsString> {
         args.iter().map(OsString::from).collect()
@@ -314,18 +429,84 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let first = open(&dir.join("0.lock"));
         first.lock().unwrap();
-        let (fd, path) = try_any(&dir, 2).unwrap().unwrap();
+        let (taken, path) = try_any(&dir, 2).unwrap().unwrap();
         assert_eq!(path, dir.join("1.lock"));
-        // Taken slot fds are inheritable.
-        // SAFETY: fd was just opened by try_any.
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-        assert_eq!(flags & libc::FD_CLOEXEC, 0);
+        // Nothing cargo starts inherits a taken slot.
+        // SAFETY: fcntl only reads the open descriptor's flags.
+        let flags = unsafe { libc::fcntl(taken.as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
         assert!(try_any(&dir, 2).unwrap().is_none());
-        // SAFETY: closing the descriptor try_any leaked on purpose.
-        unsafe { libc::close(fd) };
-        let (fd, _) = try_any(&dir, 2).unwrap().unwrap();
-        // SAFETY: as above.
-        unsafe { libc::close(fd) };
+        drop(taken);
+        // A process another test thread forks at that moment can hold a copy
+        // of the descriptor until it execs: allow a moment.
+        let freed = (0..50).any(|_| {
+            let free = try_any(&dir, 2).unwrap().is_some();
+            if !free {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            free
+        });
+        assert!(freed, "the slot was never released");
+    }
+
+    #[test]
+    fn names_who_holds_each_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("slots");
+        fs::create_dir_all(&dir).unwrap();
+        let (mut held, _) = try_any(&dir, 2).unwrap().unwrap();
+        describe(&mut held, "`cargo test` in /w/a").unwrap();
+        // A slot that's free again says nothing, whatever its file holds.
+        let (mut freed, _) = try_any(&dir, 2).unwrap().unwrap();
+        describe(&mut freed, "`cargo build` in /w/b").unwrap();
+        drop(freed);
+        // A process another test thread forks at that moment can hold a copy
+        // of the freed slot's descriptor until it execs: allow a moment.
+        let expected = [format!("pid {}: `cargo test` in /w/a", std::process::id())];
+        let settled = (0..50).any(|_| {
+            let found = holders(&dir, 2) == expected;
+            if !found {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            found
+        });
+        assert!(settled, "{:?}", holders(&dir, 2));
+        // A shorter description replaces a longer one whole.
+        describe(&mut held, "x").unwrap();
+        assert_eq!(holders(&dir, 2), [format!("pid {}: x", std::process::id())]);
+    }
+
+    #[test]
+    fn reuses_a_slot_only_an_ancestor_holds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("slots");
+        fs::create_dir_all(&dir).unwrap();
+        let slot = dir.join("0.lock");
+        open(&slot);
+        let parent = std::os::unix::process::parent_id().to_string();
+        let held =
+            |holder: &str| held_by_ancestor(&dir, Some(slot.as_os_str()), Some(holder.as_ref()));
+        assert!(held(&parent));
+        assert!(is_ancestor(1), "init holds everything");
+        // A process that isn't an ancestor (a daemon's long-gone holder
+        // whose ID something else now has), or this one, doesn't count.
+        let mut other = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        assert!(!held(&other.id().to_string()));
+        let _ = other.kill();
+        let _ = other.wait();
+        assert!(!held(&std::process::id().to_string()));
+        assert!(!held("x"));
+        // Nor a slot outside the slot directory.
+        let elsewhere = tmp.path().join("0.lock");
+        open(&elsewhere);
+        assert!(!held_by_ancestor(
+            &dir,
+            Some(elsewhere.as_os_str()),
+            Some(parent.as_ref())
+        ));
     }
 
     #[test]
@@ -333,34 +514,32 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         // Created by `acquire` itself.
         let dir = tmp.path().join("new/slots");
-        let mut env = Vec::new();
-        acquire(&dir, 1, &mut env).unwrap();
-        let fd: RawFd = env[0].1.to_str().unwrap().parse().unwrap();
-        assert_eq!(env[0].0, FD_VAR);
-        assert_eq!(env[1], (SLOT_VAR.into(), dir.join("0.lock").into()));
+        let Slot::Held { file, path } = acquire(&dir, 1, "first").unwrap() else {
+            panic!("took no slot");
+        };
+        assert_eq!(path, dir.join("0.lock"));
 
         // The only slot is held: `acquire` waits until it's released.
         let (tx, rx) = std::sync::mpsc::channel();
         let waiter = {
             let dir = dir.clone();
             std::thread::spawn(move || {
-                let mut env = Vec::new();
-                acquire(&dir, 1, &mut env).unwrap();
-                tx.send(env).unwrap();
+                tx.send(acquire(&dir, 1, "second").unwrap()).unwrap();
             })
         };
         assert!(
             rx.recv_timeout(Duration::from_millis(400)).is_err(),
             "took a held slot"
         );
-        // SAFETY: releasing the descriptor the first acquire left open.
-        unsafe { libc::close(fd) };
-        let env = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        drop(file);
+        let second = rx.recv_timeout(Duration::from_secs(10)).unwrap();
         waiter.join().unwrap();
-        assert_eq!(env[1].1, dir.join("0.lock").into_os_string());
-        let fd: RawFd = env[0].1.to_str().unwrap().parse().unwrap();
-        // SAFETY: as above.
-        unsafe { libc::close(fd) };
+        assert!(matches!(second, Slot::Held { path, .. } if path == dir.join("0.lock")));
+        assert!(
+            fs::read_to_string(dir.join("0.lock"))
+                .unwrap()
+                .ends_with(": second\n")
+        );
     }
 
     #[test]
@@ -368,14 +547,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("file");
         fs::write(&file, "").unwrap();
-        let mut env = Vec::new();
-        assert!(acquire(&file.join("slots"), 1, &mut env).is_err());
+        assert!(acquire(&file.join("slots"), 1, "x").is_err());
         // A slot that's a symlink is refused, never followed.
         let dir = tmp.path().join("slots");
         fs::create_dir_all(&dir).unwrap();
         std::os::unix::fs::symlink(&file, dir.join("0.lock")).unwrap();
         assert!(try_any(&dir, 1).is_err());
-        assert!(env.is_empty());
     }
 
     /// macOS can't flock a FIFO (EOPNOTSUPP): an error, not a busy slot.

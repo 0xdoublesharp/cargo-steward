@@ -497,3 +497,108 @@ fn removing_a_deleted_worktrees_build_dir_takes_its_tmpdir_too() {
     assert!(main_tmp.is_dir(), "the main checkout's stays");
     assert!(fx.targets.join(&ns).join("main").is_dir());
 }
+
+/// A crate in `dir` whose `main` is `body`, with `build` as its build script.
+fn write_program(dir: &Path, name: &str, body: &str, build: Option<&str>) {
+    fs::create_dir_all(dir.join("src")).unwrap();
+    fs::write(
+        dir.join("Cargo.toml"),
+        format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+    )
+    .unwrap();
+    fs::write(dir.join("src/main.rs"), format!("fn main() {{ {body} }}\n")).unwrap();
+    if let Some(build) = build {
+        fs::write(dir.join("build.rs"), format!("fn main() {{ {build} }}\n")).unwrap();
+    }
+}
+
+/// Builds in the fixture's repository, failing if it has to wait for a slot.
+fn builds_without_waiting(fx: &Fixture) {
+    fs::write(
+        fx.repo.join("src/extra.rs"),
+        format!("// {:?}\n", std::time::SystemTime::now()),
+    )
+    .unwrap();
+    let mut child = fx
+        .proxy(&fx.repo, &["build", "-q"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stderr = String::new();
+    use std::io::Read;
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(child.wait().unwrap().success(), "{stderr}");
+    assert!(!stderr.contains(WAITING), "{stderr}");
+}
+
+#[test]
+fn a_program_cargo_run_started_doesnt_keep_the_slot() {
+    let fx = Fixture::new("max-builds = 1\n");
+    let app = fx.root.join("server");
+    let started = fx.root.join("started");
+    write_program(
+        &app,
+        "server",
+        &format!(
+            "std::fs::write({:?}, \"\").unwrap(); \
+             std::thread::sleep(std::time::Duration::from_secs(60));",
+            started.display().to_string()
+        ),
+        None,
+    );
+    let mut server = fx.proxy(&app, &["run", "-q"]).spawn().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    while !started.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the server never started"
+        );
+        assert!(server.try_wait().unwrap().is_none(), "the server exited");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Give the proxy time to see cargo became the server.
+    std::thread::sleep(Duration::from_millis(500));
+    builds_without_waiting(&fx);
+
+    // Stopping the proxy stops what it runs, and it goes the same way.
+    // SAFETY: plain syscall sending a signal to our own child.
+    unsafe { libc::kill(server.id() as i32, libc::SIGTERM) };
+    let status = server.wait().unwrap();
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(status.signal(), Some(libc::SIGTERM), "{status:?}");
+}
+
+#[test]
+fn a_daemon_a_build_left_running_doesnt_keep_the_slot() {
+    let fx = Fixture::new("max-builds = 1\n");
+    let app = fx.root.join("spawner");
+    let pid_file = fx.root.join("daemon.pid");
+    write_program(
+        &app,
+        "spawner",
+        "",
+        Some(&format!(
+            "let child = std::process::Command::new(\"sleep\").arg(\"60\") \
+             .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()) \
+             .stderr(std::process::Stdio::null()).spawn().unwrap(); \
+             std::fs::write({:?}, child.id().to_string()).unwrap();",
+            pid_file.display().to_string()
+        )),
+    );
+    fx.run(&app, &["build", "-q"]);
+    let daemon: i32 = fs::read_to_string(&pid_file).unwrap().parse().unwrap();
+    // SAFETY: signal 0 only checks the process exists.
+    assert_eq!(
+        unsafe { libc::kill(daemon, 0) },
+        0,
+        "the daemon should still run"
+    );
+    builds_without_waiting(&fx);
+    // SAFETY: stopping the daemon this test started.
+    unsafe { libc::kill(daemon, libc::SIGKILL) };
+}

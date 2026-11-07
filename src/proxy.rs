@@ -9,6 +9,7 @@
 //! having no real cargo to run.
 
 mod gate;
+mod hold;
 mod real;
 mod route;
 mod shim;
@@ -52,7 +53,7 @@ pub fn run(args: Vec<OsString>) -> ! {
         process::exit(127);
     };
 
-    let vars = prepare(
+    let (vars, slot) = prepare(
         &config,
         paths.as_ref(),
         env::current_dir(),
@@ -62,6 +63,11 @@ pub fn run(args: Vec<OsString>) -> ! {
 
     let mut command = Command::new(&real);
     command.arg0("cargo").args(&cargo_args).envs(vars);
+    if let Some(gate::Slot::Held { file, path }) = slot {
+        // Hold the slot for as long as cargo builds, and no longer.
+        let cargo_like = [me.clone(), real.canonicalize().ok()];
+        hold::run(command, file, &path, &cargo_like);
+    }
     let err = command.exec();
     eprintln!(
         "error: cargo-steward: failed to run {}: {err}",
@@ -71,14 +77,15 @@ pub fn run(args: Vec<OsString>) -> ! {
 }
 
 /// Routes the build and takes a build slot, returning the variables to run
-/// cargo with. Never fails: what goes wrong is a warning and less routing.
+/// cargo with and the slot. Never fails: what goes wrong is a warning and
+/// less routing.
 fn prepare(
     config: &Config,
     paths: Option<&Paths>,
     cwd: std::io::Result<PathBuf>,
     cargo_args: &[OsString],
     me: Option<&Path>,
-) -> Vec<(OsString, OsString)> {
+) -> (Vec<(OsString, OsString)>, Option<gate::Slot>) {
     let plan = match cwd {
         Ok(cwd) => Plan::new(config, &cwd, cargo_args),
         Err(e) => Err(e.into()),
@@ -91,15 +98,35 @@ fn prepare(
         },
         Err(e) => warn(&format!("not routing this build: {e:#}")),
     }
+    let mut slot = None;
     if let Ok(plan) = &plan
         && let Some(limit) = plan.max_builds.filter(|&n| n > 0)
         && let Some(paths) = paths
         && gate::is_build(cargo_args)
-        && let Err(e) = gate::acquire(&slot_dir(paths, &plan.slots), limit, &mut vars)
     {
-        warn(&format!("running without a build slot: {e}"));
+        match gate::acquire(
+            &slot_dir(paths, &plan.slots),
+            limit,
+            &about(cargo_args, &plan.dir),
+        ) {
+            Ok(taken) => slot = Some(taken),
+            Err(e) => warn(&format!("running without a build slot: {e}")),
+        }
     }
-    vars
+    (vars, slot)
+}
+
+/// `cargo <args> in <dir>`, shortened, for whoever waits on this build.
+fn about(cargo_args: &[OsString], dir: &Path) -> String {
+    let mut command: String = route::own_args(cargo_args)
+        .iter()
+        .map(|a| a.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if command.chars().count() > 60 {
+        command = command.chars().take(57).collect::<String>() + "...";
+    }
+    format!("`cargo {command}` in {}", dir.display())
 }
 
 /// One warning line on stderr.
@@ -475,6 +502,17 @@ fn seed(me: &Path, target: &Path, from: &Path, worktree: &Path) {
 mod tests {
     use super::*;
 
+    /// [`prepare`]'s variables; no test here takes a slot.
+    fn vars_of(
+        config: &Config,
+        paths: Option<&Paths>,
+        cwd: std::io::Result<PathBuf>,
+        cargo_args: &[OsString],
+        me: Option<&Path>,
+    ) -> Vec<(OsString, OsString)> {
+        prepare(config, paths, cwd, cargo_args, me).0
+    }
+
     #[test]
     fn roots_must_be_absolute() {
         assert_eq!(root(Path::new("/r")).unwrap(), PathBuf::from("/r"));
@@ -797,7 +835,7 @@ mod tests {
             )],
             ..Config::default()
         };
-        let vars = prepare(&config, None, Ok(work.clone()), &os(&["build"]), None);
+        let vars = vars_of(&config, None, Ok(work.clone()), &os(&["build"]), None);
         let target = PathBuf::from(var(&vars, "CARGO_TARGET_DIR").unwrap());
         assert!(target.starts_with(base.join("targets")) && target.is_dir());
         let tmpdir = PathBuf::from(var(&vars, "TMP").unwrap());
@@ -812,7 +850,7 @@ mod tests {
         let base = tmp.path().canonicalize().unwrap();
         let build = os(&["build"]);
         // No working directory: nothing routed.
-        let none = prepare(
+        let none = vars_of(
             &Config::default(),
             None,
             Err(std::io::Error::other("gone")),
@@ -828,19 +866,19 @@ mod tests {
             routes: vec![forced(&base, Some(base.join("blocked/sub")), None)],
             ..Config::default()
         };
-        assert!(prepare(&config, None, Ok(base.clone()), &build, None).is_empty());
+        assert!(vars_of(&config, None, Ok(base.clone()), &build, None).is_empty());
         let config = Config {
             routes: vec![forced(&base, None, Some(base.join("blocked/sub")))],
             ..Config::default()
         };
-        assert!(prepare(&config, None, Ok(base.clone()), &build, None).is_empty());
+        assert!(vars_of(&config, None, Ok(base.clone()), &build, None).is_empty());
 
         // A relative root is an error for the plan, not for cargo.
         let config = Config {
             routes: vec![forced(&base, Some("relative".into()), None)],
             ..Config::default()
         };
-        assert!(prepare(&config, None, Ok(base.clone()), &build, None).is_empty());
+        assert!(vars_of(&config, None, Ok(base.clone()), &build, None).is_empty());
     }
 
     #[test]
@@ -854,38 +892,39 @@ mod tests {
             max_builds: Some(2),
             ..Config::default()
         };
-        let vars = prepare(
-            &config,
-            Some(&paths),
-            Ok(base.clone()),
-            &os(&["build"]),
-            None,
-        );
-        let slot = PathBuf::from(var(&vars, gate::SLOT_VAR).unwrap());
-        assert_eq!(slot.parent(), Some(base.join("home/slots").as_path()));
-        assert!(var(&vars, gate::FD_VAR).is_some());
+        let slot_of = |config: &Config, paths: Option<&Paths>, args: &[&str]| {
+            prepare(config, paths, Ok(base.clone()), &os(args), None).1
+        };
+        let Some(gate::Slot::Held { path, .. }) = slot_of(&config, Some(&paths), &["build"]) else {
+            panic!("no slot taken");
+        };
+        assert_eq!(path.parent(), Some(base.join("home/slots").as_path()));
+        let about = fs::read_to_string(&path).unwrap();
+        assert!(about.contains("`cargo build` in "), "{about}");
         // Not a build, no paths, or a zero limit: no slot.
-        let meta = prepare(
-            &config,
-            Some(&paths),
-            Ok(base.clone()),
-            &os(&["metadata"]),
-            None,
-        );
-        assert!(meta.is_empty());
-        assert!(prepare(&config, None, Ok(base.clone()), &os(&["build"]), None).is_empty());
+        assert!(slot_of(&config, Some(&paths), &["metadata"]).is_none());
+        assert!(slot_of(&config, None, &["build"]).is_none());
         let zero = Config {
             max_builds: Some(0),
             ..Config::default()
         };
-        assert!(prepare(&zero, Some(&paths), Ok(base.clone()), &os(&["build"]), None).is_empty());
+        assert!(slot_of(&zero, Some(&paths), &["build"]).is_none());
 
         // A slot directory that can't be made: a warning, and no slot.
         fs::write(base.join("file-home"), "").unwrap();
         let broken = Paths {
             home: base.join("file-home"),
         };
-        assert!(prepare(&config, Some(&broken), Ok(base), &os(&["build"]), None).is_empty());
+        assert!(slot_of(&config, Some(&broken), &["build"]).is_none());
+        // The slot was never in the variables cargo runs with.
+        let vars = vars_of(
+            &config,
+            Some(&paths),
+            Ok(base.clone()),
+            &os(&["build"]),
+            None,
+        );
+        assert!(var(&vars, gate::FD_VAR).is_none());
     }
 
     #[test]
@@ -962,7 +1001,7 @@ mod tests {
         assert!(from.ends_with("main"));
 
         // Main hasn't built yet: nothing to seed from.
-        let vars = prepare(&config, None, Ok(wt.clone()), &build, Some(&me));
+        let vars = vars_of(&config, None, Ok(wt.clone()), &build, Some(&me));
         assert!(var(&vars, "CARGO_TARGET_DIR").is_some());
         assert!(!log.exists());
 
@@ -970,7 +1009,7 @@ mod tests {
         fs::create_dir_all(&from).unwrap();
         let target = plan.target.clone().unwrap();
         fs::remove_dir(&target).unwrap();
-        prepare(&config, None, Ok(wt.clone()), &build, Some(&me));
+        vars_of(&config, None, Ok(wt.clone()), &build, Some(&me));
         let logged = fs::read_to_string(&log).unwrap();
         assert!(logged.starts_with("seed --target-dir "), "{logged}");
         assert!(logged.contains(&format!("--from {}", from.display())));
@@ -979,7 +1018,7 @@ mod tests {
 
         // A target dir with files isn't seeded again.
         fs::write(target.join("keep"), "").unwrap();
-        prepare(&config, None, Ok(wt), &build, Some(&me));
+        vars_of(&config, None, Ok(wt), &build, Some(&me));
         assert_eq!(fs::read_to_string(&log).unwrap().lines().count(), 1);
     }
 
