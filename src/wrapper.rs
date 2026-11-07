@@ -26,6 +26,10 @@ use crate::{gc, ledger, scan};
 /// is never mistaken for a stale one. Anything it keeps is cleaned up later.
 const TIMESTAMP_SLACK: Duration = Duration::from_secs(2);
 
+/// `object-grace` when the setting doesn't parse. A wrapper must never fail
+/// a build over a typo; `gc` reports the bad setting.
+const DEFAULT_OBJECT_GRACE: Duration = Duration::from_secs(600);
+
 /// After this long since the last cleanup, low free space triggers another
 /// even before `gc-interval` has passed.
 const LOW_SPACE_RECHECK: Duration = Duration::from_secs(300);
@@ -63,13 +67,19 @@ pub fn run(argv: Vec<OsString>) -> ! {
     };
     if status.success() {
         if let Some(fix) = fix {
-            fix.finish();
+            fix.finish(object_grace(&config));
         }
         if let Some(paths) = &paths {
             after_compile(paths, &config, &out_dir, started.elapsed());
         }
     }
     process::exit(exit_code(status));
+}
+
+/// How long replaced objects are kept for binaries that may still be
+/// running (`object-grace`).
+fn object_grace(config: &Config) -> Duration {
+    humantime::parse_duration(config.object_grace.trim()).unwrap_or(DEFAULT_OBJECT_GRACE)
 }
 
 /// The wrapper to run rustc through: `$CARGO_STEWARD_INNER` (empty for none),
@@ -259,11 +269,19 @@ impl LeakFix {
     /// Removes the objects the compile didn't write. Each compile writes its
     /// objects under new names (reused ones included), or rewrites them in
     /// place, so what keeps an old name and an old time is stale.
-    fn finish(self) -> usize {
-        let cutoff = self
+    ///
+    /// Objects modified within `grace` are kept anyway: a binary linked from
+    /// them may still be running, and its backtraces need them. A later
+    /// compile of the unit, or cleanup, removes them once they're older.
+    fn finish(self, grace: Duration) -> usize {
+        let before_compile = self
             .started
             .checked_sub(TIMESTAMP_SLACK)
             .unwrap_or(SystemTime::UNIX_EPOCH);
+        let before_grace = SystemTime::now()
+            .checked_sub(grace)
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let cutoff = before_compile.min(before_grace);
         let mut removed = 0;
         for name in &self.before {
             let path = self.dir.join(name);
@@ -375,6 +393,62 @@ mod tests {
     }
 
     #[test]
+    fn keeps_replaced_objects_within_the_grace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = SystemTime::now();
+        let made = |name: &str, age: Duration| {
+            let path = dir.join(name);
+            fs::write(&path, "o").unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(now - age)
+                .unwrap();
+        };
+        // Replaced 5 minutes ago (its binary may still run) and an hour ago.
+        made(
+            "app-0123456789abcdef.x.0five.rcgu.o",
+            Duration::from_secs(300),
+        );
+        made(
+            "app-0123456789abcdef.x.0hour.rcgu.o",
+            Duration::from_secs(3600),
+        );
+        let parsed = RustcArgs::parse(&args(&[
+            "--crate-name",
+            "app",
+            "-C",
+            "extra-filename=-0123456789abcdef",
+            "--out-dir",
+            dir.to_str().unwrap(),
+        ]));
+        let fix = LeakFix::prepare(&parsed, dir).unwrap();
+        fs::write(dir.join("app-0123456789abcdef.x.0new.rcgu.o"), "new").unwrap();
+        assert_eq!(fix.finish(Duration::from_secs(600)), 1);
+        let mut left: Vec<String> = crate::fsutil::entries(dir).map(|(n, _)| n).collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                "app-0123456789abcdef.x.0five.rcgu.o",
+                "app-0123456789abcdef.x.0new.rcgu.o",
+            ]
+        );
+    }
+
+    #[test]
+    fn reads_the_grace_setting() {
+        let mut config = Config::default();
+        assert_eq!(object_grace(&config), Duration::from_secs(600));
+        config.object_grace = "0s".into();
+        assert_eq!(object_grace(&config), Duration::ZERO);
+        config.object_grace = "soon".into();
+        assert_eq!(object_grace(&config), DEFAULT_OBJECT_GRACE);
+    }
+
+    #[test]
     fn removes_only_old_objects_of_the_compiled_unit() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
@@ -408,7 +482,7 @@ mod tests {
         // The compile rewrites one numbered object in place and adds new ones.
         fs::write(dir.join("app-0123456789abcdef.app.12-cgu.0.rcgu.o"), "new").unwrap();
         fs::write(dir.join("app-0123456789abcdef.x.0new.rcgu.o"), "new").unwrap();
-        assert_eq!(fix.finish(), 1);
+        assert_eq!(fix.finish(Duration::ZERO), 1);
 
         let mut left: Vec<String> = crate::fsutil::entries(dir).map(|(n, _)| n).collect();
         left.sort();

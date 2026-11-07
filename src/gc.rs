@@ -6,11 +6,16 @@
 //! 3. incremental caches and new-layout units no build has used lately;
 //! 4. whole directories whose workspaces were all deleted, or that no build
 //!    has used lately;
-//! 5. when a disk runs low, whole directories, least recently used first.
+//! 5. when a disk runs low, whole directories, those whose bytes cost least
+//!    to rebuild first.
 //!
 //! When applying, each profile directory is examined and cleaned while
 //! holding cargo's own locks, so a running build is never touched and the
-//! decision can't go stale between looking and deleting.
+//! decision can't go stale between looking and deleting. Nothing a running
+//! program was started from is removed ([`guard`]). Build directories are
+//! worked on in parallel, each by one thread.
+
+mod guard;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
@@ -21,6 +26,8 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+
+pub use guard::Running;
 
 use crate::config::{self, Paths, Policy};
 use crate::fsutil::{self, Lock, human};
@@ -74,6 +81,28 @@ pub struct Action {
     pub note: String,
 }
 
+/// Something cleanup would have removed but left in place, and why.
+#[derive(Debug, Clone)]
+pub struct Skipped {
+    pub kind: Kind,
+    pub path: PathBuf,
+    pub reason: String,
+}
+
+/// What a cleanup removed (or would), and what it kept back.
+#[derive(Debug, Default)]
+pub struct Cleanup {
+    pub actions: Vec<Action>,
+    pub skipped: Vec<Skipped>,
+}
+
+impl Cleanup {
+    fn absorb(&mut self, other: Cleanup) {
+        self.actions.extend(other.actions);
+        self.skipped.extend(other.skipped);
+    }
+}
+
 /// A build directory and what is known about its use.
 #[derive(Debug, Clone)]
 pub struct BuildDir {
@@ -83,6 +112,9 @@ pub struct BuildDir {
     pub workspaces: BTreeSet<PathBuf>,
     pub pinned: bool,
     pub device: Option<u64>,
+    /// Compile time the wrapper has recorded here, in milliseconds: a rough
+    /// measure of what rebuilding it costs. 0 when none is recorded.
+    pub compile_ms: u64,
 }
 
 impl BuildDir {
@@ -121,6 +153,7 @@ impl BuildDir {
             workspaces: info.map(|i| i.workspaces.clone()).unwrap_or_default(),
             pinned: root.join(PIN_FILE).exists(),
             device: fsutil::device(root),
+            compile_ms: info.map_or(0, |i| i.compile_ms),
         }
     }
 
@@ -153,10 +186,9 @@ pub fn inventory(paths: &Paths, scan_roots: &[PathBuf]) -> Result<(Registry, Vec
     let mut roots: Vec<PathBuf> = registry.roots.keys().cloned().collect();
     roots.extend(scan::discover(scan_roots, SCAN_DEPTH));
     let roots = scan::outermost(roots);
-    let dirs = roots
-        .iter()
-        .map(|root| BuildDir::inspect(root, registry.roots.get(root)))
-        .collect();
+    let dirs = fsutil::parallel_map(&roots, |root| {
+        BuildDir::inspect(root, registry.roots.get(root))
+    });
     Ok((registry, dirs))
 }
 
@@ -194,96 +226,190 @@ pub fn run(options: Options) -> Result<()> {
     }
 
     let (mut registry, dirs) = inventory(&paths, &config.scan_roots)?;
-    let now = SystemTime::now();
-    let actions = clean(&dirs, &policy, now, options.apply);
+    let running = if config.process_guard {
+        Running::collect()
+    } else {
+        Running::default()
+    };
+    let volumes = if options.apply {
+        Volume::measure(&dirs)
+    } else {
+        Vec::new()
+    };
+    let cleanup = clean(
+        &dirs,
+        Sweep {
+            policy: &policy,
+            running: &running,
+            now: SystemTime::now(),
+            apply: options.apply,
+        },
+    );
+    let freed: Vec<(PathBuf, i128)> = volumes
+        .iter()
+        .filter(|v| {
+            cleanup.actions.iter().any(|a| {
+                dirs.iter()
+                    .any(|d| d.device == Some(v.device) && a.path.starts_with(&d.root))
+            })
+        })
+        .filter_map(|v| Some((v.probe.clone(), v.freed()?)))
+        .collect();
 
-    for action in actions.iter().filter(|a| a.kind >= Kind::Orphaned) {
+    for action in cleanup.actions.iter().filter(|a| a.kind >= Kind::Orphaned) {
         registry.roots.remove(&action.path);
     }
     if options.apply {
         ledger::save(&paths, &registry)?;
     }
-    report(&actions, options);
+    report(&cleanup, &freed, options);
     Ok(())
 }
 
-/// Plans, and when `apply`, carries out the cleanup of `dirs`.
-pub fn clean(dirs: &[BuildDir], policy: &Policy, now: SystemTime, apply: bool) -> Vec<Action> {
-    let mut actions = Vec::new();
-    let mut removed: BTreeSet<PathBuf> = BTreeSet::new();
+/// A volume holding build directories, and its free space before cleanup.
+struct Volume {
+    device: u64,
+    /// A path on the volume that outlives the cleanup: the parent of one of
+    /// its build directories.
+    probe: PathBuf,
+    before: u64,
+}
 
+impl Volume {
+    fn measure(dirs: &[BuildDir]) -> Vec<Volume> {
+        let mut volumes: Vec<Volume> = Vec::new();
+        for dir in dirs {
+            let Some(device) = dir.device else {
+                continue;
+            };
+            if volumes.iter().any(|v| v.device == device) {
+                continue;
+            }
+            let probe = dir
+                .root
+                .parent()
+                .filter(|p| fsutil::device(p) == Some(device))
+                .unwrap_or(&dir.root)
+                .to_path_buf();
+            if let Some(before) = fsutil::free_space(&probe) {
+                volumes.push(Volume {
+                    device,
+                    probe,
+                    before,
+                });
+            }
+        }
+        volumes
+    }
+
+    /// How much the volume's free space rose since [`Volume::measure`]. Other
+    /// writes meanwhile move it too, so it can be negative.
+    fn freed(&self) -> Option<i128> {
+        let after = fsutil::free_space_near(&self.probe)?;
+        Some(i128::from(after) - i128::from(self.before))
+    }
+}
+
+/// How one cleanup works: its thresholds, the programs running when it
+/// started, its notion of now, and whether it removes anything.
+#[derive(Clone, Copy)]
+pub struct Sweep<'a> {
+    pub policy: &'a Policy,
+    pub running: &'a Running,
+    pub now: SystemTime,
+    pub apply: bool,
+}
+
+/// Plans, and when applying, carries out the cleanup of `dirs`. Each build
+/// directory is handled by one thread, several at a time.
+pub fn clean(dirs: &[BuildDir], sweep: Sweep) -> Cleanup {
+    // Before any thread renames something aside into the same parent.
     for dir in dirs {
         fsutil::sweep_trash(&dir.root);
         if let Some(parent) = dir.root.parent() {
             fsutil::sweep_trash(parent);
         }
-        if !dir.pinned {
-            let idle = dir.idle_for(now);
-            let whole = if dir.orphaned() && idle >= policy.orphan_grace {
-                Some((
-                    Kind::Orphaned,
-                    format!(
-                        "workspaces deleted, unused for {}",
-                        fsutil::ago(dir.last_used)
-                    ),
-                ))
-            } else if idle >= policy.dir_idle {
-                Some((
-                    Kind::Idle,
-                    format!("unused for {}", fsutil::ago(dir.last_used)),
-                ))
-            } else {
-                None
-            };
-            if let Some((kind, note)) = whole {
-                if let Some(action) = remove_build_dir(dir, kind, note, apply) {
-                    removed.insert(dir.root.clone());
-                    actions.push(action);
-                }
-                continue;
-            }
-        }
-        for profile in &dir.profiles {
-            actions.extend(clean_profile(profile, dir.pinned, policy, now, apply));
-        }
     }
-
-    actions.extend(free_space(dirs, &removed, &actions, policy, now, apply));
-    actions
+    let results = fsutil::parallel_map(dirs, |dir| clean_dir(dir, sweep));
+    let mut cleanup = Cleanup::default();
+    let mut removed: BTreeSet<PathBuf> = BTreeSet::new();
+    for (dir, (result, whole)) in dirs.iter().zip(results) {
+        if whole {
+            removed.insert(dir.root.clone());
+        }
+        cleanup.absorb(result);
+    }
+    let low = free_space(dirs, &removed, &cleanup.actions, sweep);
+    cleanup.absorb(low);
+    cleanup
 }
 
-fn clean_profile(
-    profile: &Profile,
-    pinned: bool,
-    policy: &Policy,
-    now: SystemTime,
-    apply: bool,
-) -> Vec<Action> {
-    let _lock = if apply {
+/// Cleans one build directory: removes it whole if it's orphaned or idle,
+/// else cleans each profile. The flag says it was removed whole.
+fn clean_dir(dir: &BuildDir, sweep: Sweep) -> (Cleanup, bool) {
+    let mut out = Cleanup::default();
+    if !dir.pinned {
+        let idle = dir.idle_for(sweep.now);
+        let whole = if dir.orphaned() && idle >= sweep.policy.orphan_grace {
+            Some((
+                Kind::Orphaned,
+                format!(
+                    "workspaces deleted, unused for {}",
+                    fsutil::ago(dir.last_used)
+                ),
+            ))
+        } else if idle >= sweep.policy.dir_idle {
+            Some((
+                Kind::Idle,
+                format!("unused for {}", fsutil::ago(dir.last_used)),
+            ))
+        } else {
+            None
+        };
+        if let Some((kind, note)) = whole {
+            match remove_build_dir(dir, kind, note, None, sweep, &mut out) {
+                Removal::Done => return (out, true),
+                Removal::Busy | Removal::Failed => return (out, false),
+                // A program runs from it: clean inside it instead.
+                Removal::Guarded => {}
+            }
+        }
+    }
+    for profile in &dir.profiles {
+        out.absorb(clean_profile(profile, dir.pinned, sweep));
+    }
+    (out, false)
+}
+
+fn clean_profile(profile: &Profile, pinned: bool, sweep: Sweep) -> Cleanup {
+    let _lock = if sweep.apply {
         match fsutil::lock_profile(&profile.path) {
-            Lock::Busy => return Vec::new(),
+            Lock::Busy => return Cleanup::default(),
             held => Some(held),
         }
     } else {
         None
     };
-    let mut actions = Vec::new();
+    let mut out = Cleanup::default();
+    let policy = sweep.policy;
+    let now = sweep.now;
     let idle = |t: SystemTime, limit: Duration| now.duration_since(t).unwrap_or_default() >= limit;
+    let keep_after = now.checked_sub(policy.object_grace).unwrap_or(UNIX_EPOCH);
 
     for dir in scan::object_dirs(profile) {
-        let stale = scan::stale_objects_in(&dir);
+        let stale = scan::stale_objects_in(&dir, keep_after);
         if stale.is_empty() {
             continue;
         }
         let files: Vec<&PathBuf> = stale.iter().flat_map(|s| &s.files).collect();
         let mut gone = 0;
-        if apply {
+        if sweep.apply {
             gone = files.iter().filter(|f| fs::remove_file(f).is_ok()).count();
         }
-        actions.push(Action {
+        out.actions.push(Action {
             kind: Kind::StaleObjects,
             path: dir,
-            files: if apply { gone } else { files.len() },
+            files: if sweep.apply { gone } else { files.len() },
             bytes: stale.iter().map(|s| s.bytes).sum(),
             note: match stale.as_slice() {
                 [one] => one.unit.clone(),
@@ -292,7 +418,7 @@ fn clean_profile(
         });
     }
     if pinned {
-        return actions;
+        return out;
     }
 
     // Old-layout files, once the new layout is in use here and no old-layout
@@ -302,77 +428,123 @@ fn clean_profile(
         && scan::legacy_last_used(&profile.path).is_none_or(|t| idle(t, policy.legacy_idle))
     {
         for path in scan::legacy_paths(&profile.path) {
-            actions.extend(remove_dir(Kind::LegacyLayout, &path, String::new(), apply));
+            remove_dir(
+                Kind::LegacyLayout,
+                &path,
+                String::new(),
+                None,
+                sweep,
+                &mut out,
+            );
         }
     }
     for unit in scan::v2_units(&profile.path) {
         if idle(unit.last_used, policy.unit_idle) {
-            actions.extend(remove_dated(Kind::IdleUnit, &unit, apply));
+            remove_dated(Kind::IdleUnit, &unit, sweep, &mut out);
         }
     }
     for cache in scan::incremental_dirs(&profile.path) {
         if idle(cache.last_used, policy.incremental_idle) {
-            actions.extend(remove_dated(Kind::IdleIncremental, &cache, apply));
+            remove_dated(Kind::IdleIncremental, &cache, sweep, &mut out);
         }
     }
-    actions
+    out
 }
 
-fn remove_dated(kind: Kind, item: &Dated, apply: bool) -> Option<Action> {
-    remove_dir(
-        kind,
-        &item.path,
-        format!("unused for {}", fsutil::ago(item.last_used)),
-        apply,
-    )
+/// How a removal went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Removal {
+    Done,
+    /// A running program was started from inside it.
+    Guarded,
+    /// A build holds its locks.
+    Busy,
+    Failed,
 }
 
-fn remove_dir(kind: Kind, path: &Path, note: String, apply: bool) -> Option<Action> {
-    let bytes = fsutil::tree_size(path);
-    if apply && let Err(e) = fsutil::remove(path) {
+fn remove_dated(kind: Kind, item: &Dated, sweep: Sweep, out: &mut Cleanup) -> Removal {
+    let note = format!("unused for {}", fsutil::ago(item.last_used));
+    remove_dir(kind, &item.path, note, None, sweep, out)
+}
+
+/// Removes `path` (when applying) and records it, unless a running program
+/// was started from inside it, which is recorded instead. `bytes` is its
+/// size if already measured.
+fn remove_dir(
+    kind: Kind,
+    path: &Path,
+    note: String,
+    bytes: Option<u64>,
+    sweep: Sweep,
+    out: &mut Cleanup,
+) -> Removal {
+    if let Some(process) = sweep.running.inside(path) {
+        out.skipped.push(Skipped {
+            kind,
+            path: path.to_path_buf(),
+            reason: format!(
+                "{} is running from it (pid {})",
+                process.exe.display(),
+                process.pid
+            ),
+        });
+        return Removal::Guarded;
+    }
+    let bytes = bytes.unwrap_or_else(|| fsutil::tree_size(path));
+    if sweep.apply
+        && let Err(e) = fsutil::remove(path)
+    {
         eprintln!(
             "warning: cargo-steward: failed to remove {}: {e}",
             path.display()
         );
-        return None;
+        return Removal::Failed;
     }
-    Some(Action {
+    out.actions.push(Action {
         kind,
         path: path.to_path_buf(),
         files: 0,
         bytes,
         note,
-    })
+    });
+    Removal::Done
 }
 
 /// Removes a whole build directory, holding every profile's locks while it is
 /// renamed aside.
-fn remove_build_dir(dir: &BuildDir, kind: Kind, note: String, apply: bool) -> Option<Action> {
-    if !apply {
-        return remove_dir(kind, &dir.root, note, false);
+fn remove_build_dir(
+    dir: &BuildDir,
+    kind: Kind,
+    note: String,
+    bytes: Option<u64>,
+    sweep: Sweep,
+    out: &mut Cleanup,
+) -> Removal {
+    if !sweep.apply {
+        return remove_dir(kind, &dir.root, note, bytes, sweep, out);
     }
     let mut locks = Vec::new();
     for profile in &dir.profiles {
         match fsutil::lock_profile(&profile.path) {
-            Lock::Busy => return None,
+            Lock::Busy => return Removal::Busy,
             held => locks.push(held),
         }
     }
-    let action = remove_dir(kind, &dir.root, note, true);
+    let removal = remove_dir(kind, &dir.root, note, bytes, sweep, out);
     drop(locks);
-    action
+    removal
 }
 
-/// Removes least recently used build directories from each disk that is
-/// below `min-free`, until it has `target-free` again.
+/// Removes build directories from each disk that is below `min-free`, until
+/// it has `target-free` again, those whose bytes cost least to rebuild first
+/// ([`eviction_order`]).
 fn free_space(
     dirs: &[BuildDir],
     removed: &BTreeSet<PathBuf>,
     done: &[Action],
-    policy: &Policy,
-    now: SystemTime,
-    apply: bool,
-) -> Vec<Action> {
+    sweep: Sweep,
+) -> Cleanup {
+    let policy = sweep.policy;
     let mut by_device: BTreeMap<u64, Vec<&BuildDir>> = BTreeMap::new();
     for dir in dirs {
         if let Some(device) = dir.device
@@ -381,13 +553,13 @@ fn free_space(
             by_device.entry(device).or_default().push(dir);
         }
     }
-    let mut actions = Vec::new();
+    let mut out = Cleanup::default();
     for (_, mut candidates) in by_device {
         let Some(free) = fsutil::free_space(&candidates[0].root) else {
             continue;
         };
         // A dry run hasn't freed what it reported; assume it would have.
-        let mut free = if apply {
+        let mut free = if sweep.apply {
             free
         } else {
             let device = candidates[0].device;
@@ -401,43 +573,89 @@ fn free_space(
             continue;
         }
         candidates.retain(|d| {
-            !d.pinned && now.duration_since(d.last_used).unwrap_or_default() >= policy.recent_guard
+            !d.pinned
+                && sweep.now.duration_since(d.last_used).unwrap_or_default() >= policy.recent_guard
         });
-        candidates.sort_by_key(|d| d.last_used);
-        for dir in candidates {
+        let sizes = fsutil::parallel_map(&candidates, |d| fsutil::tree_size(&d.root));
+        let ordered = eviction_order(candidates.into_iter().zip(sizes).collect(), sweep.now);
+        for (dir, bytes) in ordered {
             if free >= policy.target_free {
                 break;
             }
             let note = format!("unused for {}", fsutil::ago(dir.last_used));
-            if let Some(action) = remove_build_dir(dir, Kind::LowSpace, note, apply) {
-                free = if apply {
+            if remove_build_dir(dir, Kind::LowSpace, note, Some(bytes), sweep, &mut out)
+                == Removal::Done
+            {
+                free = if sweep.apply {
                     dir.root
                         .parent()
                         .and_then(fsutil::free_space)
-                        .unwrap_or(free + action.bytes)
+                        .unwrap_or(free + bytes)
                 } else {
-                    free + action.bytes
+                    free + bytes
                 };
-                actions.push(action);
             }
         }
     }
-    actions
+    out
 }
 
-fn report(actions: &[Action], options: Options) {
+/// Orders build directories, with their sizes, for removal when space runs
+/// low: the bytes that cost least to rebuild and are least likely to be
+/// needed go first. Each scores idle time × size ÷ (compile time + 1 s),
+/// highest first, so a big directory nothing has used in weeks goes before
+/// a small one used yesterday, and one that took an hour to build stays
+/// longer than one as big that took a minute.
+///
+/// A directory without recorded compile time (the wrapper never saw it
+/// build) is assumed to cost what the others do per byte (their median);
+/// when none has any, size and idle time alone decide.
+fn eviction_order(mut candidates: Vec<(&BuildDir, u64)>, now: SystemTime) -> Vec<(&BuildDir, u64)> {
+    let mut rates: Vec<f64> = candidates
+        .iter()
+        .filter(|(d, bytes)| d.compile_ms > 0 && *bytes > 0)
+        .map(|(d, bytes)| d.compile_ms as f64 / *bytes as f64)
+        .collect();
+    rates.sort_by(f64::total_cmp);
+    let median_rate = match rates.len() {
+        0 => None,
+        n if n % 2 == 1 => Some(rates[n / 2]),
+        n => Some((rates[n / 2 - 1] + rates[n / 2]) / 2.0),
+    };
+    let score = |dir: &BuildDir, bytes: u64| {
+        let idle = now
+            .duration_since(dir.last_used)
+            .unwrap_or_default()
+            .as_secs_f64();
+        let compile_ms = if dir.compile_ms > 0 {
+            dir.compile_ms as f64
+        } else {
+            median_rate.map_or(0.0, |rate| rate * bytes as f64)
+        };
+        idle * bytes as f64 / (compile_ms / 1000.0 + 1.0)
+    };
+    candidates.sort_by(|(a, a_bytes), (b, b_bytes)| {
+        score(b, *b_bytes)
+            .total_cmp(&score(a, *a_bytes))
+            .then_with(|| a.last_used.cmp(&b.last_used))
+            .then_with(|| a.root.cmp(&b.root))
+    });
+    candidates
+}
+
+fn report(cleanup: &Cleanup, freed: &[(PathBuf, i128)], options: Options) {
     let verb = if options.apply {
         "Removed"
     } else {
         "Would remove"
     };
     let stamp = humantime::format_rfc3339_seconds(SystemTime::now());
-    if actions.is_empty() {
-        if !options.auto {
-            println!("Nothing to clean up.");
-        }
-        return;
-    }
+    let prefix = if options.auto {
+        format!("{stamp} ")
+    } else {
+        String::new()
+    };
+    let actions = &cleanup.actions;
     let mut totals: BTreeMap<Kind, (usize, u64)> = BTreeMap::new();
     for action in actions {
         let total = totals.entry(action.kind).or_default();
@@ -446,11 +664,6 @@ fn report(actions: &[Action], options: Options) {
         if options.verbose || options.auto || action.kind >= Kind::Orphaned {
             let files = if action.files > 0 {
                 format!("{} files, ", action.files)
-            } else {
-                String::new()
-            };
-            let prefix = if options.auto {
-                format!("{stamp} ")
             } else {
                 String::new()
             };
@@ -463,7 +676,30 @@ fn report(actions: &[Action], options: Options) {
             );
         }
     }
+    // Always shown: they explain why something due for removal is still here.
+    for skip in &cleanup.skipped {
+        println!(
+            "{prefix}{:>12} {:>10}  {}  ({}) {}",
+            "Kept",
+            "",
+            skip.kind.describe(),
+            skip.reason,
+            skip.path.display()
+        );
+    }
     if options.auto {
+        for (probe, delta) in freed {
+            println!(
+                "{prefix}{:>12} {:>10}  on the disk holding {}",
+                "Freed",
+                signed(*delta),
+                probe.display()
+            );
+        }
+        return;
+    }
+    if actions.is_empty() {
+        println!("Nothing to clean up.");
         return;
     }
     println!();
@@ -477,11 +713,33 @@ fn report(actions: &[Action], options: Options) {
         );
     }
     println!("{:>12} {:>10}", "Total", human(sum));
-    println!(
-        "\nSizes count blocks shared with APFS or btrfs clones in full; the disk's free space\nis what actually changes."
-    );
-    if !options.apply {
+    for (probe, delta) in freed {
+        println!(
+            "{:>12} {:>10}  Freed on disk: the change in free space on the disk holding {}",
+            "",
+            signed(*delta),
+            probe.display()
+        );
+    }
+    if options.apply {
+        println!(
+            "\nSizes count blocks shared with APFS or btrfs clones in full. \"Freed on disk\" is what\nthe disk's free space actually gained, which other writes during cleanup also move."
+        );
+    } else {
+        println!(
+            "\nSizes count blocks shared with APFS or btrfs clones in full; the disk's free space\nis what actually changes."
+        );
         println!("Run `cargo steward gc --apply` to remove these.");
+    }
+}
+
+/// A size that may be negative: `-1.5 GiB`.
+fn signed(bytes: i128) -> String {
+    let magnitude = u64::try_from(bytes.unsigned_abs()).unwrap_or(u64::MAX);
+    if bytes < 0 {
+        format!("-{}", human(magnitude))
+    } else {
+        human(magnitude)
     }
 }
 
@@ -575,6 +833,22 @@ mod tests {
         config::Config::default().policy().unwrap()
     }
 
+    /// Cleans `dirs` with the default settings and no running programs.
+    fn run_clean(dirs: &[BuildDir], apply: bool) -> Vec<Action> {
+        let policy = policy();
+        let running = Running::default();
+        clean(
+            dirs,
+            Sweep {
+                policy: &policy,
+                running: &running,
+                now: SystemTime::now(),
+                apply,
+            },
+        )
+        .actions
+    }
+
     fn make(path: &Path) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, vec![7u8; 8192]).unwrap();
@@ -625,7 +899,7 @@ mod tests {
         age(&debug.join("incremental/old-1a2b"), 30 * DAY);
 
         let dirs = vec![BuildDir::inspect(&root, None)];
-        let actions = clean(&dirs, &policy(), SystemTime::now(), true);
+        let actions = run_clean(&dirs, true);
         let kinds: Vec<Kind> = actions.iter().map(|a| a.kind).collect();
         assert_eq!(kinds, [Kind::IdleUnit, Kind::IdleIncremental]);
         assert!(!debug.join("build/old/0123456789abcdef").exists());
@@ -647,7 +921,7 @@ mod tests {
         make(&debug.join("app"));
 
         let dirs = vec![BuildDir::inspect(&root, None)];
-        let actions = clean(&dirs, &policy(), SystemTime::now(), true);
+        let actions = run_clean(&dirs, true);
         assert!(
             actions.iter().all(|a| a.kind == Kind::LegacyLayout),
             "{actions:?}"
@@ -669,7 +943,7 @@ mod tests {
         make(&debug.join("deps/app-0123456789abcdef"));
         make(&debug.join("build/app/fedcba9876543210/fingerprint/bin-app"));
         let dirs = vec![BuildDir::inspect(&root, None)];
-        assert!(clean(&dirs, &policy(), SystemTime::now(), true).is_empty());
+        assert!(run_clean(&dirs, true).is_empty());
         assert!(debug.join("deps").exists());
     }
 
@@ -703,7 +977,7 @@ mod tests {
             BuildDir::inspect(&pinned, None),
             BuildDir::inspect(&busy, None),
         ];
-        let actions = clean(&dirs, &policy(), SystemTime::now(), true);
+        let actions = run_clean(&dirs, true);
         let kinds: Vec<(Kind, PathBuf)> =
             actions.iter().map(|a| (a.kind, a.path.clone())).collect();
         assert_eq!(
@@ -727,8 +1001,243 @@ mod tests {
         make(&idle.join("debug/.fingerprint/a-0123456789abcdef/lib-a"));
         age(&idle, 40 * DAY);
         let dirs = vec![BuildDir::inspect(&idle, None)];
-        let actions = clean(&dirs, &policy(), SystemTime::now(), false);
+        let actions = run_clean(&dirs, false);
         assert_eq!(actions.len(), 1);
         assert!(idle.exists());
+    }
+
+    fn sweep<'a>(policy: &'a Policy, running: &'a Running, apply: bool) -> Sweep<'a> {
+        Sweep {
+            policy,
+            running,
+            now: SystemTime::now(),
+            apply,
+        }
+    }
+
+    fn set_modified(path: &Path, age: Duration) {
+        File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(SystemTime::now() - age))
+            .unwrap();
+    }
+
+    #[test]
+    fn keeps_stale_objects_within_the_object_grace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = build_dir(tmp.path(), "target");
+        let out = root.join("debug/build/app/0123456789abcdef/out");
+        make(&root.join("debug/build/app/0123456789abcdef/fingerprint/bin-app"));
+        let minute = Duration::from_secs(60);
+        for (invocation, age) in [
+            ("0hour", 60 * minute),
+            ("0five", 5 * minute),
+            ("0now", minute / 60),
+        ] {
+            let path = out.join(format!("app.x.{invocation}.rcgu.o"));
+            make(&path);
+            set_modified(&path, age);
+        }
+        let dirs = vec![BuildDir::inspect(&root, None)];
+        let actions = run_clean(&dirs, true);
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        assert_eq!(actions[0].files, 1);
+        assert!(!out.join("app.x.0hour.rcgu.o").exists());
+        assert!(out.join("app.x.0five.rcgu.o").exists());
+
+        // With no grace, only the newest compile's objects stay.
+        let mut policy = policy();
+        policy.object_grace = Duration::ZERO;
+        let running = Running::default();
+        let cleanup = clean(&dirs, sweep(&policy, &running, true));
+        assert_eq!(cleanup.actions.len(), 1);
+        assert!(!out.join("app.x.0five.rcgu.o").exists());
+        assert!(out.join("app.x.0now.rcgu.o").exists());
+    }
+
+    #[test]
+    fn keeps_units_caches_and_old_layout_files_programs_run_from() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = build_dir(tmp.path(), "target");
+        let debug = root.join("debug");
+        make(&debug.join(".fingerprint/app-0123456789abcdef/bin-app"));
+        make(&debug.join("deps/app-0123456789abcdef"));
+        age(&debug.join(".fingerprint"), 5 * DAY);
+        make(&debug.join("build/old/0123456789abcdef/fingerprint/lib-old"));
+        make(&debug.join("build/old/0123456789abcdef/out/old-tool"));
+        make(&debug.join("build/gone/fedcba9876543210/fingerprint/lib-gone"));
+        age(&debug.join("build/old"), 30 * DAY);
+        age(&debug.join("build/gone"), 30 * DAY);
+        make(&debug.join("incremental/old-1a2b/s-abc/dep-graph.bin"));
+        age(&debug.join("incremental"), 30 * DAY);
+
+        let running = Running::of(vec![
+            guard::Process {
+                pid: 7,
+                exe: debug.join("deps/app-0123456789abcdef"),
+            },
+            guard::Process {
+                pid: 8,
+                exe: debug.join("build/old/0123456789abcdef/out/old-tool"),
+            },
+        ]);
+        let dirs = vec![BuildDir::inspect(&root, None)];
+        let policy = policy();
+        let cleanup = clean(&dirs, sweep(&policy, &running, true));
+        let mut kept: Vec<(Kind, PathBuf)> = cleanup
+            .skipped
+            .iter()
+            .map(|s| (s.kind, s.path.clone()))
+            .collect();
+        kept.sort();
+        assert_eq!(
+            kept,
+            [
+                (Kind::LegacyLayout, debug.join("deps")),
+                (Kind::IdleUnit, debug.join("build/old/0123456789abcdef")),
+            ]
+        );
+        assert!(debug.join("deps").exists());
+        assert!(debug.join("build/old/0123456789abcdef").exists());
+        // What no program runs from goes as before.
+        assert!(!debug.join(".fingerprint").exists());
+        assert!(!debug.join("build/gone/fedcba9876543210").exists());
+        assert!(!debug.join("incremental/old-1a2b").exists());
+    }
+
+    fn dated(root: &str, idle_days: u32, compile_ms: u64) -> BuildDir {
+        BuildDir {
+            root: PathBuf::from(root),
+            profiles: Vec::new(),
+            last_used: SystemTime::now() - idle_days * DAY,
+            workspaces: BTreeSet::new(),
+            pinned: false,
+            device: None,
+            compile_ms,
+        }
+    }
+
+    fn order(candidates: &[(BuildDir, u64)]) -> Vec<&str> {
+        let refs = candidates.iter().map(|(d, b)| (d, *b)).collect();
+        eviction_order(refs, SystemTime::now())
+            .into_iter()
+            .map(|(d, _)| d.root.to_str().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn evicts_the_cheapest_bytes_to_rebuild_first() {
+        const GIB: u64 = 1 << 30;
+        let minute = 60_000;
+        // Alike but for idle time: least recently used first.
+        assert_eq!(
+            order(&[
+                (dated("/recent", 2, 10 * minute), 10 * GIB),
+                (dated("/old", 9, 10 * minute), 10 * GIB),
+            ]),
+            ["/old", "/recent"]
+        );
+        // Alike but for size: the bigger one frees more per rebuild.
+        assert_eq!(
+            order(&[
+                (dated("/small", 5, 10 * minute), GIB),
+                (dated("/big", 5, 10 * minute), 40 * GIB),
+            ]),
+            ["/big", "/small"]
+        );
+        // An hour of compiling outweighs being a little older.
+        assert_eq!(
+            order(&[
+                (dated("/costly", 6, 60 * minute), 10 * GIB),
+                (dated("/cheap", 4, minute), 10 * GIB),
+            ]),
+            ["/cheap", "/costly"]
+        );
+        // Without any compile times, idle time × size decides.
+        assert_eq!(
+            order(&[
+                (dated("/a", 3, 0), 10 * GIB),
+                (dated("/b", 10, 0), 2 * GIB),
+                (dated("/c", 4, 0), 10 * GIB),
+            ]),
+            ["/c", "/a", "/b"]
+        );
+    }
+
+    #[test]
+    fn a_dir_without_compile_times_costs_what_others_do_per_byte() {
+        const GIB: u64 = 1 << 30;
+        let minute = 60_000;
+        // Without the estimate the unknown one would score as free to
+        // rebuild and go first; at the others' rate it sits between them.
+        assert_eq!(
+            order(&[
+                (dated("/known-cheap", 5, minute), 10 * GIB),
+                (dated("/unknown", 5, 0), 10 * GIB),
+                (dated("/known-costly", 5, 30 * minute), 10 * GIB),
+            ]),
+            ["/known-cheap", "/unknown", "/known-costly"]
+        );
+    }
+
+    #[test]
+    fn low_space_eviction_keeps_pins_recent_dirs_and_running_programs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut dirs = Vec::new();
+        let mut info = BTreeMap::new();
+        for (name, idle_days, compile_ms) in [
+            ("costly", 5, 3_600_000),
+            ("cheap", 3, 1_000),
+            ("running", 6, 1_000),
+            ("recent", 0, 1_000),
+            ("pinned", 8, 1_000),
+        ] {
+            let root = build_dir(tmp.path(), name);
+            make(&root.join("debug/.fingerprint/a-0123456789abcdef/lib-a"));
+            make(&root.join("debug/deps/liba-0123456789abcdef.rlib"));
+            if name == "pinned" {
+                make(&root.join(PIN_FILE));
+            }
+            if idle_days > 0 {
+                age(&root, idle_days * DAY);
+            }
+            info.insert(
+                name,
+                RootInfo {
+                    last_used: ledger::now_secs() - u64::from(idle_days) * 86_400,
+                    workspaces: BTreeSet::new(),
+                    compile_ms,
+                },
+            );
+            dirs.push(BuildDir::inspect(&root, info.get(name)));
+        }
+        let mut policy = policy();
+        policy.min_free = u64::MAX / 2;
+        policy.target_free = u64::MAX / 2;
+        let running = Running::of(vec![guard::Process {
+            pid: 9,
+            exe: tmp.path().join("running/debug/app"),
+        }]);
+        let cleanup = clean(&dirs, sweep(&policy, &running, false));
+        let removed: Vec<(Kind, PathBuf)> = cleanup
+            .actions
+            .iter()
+            .map(|a| (a.kind, a.path.clone()))
+            .collect();
+        assert_eq!(
+            removed,
+            [
+                (Kind::LowSpace, tmp.path().join("cheap")),
+                (Kind::LowSpace, tmp.path().join("costly")),
+            ]
+        );
+        let kept: Vec<(Kind, PathBuf)> = cleanup
+            .skipped
+            .iter()
+            .map(|s| (s.kind, s.path.clone()))
+            .collect();
+        assert_eq!(kept, [(Kind::LowSpace, tmp.path().join("running"))]);
     }
 }

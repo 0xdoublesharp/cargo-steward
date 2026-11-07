@@ -189,7 +189,6 @@ pub struct Policy {
     pub recent_guard: Duration,
     pub min_free: u64,
     pub target_free: u64,
-    #[allow(dead_code)] // Read by the object-grace work in the wrapper and cleanup.
     pub object_grace: Duration,
 }
 

@@ -1,12 +1,22 @@
-//! Filesystem helpers: sizes, timestamps, free space, cargo's locks, and
-//! deletion that never leaves a half-removed directory in place.
+//! Filesystem helpers: sizes, timestamps, free space, cargo's locks,
+//! deletion that never leaves a half-removed directory in place, and
+//! bounded parallel work over many directories.
+
+mod unshared;
 
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
 use std::time::SystemTime;
+
+pub use unshared::private_size;
+
+/// The most threads [`parallel_map`] uses. Directory listing and stat calls
+/// stop scaling well past this on the disks build output lives on.
+const MAX_WORKERS: usize = 8;
 
 /// When a file was last used: its newest access or modification time. A
 /// directory's access time only records someone listing it (including us),
@@ -37,8 +47,64 @@ pub fn allocated(meta: &fs::Metadata) -> u64 {
 /// [`allocated`] size of everything under `path`, counting hard links once
 /// and not following symlinks.
 pub fn tree_size(path: &Path) -> u64 {
-    let mut seen = HashSet::new();
     let mut total = 0;
+    walk_files(path, |_, meta| total += allocated(meta));
+    total
+}
+
+/// What a directory tree takes up, counted two ways.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Usage {
+    /// As `du` counts it: every file's blocks, shared or not.
+    pub allocated: u64,
+    /// Only blocks no copy-on-write clone shares ([`private_size`]). `None`
+    /// where the filesystem can't tell.
+    pub private: Option<u64>,
+}
+
+/// [`Usage`] of everything under `path`, in one walk. Removing the tree
+/// frees at least `private` and at most `allocated`: blocks its own files
+/// share with each other count in neither's private size.
+pub fn tree_usage(path: &Path) -> Usage {
+    let mut allocated_total = 0;
+    let mut private_total = 0;
+    let mut supported = false;
+    let mut files = 0usize;
+    walk_files(path, |file, meta| {
+        let bytes = allocated(meta);
+        allocated_total += bytes;
+        files += 1;
+        if !meta.is_file() {
+            // Symlinks and special files take a block at most, unshared.
+            private_total += bytes;
+            return;
+        }
+        match private_size(file) {
+            Some(private) => {
+                supported = true;
+                private_total += private.min(bytes);
+            }
+            // Gone since it was listed, or unreadable: count it in full.
+            None => private_total += bytes,
+        }
+    });
+    Usage {
+        allocated: allocated_total,
+        private: (supported || files == 0).then_some(private_total),
+    }
+}
+
+/// Bytes under `path` that no copy-on-write clone shares; see [`tree_usage`].
+#[allow(dead_code)] // Library surface for callers that only need this half.
+pub fn tree_private_size(path: &Path) -> Option<u64> {
+    tree_usage(path).private
+}
+
+/// Calls `visit` with every non-directory under `path` (`path` itself if it
+/// isn't a directory), not following symlinks and visiting each hard-linked
+/// file once.
+fn walk_files(path: &Path, mut visit: impl FnMut(&Path, &fs::Metadata)) {
+    let mut seen = HashSet::new();
     let mut stack = vec![path.to_path_buf()];
     while let Some(p) = stack.pop() {
         let Ok(meta) = fs::symlink_metadata(&p) else {
@@ -48,12 +114,10 @@ pub fn tree_size(path: &Path) -> u64 {
             stack.extend(entries(&p).map(|(_, child)| child));
             continue;
         }
-        if !first_link(&meta, &mut seen) {
-            continue;
+        if first_link(&meta, &mut seen) {
+            visit(&p, &meta);
         }
-        total += allocated(&meta);
     }
-    total
 }
 
 /// Whether this is the first time a hard-linked file is seen. Files with a
@@ -124,6 +188,12 @@ pub fn free_space(path: &Path) -> Option<u64> {
         let _ = path;
         None
     }
+}
+
+/// [`free_space`] of the volume holding `path`, or once `path` is gone, of
+/// its nearest remaining ancestor.
+pub fn free_space_near(path: &Path) -> Option<u64> {
+    path.ancestors().find_map(free_space)
 }
 
 /// Identifies the volume a path is on, so build directories can be grouped
@@ -255,6 +325,47 @@ pub fn subdirs(dir: &Path) -> impl Iterator<Item = PathBuf> {
         .map(|e| e.path())
 }
 
+/// Runs `f` on each of `items` on up to [`MAX_WORKERS`] threads (fewer if the
+/// machine has fewer cores), and returns the results in the items' order.
+/// Items are handed out one at a time, so one slow item doesn't hold up a
+/// whole share of the others. A panic in `f` is passed on to the caller.
+pub fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let workers = thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(MAX_WORKERS)
+        .min(items.len());
+    if workers <= 1 {
+        return items.iter().map(f).collect();
+    }
+    let next = AtomicUsize::new(0);
+    let mut done: Vec<(usize, R)> = thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut out = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(item) = items.get(i) else {
+                            break;
+                        };
+                        out.push((i, f(item)));
+                    }
+                    out
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| {
+                h.join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+            .collect()
+    });
+    done.sort_by_key(|(i, _)| *i);
+    done.into_iter().map(|(_, r)| r).collect()
+}
+
 /// Sizes the way people read them: `1.5 GiB`.
 pub fn human(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
@@ -331,6 +442,50 @@ mod tests {
             held
         });
         assert!(freed, "the lock was never released");
+    }
+
+    #[test]
+    fn parallel_map_keeps_the_order_of_its_items() {
+        let items: Vec<u64> = (0..100).collect();
+        let doubled = parallel_map(&items, |n| {
+            // Uneven work, so items finish out of order.
+            std::thread::sleep(std::time::Duration::from_micros((n % 7) * 50));
+            n * 2
+        });
+        assert_eq!(doubled, items.iter().map(|n| n * 2).collect::<Vec<_>>());
+        assert!(parallel_map(&[] as &[u8], |_| 0).is_empty());
+    }
+
+    #[test]
+    fn free_space_falls_back_to_an_ancestor_once_a_path_is_gone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gone = tmp.path().join("removed/deeper");
+        assert!(free_space(&gone).is_none() || cfg!(not(unix)));
+        if cfg!(unix) {
+            assert!(free_space_near(&gone).is_some());
+        }
+    }
+
+    #[test]
+    fn usage_counts_both_ways() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("a"), vec![1u8; 256 * 1024]).unwrap();
+        fs::create_dir(tmp.path().join("sub")).unwrap();
+        fs::write(tmp.path().join("sub/b"), vec![2u8; 64 * 1024]).unwrap();
+        let usage = tree_usage(tmp.path());
+        assert_eq!(usage.allocated, tree_size(tmp.path()));
+        if let Some(private) = usage.private {
+            // Nothing here is a clone: every block is private.
+            assert_eq!(private, usage.allocated);
+        }
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(
+            tree_usage(empty.path()),
+            Usage {
+                allocated: 0,
+                private: Some(0)
+            }
+        );
     }
 
     #[test]
