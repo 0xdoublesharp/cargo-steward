@@ -124,6 +124,27 @@ pub struct Config {
     pub max_builds: Option<u32>,
     /// For the `cargo` proxy: the real cargo to run. Found on PATH if unset.
     pub real_cargo: Option<PathBuf>,
+    /// For the `cargo` proxy: settings for commands run under particular
+    /// directories, overriding `target-root`, `tmp-root` and `max-builds`.
+    /// The longest matching `path` wins.
+    pub routes: Vec<Route>,
+}
+
+/// Proxy settings for commands run under one directory tree.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct Route {
+    /// Applies to commands whose directory is this one or below it.
+    pub path: PathBuf,
+    /// As the top-level `target-root`; unset routes no target directory.
+    #[serde(default)]
+    pub target_root: Option<PathBuf>,
+    /// As the top-level `tmp-root`.
+    #[serde(default)]
+    pub tmp_root: Option<PathBuf>,
+    /// As the top-level `max-builds`, with its own set of slots.
+    #[serde(default)]
+    pub max_builds: Option<u32>,
 }
 
 impl Default for Config {
@@ -151,6 +172,7 @@ impl Default for Config {
             tmp_root: None,
             max_builds: None,
             real_cargo: None,
+            routes: Vec::new(),
         }
     }
 }

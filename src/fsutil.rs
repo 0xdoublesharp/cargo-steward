@@ -321,7 +321,16 @@ mod tests {
         assert!(matches!(first, Lock::Held(_)));
         assert!(matches!(lock_profile(tmp.path()), Lock::Busy));
         drop(first);
-        assert!(matches!(lock_profile(tmp.path()), Lock::Held(_)));
+        // A process another test thread forks at the wrong moment can hold a
+        // copy of the descriptor until it execs, so allow a moment.
+        let freed = (0..50).any(|_| {
+            let held = matches!(lock_profile(tmp.path()), Lock::Held(_));
+            if !held {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            held
+        });
+        assert!(freed, "the lock was never released");
     }
 
     #[test]

@@ -270,11 +270,17 @@ fn explain(args: &[OsString]) -> Result<()> {
         None => println!("real cargo:   none found: the proxy can't run cargo"),
     }
     let command = gate::command(&args).unwrap_or_else(|| "(none)".into());
-    match (config.max_builds.filter(|&n| n > 0), &paths) {
+    let plan = Plan::new(&config, &cwd, &args).ok();
+    let limit = plan.as_ref().and_then(|p| p.max_builds).filter(|&n| n > 0);
+    let set = plan.as_ref().map(|p| p.slots.clone()).unwrap_or_default();
+    if let Some(route) = plan.as_ref().and_then(|p| p.route.as_ref()) {
+        println!("route:        {}", route.display());
+    }
+    match (limit, &paths) {
         (None, _) | (_, None) => println!("build slot:   no limit (max-builds isn't set)"),
         (Some(n), Some(paths)) if gate::is_build(&args) => println!(
             "build slot:   takes one of {n} (in {})",
-            slot_dir(paths).display()
+            slot_dir(paths, &set).display()
         ),
         (Some(_), _) => println!("build slot:   none needed: `{command}` doesn't build"),
     }

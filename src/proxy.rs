@@ -52,17 +52,23 @@ pub fn run(args: Vec<OsString>) -> ! {
         process::exit(127);
     };
 
-    let mut vars = match route_env(&config, &cargo_args, me.as_deref()) {
-        Ok(vars) => vars,
-        Err(e) => {
-            warn(&format!("not routing this build: {e:#}"));
-            Vec::new()
-        }
+    let plan = match env::current_dir() {
+        Ok(cwd) => Plan::new(&config, &cwd, &cargo_args),
+        Err(e) => Err(e.into()),
     };
-    if let Some(limit) = config.max_builds.filter(|&n| n > 0)
+    let mut vars = Vec::new();
+    match &plan {
+        Ok(plan) => match route_env(plan, me.as_deref()) {
+            Ok(routed) => vars = routed,
+            Err(e) => warn(&format!("not routing this build: {e:#}")),
+        },
+        Err(e) => warn(&format!("not routing this build: {e:#}")),
+    }
+    if let Ok(plan) = &plan
+        && let Some(limit) = plan.max_builds.filter(|&n| n > 0)
         && let Some(paths) = &paths
         && gate::is_build(&cargo_args)
-        && let Err(e) = gate::acquire(&slot_dir(paths), limit, &mut vars)
+        && let Err(e) = gate::acquire(&slot_dir(paths, &plan.slots), limit, &mut vars)
     {
         warn(&format!("running without a build slot: {e}"));
     }
@@ -115,9 +121,59 @@ fn real_cargo(config: &Config, me: Option<&Path>) -> Option<PathBuf> {
     .find()
 }
 
-/// Where the build slots' lock files live.
-fn slot_dir(paths: &Paths) -> PathBuf {
-    paths.home.join("slots")
+/// Where a set of build slots' lock files live: `slots/` for the top-level
+/// `max-builds`, a subdirectory of it for a route's.
+fn slot_dir(paths: &Paths, set: &str) -> PathBuf {
+    let slots = paths.home.join("slots");
+    if set.is_empty() {
+        slots
+    } else {
+        slots.join(set)
+    }
+}
+
+/// The proxy settings for commands run in one directory: the longest
+/// matching route's, else the top-level ones.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Effective {
+    pub target_root: Option<PathBuf>,
+    pub tmp_root: Option<PathBuf>,
+    pub max_builds: Option<u32>,
+    /// Which set of build slots `max_builds` counts: empty for the
+    /// top-level one, else the route's own.
+    pub slots: String,
+    /// The route's `path`, when one applies.
+    pub route: Option<PathBuf>,
+}
+
+impl Effective {
+    pub fn of(config: &Config, dir: &Path) -> Effective {
+        let matched = config
+            .routes
+            .iter()
+            .filter_map(|r| Some((root(&r.path).ok().map(|p| route::resolve(&p))?, r)))
+            .filter(|(path, _)| dir.starts_with(path))
+            .max_by_key(|(path, _)| path.components().count());
+        match matched {
+            Some((path, r)) => Effective {
+                target_root: r.target_root.clone(),
+                tmp_root: r.tmp_root.clone(),
+                max_builds: r.max_builds,
+                slots: format!(
+                    "route-{}",
+                    route::repo_name("", path.as_os_str()).trim_start_matches('-')
+                ),
+                route: Some(path),
+            },
+            None => Effective {
+                target_root: config.target_root.clone(),
+                tmp_root: config.tmp_root.clone(),
+                max_builds: config.max_builds,
+                slots: String::new(),
+                route: None,
+            },
+        }
+    }
 }
 
 /// What the proxy does for one invocation.
@@ -135,6 +191,11 @@ pub struct Plan {
     /// For a build in a linked worktree with `seed` on: the main checkout's
     /// target directory, to seed a new one from.
     pub seed_from: Option<PathBuf>,
+    /// The build limit that applies, and which set of slots it counts.
+    pub max_builds: Option<u32>,
+    pub slots: String,
+    /// The route that applies, if any.
+    pub route: Option<PathBuf>,
 }
 
 impl Plan {
@@ -142,6 +203,25 @@ impl Plan {
     /// changes nothing.
     pub fn new(config: &Config, cwd: &Path, args: &[OsString]) -> Result<Plan> {
         let dir = route::command_dir(cwd, args);
+        let effective = Effective::of(config, &dir);
+        if effective.target_root.is_none() && effective.tmp_root.is_none() {
+            // Nothing to route: skip the git and config lookups.
+            return Ok(Plan {
+                namespace: Namespace {
+                    repo: String::new(),
+                    key: String::new(),
+                    git: None,
+                },
+                dir,
+                skip: Some("no target-root or tmp-root applies here".into()),
+                target: None,
+                tmp: None,
+                seed_from: None,
+                max_builds: effective.max_builds,
+                slots: effective.slots,
+                route: effective.route,
+            });
+        }
         let namespace = Namespace::of(&dir);
         let real_cwd = route::resolve(cwd);
         let cargo_home = config::cargo_home();
@@ -151,8 +231,16 @@ impl Plan {
             &[&real_cwd, &dir],
             cargo_home.as_deref(),
         );
-        let target_root = config.target_root.as_deref().map(root).transpose()?;
-        let tmp_root = config.tmp_root.as_deref().map(root).transpose()?;
+        let label = namespace
+            .repo
+            .rsplit_once('-')
+            .map_or(namespace.repo.as_str(), |(label, _)| label);
+        let expand = |path: &Path| -> Result<PathBuf> {
+            let text = path.to_string_lossy().replace("{label}", label);
+            root(Path::new(&text))
+        };
+        let target_root = effective.target_root.as_deref().map(expand).transpose()?;
+        let tmp_root = effective.tmp_root.as_deref().map(expand).transpose()?;
         let target = target_root.as_ref().map(|r| r.join(namespace.relative()));
         let tmp = tmp_root.map(|r| r.join(namespace.relative()));
         let seed_from = match (&target_root, &namespace.git) {
@@ -173,6 +261,9 @@ impl Plan {
             target,
             tmp,
             seed_from,
+            max_builds: effective.max_builds,
+            slots: effective.slots,
+            route: effective.route,
         })
     }
 
@@ -214,15 +305,7 @@ fn root(path: &Path) -> Result<PathBuf> {
 /// Works out the routing, creates the directories, seeds a new worktree's
 /// target directory, and returns the variables to set. Nothing (and no
 /// subprocess) when no root is set or a target directory is already chosen.
-fn route_env(
-    config: &Config,
-    args: &[OsString],
-    me: Option<&Path>,
-) -> Result<Vec<(OsString, OsString)>> {
-    if config.target_root.is_none() && config.tmp_root.is_none() {
-        return Ok(Vec::new());
-    }
-    let plan = Plan::new(config, &env::current_dir()?, args)?;
+fn route_env(plan: &Plan, me: Option<&Path>) -> Result<Vec<(OsString, OsString)>> {
     if plan.skip.is_some() {
         return Ok(Vec::new());
     }
@@ -294,6 +377,9 @@ mod tests {
             target: Some("/t/repo-0123456789/main".into()),
             tmp: Some("/tmp-root/repo-0123456789/main".into()),
             seed_from: None,
+            max_builds: None,
+            slots: String::new(),
+            route: None,
         };
         let vars = plan.vars();
         let get = |k: &str| {
@@ -307,5 +393,96 @@ mod tests {
         assert_eq!(get("TEMP").unwrap(), "/tmp-root/repo-0123456789/main");
         plan.skip = Some("CARGO_TARGET_DIR is set".into());
         assert!(plan.vars().is_empty());
+    }
+
+    #[test]
+    fn the_longest_matching_route_wins_and_labels_expand() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let git_init = |dir: &Path| {
+            std::fs::create_dir_all(dir).unwrap();
+            let status = Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(dir)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+        let repo = base.join("work/proj");
+        git_init(&repo);
+        std::fs::create_dir_all(repo.join("crates/a")).unwrap();
+        let config = Config {
+            target_root: Some(base.join("{label}/cargo")),
+            max_builds: Some(8),
+            routes: vec![
+                config::Route {
+                    path: base.join("work"),
+                    target_root: Some(base.join("work-root")),
+                    tmp_root: None,
+                    max_builds: Some(2),
+                },
+                config::Route {
+                    path: repo.clone(),
+                    target_root: Some(base.join("proj-root")),
+                    tmp_root: Some(base.join("proj-tmp")),
+                    max_builds: Some(3),
+                },
+            ],
+            ..Config::default()
+        };
+        let none: [OsString; 0] = [];
+
+        // Inside the repository, its own route applies.
+        let plan = Plan::new(&config, &repo.join("crates/a"), &none).unwrap();
+        assert_eq!(plan.route.as_deref(), Some(repo.as_path()));
+        assert_eq!(plan.max_builds, Some(3));
+        let text = |p: &Path| p.to_string_lossy().into_owned();
+        let target = plan.target.unwrap();
+        assert!(
+            text(&target).starts_with(&text(&base.join("proj-root/proj-"))),
+            "{target:?}"
+        );
+        assert!(target.ends_with("main"));
+        assert!(plan.tmp.unwrap().starts_with(base.join("proj-tmp")));
+        assert!(plan.slots.starts_with("route-"));
+
+        // Elsewhere, the top-level settings, with `{label}` expanded.
+        let other = base.join("elsewhere/tool");
+        git_init(&other);
+        let plan = Plan::new(&config, &other, &none).unwrap();
+        assert_eq!(plan.route, None);
+        assert_eq!(plan.max_builds, Some(8));
+        assert!(plan.slots.is_empty());
+        let target = plan.target.unwrap();
+        assert!(
+            text(&target).starts_with(&text(&base.join("tool/cargo/tool-"))),
+            "{target:?}"
+        );
+
+        // A route without roots routes nothing, but keeps its own limit.
+        let config = Config {
+            routes: vec![config::Route {
+                path: base.clone(),
+                target_root: None,
+                tmp_root: None,
+                max_builds: Some(1),
+            }],
+            ..Config::default()
+        };
+        let plan = Plan::new(&config, &other, &none).unwrap();
+        assert!(plan.skip.is_some() && plan.vars().is_empty());
+        assert_eq!(plan.max_builds, Some(1));
+    }
+
+    #[test]
+    fn routes_round_trip_through_the_settings_file() {
+        let text = "target-root = \"/s/{label}/cargo\"\n\n[[routes]]\npath = \"/w/diesis\"\n\
+                    target-root = \"/s/0xdiesis/cargo\"\nmax-builds = 3\n";
+        let config: Config = toml::from_str(text).unwrap();
+        assert_eq!(config.routes.len(), 1);
+        assert_eq!(config.routes[0].max_builds, Some(3));
+        assert_eq!(config.routes[0].tmp_root, None);
+        let again: Config = toml::from_str(&toml::to_string_pretty(&config).unwrap()).unwrap();
+        assert_eq!(again, config);
     }
 }

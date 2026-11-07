@@ -65,7 +65,34 @@ set, the proxy just runs cargo.
 | `real-cargo`  | unset   | The cargo to run. Searched for when unset. |
 | `seed`        | `true`  | Seed new worktrees' target directories from the main checkout's. |
 
-Roots must be absolute paths. A leading `~/` means `$HOME`.
+Roots must be absolute paths. A leading `~/` means `$HOME`. `{label}` in a
+root is replaced by the repository's label (the `<label>` of the namespace
+below), which groups each project's output under its own folder:
+
+```toml
+target-root = "/Volumes/Scratch/{label}/cargo"
+tmp-root = "/Volumes/Scratch/{label}/tmp"
+```
+
+### Routes
+
+`[[routes]]` give commands run under one directory tree their own
+`target-root`, `tmp-root` and `max-builds`. The route with the longest
+matching `path` applies; otherwise the top-level settings do. A route's
+`max-builds` counts its own set of slots, separate from the top-level one. A
+route that sets no roots routes nothing (useful to exempt a tree, or to give
+it a build limit alone).
+
+```toml
+[[routes]]
+path = "/Users/me/Workspaces/0xdiesis"
+target-root = "/Volumes/Scratch/0xdiesis/cargo"   # the names its old shim used
+tmp-root = "/Volumes/Scratch/0xdiesis/tmp"
+max-builds = 3
+```
+
+`cargo steward shim explain` shows which route applies to the current
+directory.
 
 ## Naming
 

@@ -37,9 +37,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: End-to-end tests with the other cargo
         run: |
-          export STEWARD_TEST_CARGO="$(rustup +${{ matrix.toolchain }} which cargo)"
-          export RUSTC="$(rustup +${{ matrix.toolchain }} which rustc)"
-          cargo test --test e2e
+          STEWARD_TEST_CARGO="$(rustup +${{ matrix.toolchain }} which cargo)"
+          RUSTC="$(rustup +${{ matrix.toolchain }} which rustc)"
+          export STEWARD_TEST_CARGO RUSTC
+          cargo test --test e2e --test ci --test warm_start
 
   lint:
     name: Lint
