@@ -155,7 +155,7 @@ fn system_disk_build_dirs(
 /// `build.rustc-wrapper` in the user-wide Cargo config.
 fn configured_wrapper() -> Option<String> {
     let home = config::cargo_home()?;
-    let text = fs::read_to_string(home.join("config.toml")).ok()?;
+    let text = fs::read_to_string(config::user_cargo_config(&home)).ok()?;
     let doc = text.parse::<toml_edit::DocumentMut>().ok()?;
     doc.get("build")?
         .get("rustc-wrapper")?
@@ -312,15 +312,20 @@ fn toolchain_pin(dir: &Path) -> Option<(PathBuf, String)> {
 }
 
 /// A project-level `.cargo/config.toml` above `dir` that sets its own
-/// `rustc-wrapper`.
+/// `rustc-wrapper`. `$CARGO_HOME`'s config (`~/.cargo` above projects in the
+/// home directory) is the user-wide one, not a project's.
 fn wrapper_override(dir: &Path) -> Option<PathBuf> {
-    let user = config::cargo_home().map(|h| h.join("config.toml"));
+    let cargo_home = config::cargo_home();
     for ancestor in dir.ancestors() {
+        let dot_cargo = ancestor.join(".cargo");
+        if cargo_home
+            .as_deref()
+            .is_some_and(|h| fsutil::same_file(&dot_cargo, h))
+        {
+            continue;
+        }
         for name in ["config.toml", "config"] {
-            let file = ancestor.join(".cargo").join(name);
-            if Some(&file) == user.as_ref() {
-                continue;
-            }
+            let file = dot_cargo.join(name);
             let Ok(text) = fs::read_to_string(&file) else {
                 continue;
             };

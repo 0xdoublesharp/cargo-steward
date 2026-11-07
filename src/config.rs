@@ -4,7 +4,7 @@
 use std::env;
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -63,6 +63,21 @@ pub fn cargo_home() -> Option<PathBuf> {
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".cargo")))
+}
+
+/// The user-wide Cargo config file Cargo reads in `cargo_home`. Cargo reads
+/// the older extensionless `config` whenever it exists, even next to a
+/// `config.toml` (it warns and ignores `config.toml`), so that one wins
+/// unless it is the same file as `config.toml` through a link. Without
+/// either, `config.toml`, where a new one goes.
+pub fn user_cargo_config(cargo_home: &Path) -> PathBuf {
+    let toml = cargo_home.join("config.toml");
+    let legacy = cargo_home.join("config");
+    if legacy.exists() && !crate::fsutil::same_file(&legacy, &toml) {
+        legacy
+    } else {
+        toml
+    }
 }
 
 /// The settings file, `config.toml` in [`Paths::home`].
@@ -585,5 +600,27 @@ mod tests {
             home: tmp.path().to_path_buf(),
         };
         assert_eq!(load_lenient(&paths), (Config::default(), Vec::new()));
+    }
+
+    /// Cargo reads the extensionless `config` whenever it exists.
+    #[test]
+    fn finds_the_user_cargo_config_cargo_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        assert_eq!(user_cargo_config(home), home.join("config.toml"));
+        fs::write(home.join("config.toml"), "").unwrap();
+        assert_eq!(user_cargo_config(home), home.join("config.toml"));
+        fs::write(home.join("config"), "").unwrap();
+        assert_eq!(user_cargo_config(home), home.join("config"));
+        fs::remove_file(home.join("config.toml")).unwrap();
+        assert_eq!(user_cargo_config(home), home.join("config"));
+        // `config` linked to `config.toml` (for older cargos) is config.toml.
+        #[cfg(unix)]
+        {
+            fs::remove_file(home.join("config")).unwrap();
+            fs::write(home.join("config.toml"), "").unwrap();
+            std::os::unix::fs::symlink("config.toml", home.join("config")).unwrap();
+            assert_eq!(user_cargo_config(home), home.join("config.toml"));
+        }
     }
 }

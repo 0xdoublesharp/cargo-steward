@@ -61,3 +61,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `scripts/install.sh` runs `cargo install` without the configured
   `rustc-wrapper`, so it can reinstall cargo-steward when the binary that
   wrapper names is missing and every other build fails.
+- `setup` and `doctor` read the user-wide Cargo config Cargo reads: the
+  extensionless `$CARGO_HOME/config` whenever it exists, even next to a
+  `config.toml`. With only that file, `doctor` reported no wrapper and
+  skipped the missing-binary check, and flagged `~/.cargo/config` as a
+  project that bypasses cargo-steward.

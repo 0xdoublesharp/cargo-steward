@@ -612,3 +612,52 @@ fn reports_settings_it_cant_use_and_keeps_the_rest() {
     // The good one still applies.
     assert!(out.contains("Automatic cleanup is on"), "{out}");
 }
+
+/// Cargo reads the extensionless `config` when it exists, even next to a
+/// `config.toml`; doctor reads the same file, and `~/.cargo` above projects
+/// in the home directory is the user config, not a project's.
+#[test]
+fn reads_the_legacy_cargo_config_cargo_reads() {
+    let mut fx = Fixture::new();
+    script(&fx.bin.join("tmutil"), "exit 1");
+    script(&fx.bin.join("mdutil"), "exit 1");
+    let cargo_home = fx.home.join(".cargo");
+    fx.set("CARGO_HOME", &cargo_home);
+    let missing = cargo_home.join("bin/cargo-steward");
+    write(
+        &cargo_home.join("config"),
+        &format!(
+            "[build]\nrustc-wrapper = {:?}\n[profile.dev]\ndebug = \"line-tables-only\"\n",
+            missing.display().to_string()
+        ),
+    );
+    // Ignored by cargo while `config` exists.
+    write(
+        &cargo_home.join("config.toml"),
+        "[build]\nrustc-wrapper = \"sccache\"\n",
+    );
+    let project = fx.home.join("p");
+    write(&project.join("Cargo.toml"), "[package]\nname = \"p\"\n");
+    let build = project.join("target");
+    build_dir(&build);
+    fx.record(&[&project], &build);
+
+    let out = fx.doctor();
+    assert!(
+        out.contains(&format!(
+            "The configured wrapper {} doesn't exist",
+            missing.display()
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains("Cargo's rustc-wrapper is cargo-steward"),
+        "{out}"
+    );
+    assert!(!out.contains("No rustc-wrapper is set"), "{out}");
+    assert!(!out.contains("sets build.rustc-wrapper"), "{out}");
+    assert!(
+        out.contains("Debug info in dev builds is reduced for every project"),
+        "{out}"
+    );
+}

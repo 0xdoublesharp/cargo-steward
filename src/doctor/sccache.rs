@@ -109,14 +109,22 @@ pub fn env_sccache_dir(config_text: &str, base: &Path) -> Option<PathBuf> {
 /// Project Cargo configs at or above each of `dirs` that set their own
 /// `SCCACHE_DIR`: the cache directory, and the config files that choose it.
 pub fn project_dirs(dirs: &BTreeSet<PathBuf>) -> BTreeMap<PathBuf, BTreeSet<PathBuf>> {
-    let user = config::cargo_home().map(|h| h.join("config.toml"));
+    let cargo_home = config::cargo_home();
     let mut found: BTreeMap<PathBuf, BTreeSet<PathBuf>> = BTreeMap::new();
     let mut seen = BTreeSet::new();
     for dir in dirs {
         for ancestor in dir.ancestors() {
+            let dot_cargo = ancestor.join(".cargo");
+            // The user-wide config, which `user_config_dir` reads.
+            if cargo_home
+                .as_deref()
+                .is_some_and(|h| fsutil::same_file(&dot_cargo, h))
+            {
+                continue;
+            }
             for name in ["config.toml", "config"] {
-                let file = ancestor.join(".cargo").join(name);
-                if Some(&file) == user.as_ref() || !seen.insert(file.clone()) {
+                let file = dot_cargo.join(name);
+                if !seen.insert(file.clone()) {
                     continue;
                 }
                 let Ok(text) = fs::read_to_string(&file) else {
@@ -134,7 +142,7 @@ pub fn project_dirs(dirs: &BTreeSet<PathBuf>) -> BTreeMap<PathBuf, BTreeSet<Path
 /// The `SCCACHE_DIR` the user-wide Cargo config sets for every build.
 fn user_config_dir() -> Option<PathBuf> {
     let home = config::cargo_home()?;
-    let text = fs::read_to_string(home.join("config.toml")).ok()?;
+    let text = fs::read_to_string(config::user_cargo_config(&home)).ok()?;
     env_sccache_dir(&text, home.parent()?)
 }
 

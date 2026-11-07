@@ -93,7 +93,7 @@ pub fn report(roots: &BTreeSet<PathBuf>) {
         .map(|v| env_debug(&v))
         .unwrap_or(Debug::Unset);
     let from_user = config::cargo_home()
-        .and_then(|h| fs::read_to_string(h.join("config.toml")).ok())
+        .and_then(|h| fs::read_to_string(config::user_cargo_config(&h)).ok())
         .map_or(Debug::Unset, |t| dev_debug(&t));
     if from_env == Debug::Reduced || (from_env == Debug::Unset && from_user == Debug::Reduced) {
         say(

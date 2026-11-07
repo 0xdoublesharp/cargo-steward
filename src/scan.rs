@@ -1465,7 +1465,11 @@ mod tests {
     #[test]
     fn only_rcgu_objects_count_as_names() {
         let mut names = HashSet::new();
-        find_names(b"a.rcgu.x b.rcgu.dwo c.rcgu.otmp d.rcgu.o", false, &mut names);
+        find_names(
+            b"a.rcgu.x b.rcgu.dwo c.rcgu.otmp d.rcgu.o",
+            false,
+            &mut names,
+        );
         assert_eq!(
             names,
             HashSet::from(["b.rcgu.dwo".to_owned(), "d.rcgu.o".to_owned()])

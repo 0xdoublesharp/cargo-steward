@@ -517,6 +517,23 @@ fn background_gc_runs_quietly() {
     assert!(out.is_empty(), "{out}");
 }
 
+/// Cargo reads the extensionless `config` even when `config.toml` exists, so
+/// that's the one setup edits.
+#[test]
+fn setup_edits_the_legacy_config_cargo_reads_next_to_config_toml() {
+    let fx = Fixture::new();
+    let legacy = fx.cargo_home.join("config");
+    fs::write(&legacy, "[build]\njobs = 2\n").unwrap();
+    fs::write(fx.cargo_home.join("config.toml"), "[build]\njobs = 3\n").unwrap();
+    fx.run(&["setup", "--scan-root", "."]);
+    assert!(
+        fs::read_to_string(&legacy)
+            .unwrap()
+            .contains("cargo-steward")
+    );
+    assert_eq!(fx.cargo_config(), "[build]\njobs = 3\n");
+}
+
 /// The script's `cargo install`s run without the configured rustc-wrapper,
 /// which may be a cargo-steward that has gone missing.
 #[cfg(unix)]

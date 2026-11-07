@@ -211,6 +211,22 @@ pub fn device(path: &Path) -> Option<u64> {
     }
 }
 
+/// Whether two paths name the same existing file or directory, following
+/// symlinks.
+pub fn same_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let id = |p: &Path| fs::metadata(p).ok().map(|m| (m.dev(), m.ino()));
+        id(a).is_some_and(|a| Some(a) == id(b))
+    }
+    #[cfg(not(unix))]
+    {
+        a.canonicalize()
+            .is_ok_and(|a| b.canonicalize().is_ok_and(|b| a == b))
+    }
+}
+
 /// Cargo's locks on a build profile directory, held exclusively.
 #[derive(Debug)]
 pub enum Lock {

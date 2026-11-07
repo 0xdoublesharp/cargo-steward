@@ -46,7 +46,7 @@ pub struct Args {
 pub fn run(args: &Args) -> Result<()> {
     let paths = Paths::resolve().context("cannot locate the home directory")?;
     let cargo_home = config::cargo_home().context("cannot locate CARGO_HOME")?;
-    let cargo_config = cargo_config_path(&cargo_home);
+    let cargo_config = config::user_cargo_config(&cargo_home);
     let original = fs::read_to_string(&cargo_config).unwrap_or_default();
     let mut doc: DocumentMut = original
         .parse()
@@ -173,18 +173,6 @@ fn undo(doc: &mut DocumentMut, settings: &mut Config, current_is_us: bool) {
         doc.remove("build");
     }
     settings.auto_gc = false;
-}
-
-/// `$CARGO_HOME/config.toml`, or the older extensionless `config` when only
-/// that exists.
-fn cargo_config_path(cargo_home: &Path) -> PathBuf {
-    let toml = cargo_home.join("config.toml");
-    let legacy = cargo_home.join("config");
-    if !toml.exists() && legacy.is_file() {
-        legacy
-    } else {
-        toml
-    }
 }
 
 fn build_table(doc: &mut DocumentMut) -> &mut Table {
@@ -362,15 +350,17 @@ mod tests {
         assert!(!is_steward("sccache"));
     }
 
+    /// Cargo reads the extensionless `config` whenever it exists, even next
+    /// to a `config.toml`; setup edits that one.
     #[test]
-    fn prefers_config_toml_but_falls_back_to_the_legacy_name() {
+    fn prefers_the_legacy_name_as_cargo_does() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
-        assert_eq!(cargo_config_path(home), home.join("config.toml"));
+        assert_eq!(config::user_cargo_config(home), home.join("config.toml"));
         fs::write(home.join("config"), "").unwrap();
-        assert_eq!(cargo_config_path(home), home.join("config"));
+        assert_eq!(config::user_cargo_config(home), home.join("config"));
         fs::write(home.join("config.toml"), "").unwrap();
-        assert_eq!(cargo_config_path(home), home.join("config.toml"));
+        assert_eq!(config::user_cargo_config(home), home.join("config"));
     }
 
     #[test]
