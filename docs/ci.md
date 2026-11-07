@@ -162,7 +162,7 @@ with the time, saves when each unit's fingerprint was last used to
 fingerprint file to the Unix epoch, leaving modification times alone. An access time older than the
 modification time is the case every common mount updates on the next read:
 Linux `relatime` (the default) and `strictatime`, and macOS, whose APFS
-behaves like `relatime`. So after the job, a unit whose fingerprint files were
+updates an access time only when it's older than the modification time. So after the job, a unit whose fingerprint files were
 neither read nor written since the start was in none of its builds. `trim`
 removes those units, puts back the saved access times of the fingerprints no
 build read, and removes both files.

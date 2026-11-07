@@ -6,6 +6,68 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Cleanup no longer removes Cargo 1.100-layout build units that builds still
+  use. Reading a unit doesn't move its times (APFS, `noatime`), so every
+  dependency looked idle `unit-idle` after its last rebuild; units are now
+  kept while anything used since was built from them, following cargo's
+  fingerprints across profiles.
+- The `cargo` proxy holds a build slot only while cargo builds. Programs a
+  build left running (a server from `cargo run`, a test's daemon,
+  `cargo watch`) kept the slot and blocked other builds; the waiting message
+  now names who holds each slot.
+- Low-space cleanup weighs build directories by their unshared size (clones
+  from `seed` and `dedup` no longer look full size) and stops when removals
+  stop raising free space (Time Machine local snapshots), instead of going on
+  to every directory on the disk.
+- What an interrupted cleanup renamed aside inside a build directory is
+  finished by the next `gc --apply`; it was left forever. A preview no longer
+  deletes anything, and trash a running cleanup is still deleting is left to
+  it.
+- Removing a whole build directory also locks profiles a build started after
+  cleanup looked (`--release`, another `--target`).
+- `status`, `doctor`, and the `gc` and `dedup` previews work when the steward
+  home is read-only, as in an agent's sandbox; they no longer compact the
+  ledger.
+- A setting that doesn't parse falls back to its default alone, so a typo no
+  longer drops `inner-wrapper` (sccache) and `auto-gc` with it; `doctor`
+  reports bad and unknown settings, and other commands warn.
+- Cleanup and `remove` delete the TMPDIR the proxy routed for a build
+  directory they remove.
+- Cleanup keeps what the wrapper recorded about build directories on a volume
+  that isn't mounted.
+- The wrapper lists a unit's objects only before incremental compiles, which
+  are the only ones that leave stale objects: a full `deps/` listing per
+  dependency compile is gone.
+- Object names found across a read boundary are no longer recorded cut short.
+- `doctor` quotes scan roots in its `tmutil addexclusion` and `mdutil -i off`
+  fix commands, so they work for volume names with spaces.
+- `scripts/install.sh` runs `cargo install` without the configured
+  `rustc-wrapper`, so it can reinstall cargo-steward when the binary that
+  wrapper names is missing and every other build fails.
+- `setup` and `doctor` read the user-wide Cargo config Cargo reads: the
+  extensionless `$CARGO_HOME/config` whenever it exists, even next to a
+  `config.toml`. With only that file, `doctor` reported no wrapper and
+  skipped the missing-binary check, and flagged `~/.cargo/config` as a
+  project that bypasses cargo-steward.
+- Writing a settings or Cargo config file through a symlink (as dotfile
+  managers set up) updates the file it links to instead of replacing the
+  link, and keeps the file's permissions; `setup`'s backup of Cargo's config
+  gets the original's permissions instead of 0644.
+- `setup` records cargo-steward as installed on PATH (such as Homebrew's or
+  Nix's link) rather than the versioned file it resolves to, which an upgrade
+  removes and then every build fails.
+- `setup` keeps the other keys of an inline `build = { ... }` in Cargo's
+  config (it replaced the table with an empty one, losing `jobs`,
+  `target-dir` and the rest, in setup and `--undo` alike), and refuses a
+  `build` that isn't a table instead of overwriting it.
+- `setup` stops when Cargo's config exists but can't be read (permissions,
+  not UTF-8) instead of treating it as empty and replacing it with no backup.
+- `setup --undo` puts back the `build.rustc-wrapper` and `build.build-dir`
+  that setup replaced, recorded in the new `previous-wrapper` and
+  `previous-build-dir` settings. It used to set the inner wrapper as the
+  wrapper even when that came from `--inner` and was never configured, and
+  removed a `build-dir` that `--build-dir` had overwritten. Settings written
+  by earlier versions are undone as before.
 - `ci trim --budget` weighs only what it can remove: it no longer evicts
   build units to make up for profiles a build is using, `doc/` or final
   outputs, and says when those leave the directory over the budget.
@@ -65,35 +127,3 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   until that crate's next compile.
 - `scripts/install.sh` for new machines (from source, git, or a release
   binary) and a release workflow building macOS and Linux binaries.
-
-### Fixed
-
-- `doctor` quotes scan roots in its `tmutil addexclusion` and `mdutil -i off`
-  fix commands, so they work for volume names with spaces.
-- `scripts/install.sh` runs `cargo install` without the configured
-  `rustc-wrapper`, so it can reinstall cargo-steward when the binary that
-  wrapper names is missing and every other build fails.
-- `setup` and `doctor` read the user-wide Cargo config Cargo reads: the
-  extensionless `$CARGO_HOME/config` whenever it exists, even next to a
-  `config.toml`. With only that file, `doctor` reported no wrapper and
-  skipped the missing-binary check, and flagged `~/.cargo/config` as a
-  project that bypasses cargo-steward.
-- Writing a settings or Cargo config file through a symlink (as dotfile
-  managers set up) updates the file it links to instead of replacing the
-  link, and keeps the file's permissions; `setup`'s backup of Cargo's config
-  gets the original's permissions instead of 0644.
-- `setup` records cargo-steward as installed on PATH (such as Homebrew's or
-  Nix's link) rather than the versioned file it resolves to, which an upgrade
-  removes and then every build fails.
-- `setup` keeps the other keys of an inline `build = { ... }` in Cargo's
-  config (it replaced the table with an empty one, losing `jobs`,
-  `target-dir` and the rest, in setup and `--undo` alike), and refuses a
-  `build` that isn't a table instead of overwriting it.
-- `setup` stops when Cargo's config exists but can't be read (permissions,
-  not UTF-8) instead of treating it as empty and replacing it with no backup.
-- `setup --undo` puts back the `build.rustc-wrapper` and `build.build-dir`
-  that setup replaced, recorded in the new `previous-wrapper` and
-  `previous-build-dir` settings. It used to set the inner wrapper as the
-  wrapper even when that came from `--inner` and was never configured, and
-  removed a `build-dir` that `--build-dir` had overwritten. Settings written
-  by earlier versions are undone as before.
