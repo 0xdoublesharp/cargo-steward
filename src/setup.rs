@@ -10,6 +10,7 @@ mod volume;
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -48,22 +49,39 @@ pub fn run(args: &Args) -> Result<()> {
     let paths = Paths::resolve().context("cannot locate the home directory")?;
     let cargo_home = config::cargo_home().context("cannot locate CARGO_HOME")?;
     let cargo_config = config::user_cargo_config(&cargo_home);
-    let original = fs::read_to_string(&cargo_config).unwrap_or_default();
+    // Only a missing file is an empty config: one that can't be read must
+    // not be replaced by what setup adds.
+    let original = match fs::read_to_string(&cargo_config) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", cargo_config.display())),
+    };
     let mut doc: DocumentMut = original
         .parse()
         .with_context(|| format!("parsing {}", cargo_config.display()))?;
+    if let Some(build) = doc.get("build")
+        && !build.is_table_like()
+    {
+        bail!(
+            "`build` in {} is {}, not a table; fix it, then run setup again",
+            cargo_config.display(),
+            build.type_name()
+        );
+    }
     let mut settings = config::load(&paths)?;
     let exe = steward_exe(&cargo_home)?;
 
-    let current = doc
-        .get("build")
-        .and_then(|b| b.get("rustc-wrapper"))
-        .and_then(Item::as_str)
-        .map(str::to_owned);
+    let build_key = |key: &str| {
+        doc.get("build")
+            .and_then(|b| b.get(key))
+            .and_then(Item::as_str)
+            .map(str::to_owned)
+    };
+    let current = build_key("rustc-wrapper");
     let current_is_us = current.as_deref().is_some_and(is_steward);
 
     if args.undo {
-        undo(&mut doc, &mut settings, current_is_us);
+        undo(&mut doc, &mut settings, current_is_us)?;
     } else {
         let inner = match (&args.inner, &current) {
             (Some(inner), _) => Some(inner.clone()),
@@ -111,7 +129,7 @@ pub fn run(args: &Args) -> Result<()> {
                 settings.scan_roots.push(root);
             }
         }
-        let build = build_table(&mut doc);
+        let build = build_table(&mut doc)?;
         build["rustc-wrapper"] = value(exe.to_string_lossy().as_ref());
         if let Some(dir) = &args.build_dir {
             let dir = absolute(dir)?;
@@ -158,8 +176,8 @@ pub fn run(args: &Args) -> Result<()> {
     Ok(())
 }
 
-fn undo(doc: &mut DocumentMut, settings: &mut Config, current_is_us: bool) {
-    let build = build_table(doc);
+fn undo(doc: &mut DocumentMut, settings: &mut Config, current_is_us: bool) -> Result<()> {
+    let build = build_table(doc)?;
     if current_is_us {
         match &settings.inner_wrapper {
             Some(inner) => build["rustc-wrapper"] = value(inner.as_str()),
@@ -176,16 +194,21 @@ fn undo(doc: &mut DocumentMut, settings: &mut Config, current_is_us: bool) {
         doc.remove("build");
     }
     settings.auto_gc = false;
+    Ok(())
 }
 
-fn build_table(doc: &mut DocumentMut) -> &mut Table {
+/// The `[build]` table, converted from an inline `build = { ... }` with its
+/// keys kept, and created if missing. Fails if `build` is anything else.
+fn build_table(doc: &mut DocumentMut) -> Result<&mut Table> {
     let item = doc
         .entry("build")
         .or_insert_with(|| Item::Table(Table::new()));
-    if !item.is_table() {
-        *item = Item::Table(Table::new());
+    if let Some(inline) = item.as_inline_table() {
+        *item = Item::Table(inline.clone().into_table());
     }
-    item.as_table_mut().expect("just made a table")
+    let kind = item.type_name();
+    item.as_table_mut()
+        .with_context(|| format!("`build` in Cargo's config is {kind}, not a table"))
 }
 
 /// The binary cargo should run, by a path that outlives upgrades:
@@ -325,7 +348,7 @@ mod tests {
     fn swaps_the_wrapper_in_and_back_out_keeping_comments() {
         let original = "# my settings\n[build]\nrustc-wrapper = \"sccache\" # cache\njobs = 8\n";
         let mut doc: DocumentMut = original.parse().unwrap();
-        build_table(&mut doc)["rustc-wrapper"] = value("/home/u/.cargo/bin/cargo-steward");
+        build_table(&mut doc).unwrap()["rustc-wrapper"] = value("/home/u/.cargo/bin/cargo-steward");
         let text = doc.to_string();
         assert!(text.contains("# my settings"));
         assert!(text.contains("jobs = 8"));
@@ -337,7 +360,7 @@ mod tests {
             ..Config::default()
         };
         let mut doc: DocumentMut = text.parse().unwrap();
-        undo(&mut doc, &mut settings, true);
+        undo(&mut doc, &mut settings, true).unwrap();
         let restored = doc.to_string();
         assert!(restored.contains("rustc-wrapper = \"sccache\""));
         assert!(restored.contains("jobs = 8"));
@@ -350,7 +373,7 @@ mod tests {
             .parse()
             .unwrap();
         let mut settings = Config::default();
-        undo(&mut doc, &mut settings, true);
+        undo(&mut doc, &mut settings, true).unwrap();
         assert_eq!(doc.to_string().trim(), "");
     }
 
@@ -381,12 +404,45 @@ mod tests {
         assert_eq!(config::user_cargo_config(home), home.join("config"));
     }
 
+    /// An inline `build = { ... }` becomes a `[build]` table with its keys;
+    /// any other `build` value is refused rather than replaced.
     #[test]
-    fn replaces_a_build_key_that_isnt_a_table() {
-        let mut doc: DocumentMut = "build = 3\n".parse().unwrap();
-        build_table(&mut doc)["jobs"] = value(2);
+    fn keeps_an_inline_build_table_and_refuses_other_values() {
+        let mut doc: DocumentMut =
+            "build = { jobs = 8, target-dir = \"/srv/t\", rustc-wrapper = \"sccache\" }\n"
+                .parse()
+                .unwrap();
+        build_table(&mut doc).unwrap()["rustc-wrapper"] = value("/x/cargo-steward");
         let doc: DocumentMut = doc.to_string().parse().unwrap();
-        assert_eq!(doc["build"]["jobs"].as_integer(), Some(2));
+        assert_eq!(doc["build"]["jobs"].as_integer(), Some(8));
+        assert_eq!(doc["build"]["target-dir"].as_str(), Some("/srv/t"));
+        assert_eq!(
+            doc["build"]["rustc-wrapper"].as_str(),
+            Some("/x/cargo-steward")
+        );
+
+        // Undo keeps them too.
+        let mut doc: DocumentMut = "build = { jobs = 8, rustc-wrapper = \"/x/cargo-steward\" }\n"
+            .parse()
+            .unwrap();
+        let mut settings = Config {
+            inner_wrapper: Some("sccache".into()),
+            ..Config::default()
+        };
+        undo(&mut doc, &mut settings, true).unwrap();
+        let doc: DocumentMut = doc.to_string().parse().unwrap();
+        assert_eq!(doc["build"]["jobs"].as_integer(), Some(8));
+        assert_eq!(doc["build"]["rustc-wrapper"].as_str(), Some("sccache"));
+
+        let mut doc: DocumentMut = "build = 3\n".parse().unwrap();
+        let err = format!("{:#}", build_table(&mut doc).unwrap_err());
+        assert!(err.contains("not a table"), "{err}");
+        assert_eq!(doc.to_string(), "build = 3\n");
+        let err = format!(
+            "{:#}",
+            undo(&mut doc, &mut Config::default(), true).unwrap_err()
+        );
+        assert!(err.contains("not a table"), "{err}");
     }
 
     /// A package manager's link on PATH is recorded, not the versioned file
@@ -432,7 +488,7 @@ mod tests {
             inner_wrapper: Some("other".into()),
             ..Config::default()
         };
-        undo(&mut doc, &mut settings, false);
+        undo(&mut doc, &mut settings, false).unwrap();
         assert_eq!(doc.to_string(), "[build]\nrustc-wrapper = \"sccache\"\n");
         assert!(!settings.managed_build_dir);
     }

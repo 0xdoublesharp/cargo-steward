@@ -517,6 +517,70 @@ fn background_gc_runs_quietly() {
     assert!(out.is_empty(), "{out}");
 }
 
+/// A Cargo config that exists but can't be read is never replaced: only a
+/// missing file is an empty config.
+#[test]
+fn setup_refuses_a_config_it_cannot_read() {
+    let fx = Fixture::new();
+    let config = fx.cargo_home.join("config.toml");
+    let latin1 = b"[build]\njobs = 8 # caf\xe9\n";
+    fs::write(&config, latin1).unwrap();
+    let err = fx.fail(&["setup", "--scan-root", "."]);
+    assert!(
+        err.contains(&format!("reading {}", config.display())),
+        "{err}"
+    );
+    assert_eq!(fs::read(&config).unwrap(), latin1);
+    assert!(fx.settings().is_empty());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(&config, "[build]\njobs = 8\n").unwrap();
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o200)).unwrap();
+        // Root reads it anyway; then there's nothing to test.
+        if fs::read(&config).is_err() {
+            let err = fx.fail(&["setup", "--scan-root", "."]);
+            assert!(err.contains("ermission denied"), "{err}");
+            fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(fs::read_to_string(&config).unwrap(), "[build]\njobs = 8\n");
+        }
+    }
+}
+
+/// `build = { ... }` keeps its other keys through setup and undo, and a
+/// `build` that isn't a table is refused.
+#[test]
+fn setup_keeps_an_inline_build_table() {
+    let fx = Fixture::new();
+    let config = fx.cargo_home.join("config.toml");
+    fs::write(
+        &config,
+        "build = { jobs = 8, target-dir = \"/srv/t\", rustc-wrapper = \"sccache\" }\n",
+    )
+    .unwrap();
+    fx.run(&["setup", "--scan-root", "."]);
+    let text = fx.cargo_config();
+    assert!(
+        text.contains("jobs = 8") && text.contains("target-dir = \"/srv/t\""),
+        "{text}"
+    );
+    assert!(text.contains("cargo-steward"), "{text}");
+    fx.run(&["setup", "--undo"]);
+    let text = fx.cargo_config();
+    assert!(
+        text.contains("jobs = 8")
+            && text.contains("target-dir = \"/srv/t\"")
+            && text.contains("rustc-wrapper = \"sccache\""),
+        "{text}"
+    );
+
+    fs::write(&config, "build = \"fast\"\n").unwrap();
+    let err = fx.fail(&["setup", "--scan-root", "."]);
+    assert!(err.contains("not a table"), "{err}");
+    assert_eq!(fx.cargo_config(), "build = \"fast\"\n");
+}
+
 /// A symlinked Cargo config (from a dotfile manager) stays a link, and the
 /// config and its backup keep the original's permissions.
 #[cfg(unix)]

@@ -73,3 +73,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `setup` records cargo-steward as installed on PATH (such as Homebrew's or
   Nix's link) rather than the versioned file it resolves to, which an upgrade
   removes and then every build fails.
+- `setup` keeps the other keys of an inline `build = { ... }` in Cargo's
+  config (it replaced the table with an empty one, losing `jobs`,
+  `target-dir` and the rest, in setup and `--undo` alike), and refuses a
+  `build` that isn't a table instead of overwriting it.
+- `setup` stops when Cargo's config exists but can't be read (permissions,
+  not UTF-8) instead of treating it as empty and replacing it with no backup.
