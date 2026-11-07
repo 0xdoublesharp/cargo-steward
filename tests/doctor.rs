@@ -593,3 +593,22 @@ esac"#,
         "{out}"
     );
 }
+
+#[test]
+fn reports_settings_it_cant_use_and_keeps_the_rest() {
+    let fx = Fixture::new();
+    script(&fx.bin.join("tmutil"), "exit 1");
+    script(&fx.bin.join("mdutil"), "exit 1");
+    write(
+        &fx.steward.join("config.toml"),
+        "auto-gc = true\nmax_builds = 3\ndir-idle = \"soon\"\n",
+    );
+    let out = fx.doctor();
+    assert!(
+        out.contains("max_builds: not a cargo-steward setting"),
+        "{out}"
+    );
+    assert!(out.contains("dir-idle:"), "{out}");
+    // The good one still applies.
+    assert!(out.contains("Automatic cleanup is on"), "{out}");
+}

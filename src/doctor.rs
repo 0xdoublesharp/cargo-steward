@@ -57,7 +57,7 @@ fn joined<T: Default>(handle: thread::ScopedJoinHandle<'_, T>) -> T {
 
 pub fn run() -> Result<()> {
     let paths = Paths::resolve().context("cannot locate the home directory")?;
-    let settings = config::load(&paths)?;
+    let (settings, problems) = config::load_lenient(&paths);
     let policy = settings.policy()?;
     let configured = configured_wrapper();
     let home = env::var_os("HOME").map(PathBuf::from);
@@ -89,7 +89,10 @@ pub fn run() -> Result<()> {
         let workspace_roots = profile::workspace_roots(&packages);
         let pins = toolchain_pins(&packages);
 
-        println!("Wrapper");
+        println!("Settings");
+        check_settings(&paths, &problems);
+
+        println!("\nWrapper");
         binary::report(&joined(binary_probe));
         check_wrapper(&settings, configured.as_deref());
 
@@ -376,6 +379,31 @@ fn check_disks(
         if let Some(status) = statuses.iter().find(|s| &s.root == root) {
             backup::report_root(status);
         }
+    }
+}
+
+/// What in the settings file can't be used, and so has its default.
+fn check_settings(paths: &Paths, problems: &[String]) {
+    if problems.is_empty() {
+        let file = paths.config();
+        if file.exists() {
+            say(Level::Ok, format!("{} reads cleanly", file.display()));
+        } else {
+            say(
+                Level::Info,
+                format!("No {}: the defaults apply", file.display()),
+            );
+        }
+        return;
+    }
+    for problem in problems {
+        say(
+            Level::Warn,
+            format!(
+                "Settings: {problem}\nFix: edit {}",
+                paths.config().display()
+            ),
+        );
     }
 }
 

@@ -241,6 +241,107 @@ pub fn load(paths: &Paths) -> Result<Config> {
     }
 }
 
+/// Reads the settings so that each one that's wrong falls back to its
+/// default alone, and says what was wrong. For what must run whatever the
+/// file holds (the wrapper and the proxy run every build) and for reports:
+/// a typo in one setting no longer silently drops `inner-wrapper` (sccache)
+/// and `auto-gc` with it. A file that isn't TOML at all gives the defaults.
+pub fn load_lenient(paths: &Paths) -> (Config, Vec<String>) {
+    let path = paths.config();
+    match fs::read_to_string(&path) {
+        Ok(text) => lenient(&text, &path),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => (Config::default(), Vec::new()),
+        Err(e) => (
+            Config::default(),
+            vec![format!(
+                "reading {}: {e}; using the defaults",
+                path.display()
+            )],
+        ),
+    }
+}
+
+/// [`Config`] and its thresholds ([`Config::policy`]) from `table`.
+fn parse_table(table: &toml::Table) -> std::result::Result<Config, String> {
+    let config: Config = toml::Value::Table(table.clone())
+        .try_into()
+        .map_err(|e: toml::de::Error| e.message().to_owned())?;
+    config.policy().map_err(|e| format!("{e:#}"))?;
+    Ok(config)
+}
+
+fn lenient(text: &str, path: &std::path::Path) -> (Config, Vec<String>) {
+    let table: toml::Table = match text.parse() {
+        Ok(table) => table,
+        Err(e) => {
+            return (
+                Config::default(),
+                vec![format!(
+                    "{} isn't valid TOML ({}); using the defaults",
+                    path.display(),
+                    e.message()
+                )],
+            );
+        }
+    };
+    // Settings are taken one at a time, in rounds, so one that only fits
+    // with another (`target-free` above a raised `min-free`) still counts.
+    let mut accepted = toml::Table::new();
+    let mut config = Config::default();
+    let mut pending: Vec<(String, toml::Value, String)> = table
+        .into_iter()
+        .map(|(key, value)| (key, value, String::new()))
+        .collect();
+    loop {
+        let before = pending.len();
+        pending.retain_mut(|(key, value, error)| {
+            let mut candidate = accepted.clone();
+            candidate.insert(key.clone(), value.clone());
+            match parse_table(&candidate) {
+                Ok(parsed) => {
+                    accepted = candidate;
+                    config = parsed;
+                    false
+                }
+                Err(e) => {
+                    *error = e;
+                    true
+                }
+            }
+        });
+        if pending.is_empty() || pending.len() == before {
+            break;
+        }
+    }
+    let mut problems: Vec<String> = pending
+        .into_iter()
+        .map(|(key, _, error)| format!("{key}: {error}; using the default"))
+        .collect();
+    // A key that changes nothing and isn't one cargo-steward writes back is
+    // one it doesn't know: most likely a typo.
+    let known: std::collections::BTreeSet<String> = toml::Value::try_from(&config)
+        .ok()
+        .and_then(|v| v.as_table().map(|t| t.keys().cloned().collect()))
+        .unwrap_or_default();
+    for key in accepted.keys().filter(|k| !known.contains(*k)) {
+        let mut without = accepted.clone();
+        without.remove(key);
+        if parse_table(&without).is_ok_and(|c| c == config) {
+            problems.push(format!("{key}: not a cargo-steward setting; ignored"));
+        }
+    }
+    (config, problems)
+}
+
+/// [`load_lenient`], printing what was wrong as warnings.
+pub fn load_warning(paths: &Paths) -> Config {
+    let (config, problems) = load_lenient(paths);
+    for problem in problems {
+        eprintln!("warning: cargo-steward: settings: {problem}");
+    }
+    config
+}
+
 pub fn save(paths: &Paths, config: &Config) -> Result<()> {
     fs::create_dir_all(&paths.home)
         .with_context(|| format!("creating {}", paths.home.display()))?;
@@ -433,5 +534,56 @@ mod tests {
         // The temporary file isn't left behind.
         let names: Vec<_> = fs::read_dir(tmp.path()).unwrap().flatten().collect();
         assert_eq!(names.len(), 2, "{names:?}");
+    }
+
+    fn lenient_str(text: &str) -> (Config, Vec<String>) {
+        lenient(text, std::path::Path::new("config.toml"))
+    }
+
+    #[test]
+    fn a_bad_setting_falls_back_alone() {
+        let (config, problems) = lenient_str(
+            "inner-wrapper = \"sccache\"\nauto-gc = \"yes\"\ndir-idle = \"soon\"\n\
+             unit-idle = \"3d\"\n",
+        );
+        assert_eq!(config.inner_wrapper.as_deref(), Some("sccache"));
+        assert_eq!(config.unit_idle, "3d");
+        assert!(!config.auto_gc, "the default");
+        assert_eq!(config.dir_idle, Config::default().dir_idle);
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(problems.iter().any(|p| p.starts_with("auto-gc:")));
+        assert!(problems.iter().any(|p| p.starts_with("dir-idle:")));
+    }
+
+    #[test]
+    fn settings_that_only_fit_together_are_both_kept() {
+        let (config, problems) = lenient_str("target-free = \"300G\"\nmin-free = \"200G\"\n");
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(config.min_free, "200G");
+        assert_eq!(config.target_free, "300G");
+    }
+
+    #[test]
+    fn unknown_settings_and_broken_files_are_reported() {
+        let (config, problems) = lenient_str("auto-gc = true\nmax_builds = 3\n");
+        assert!(config.auto_gc);
+        assert_eq!(config.max_builds, None);
+        assert_eq!(
+            problems,
+            ["max_builds: not a cargo-steward setting; ignored"]
+        );
+        // A setting given its default value is still a known one.
+        assert!(lenient_str("leak-fix = true\n").1.is_empty());
+
+        let (config, problems) = lenient_str("auto-gc = \n");
+        assert_eq!(config, Config::default());
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].contains("isn't valid TOML"), "{problems:?}");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            home: tmp.path().to_path_buf(),
+        };
+        assert_eq!(load_lenient(&paths), (Config::default(), Vec::new()));
     }
 }

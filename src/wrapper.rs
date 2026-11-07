@@ -36,10 +36,7 @@ const LOW_SPACE_RECHECK: Duration = Duration::from_secs(300);
 
 pub fn run(argv: Vec<OsString>) -> ! {
     let paths = Paths::resolve();
-    let config = paths
-        .as_ref()
-        .and_then(|p| config::load(p).ok())
-        .unwrap_or_default();
+    let config = settings(paths.as_ref());
 
     let mut command: Vec<OsString> = inner_wrapper(&config).into_iter().collect();
     command.extend(argv.iter().cloned());
@@ -74,6 +71,13 @@ pub fn run(argv: Vec<OsString>) -> ! {
         }
     }
     process::exit(exit_code(status));
+}
+
+/// The settings, each one that can't be used replaced by its default: a
+/// typo in one must not drop the others (`inner-wrapper`, `auto-gc`), and a
+/// wrapper must never fail a build over one. `doctor` and `gc` report them.
+fn settings(paths: Option<&Paths>) -> Config {
+    paths.map(|p| config::load_lenient(p).0).unwrap_or_default()
 }
 
 /// Whether to look for objects this compile replaces. Only incremental
@@ -402,6 +406,24 @@ mod tests {
             ..Config::default()
         };
         assert!(!wants_leak_fix(&off, &incremental));
+    }
+
+    #[test]
+    fn a_bad_setting_doesnt_drop_the_inner_wrapper() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            home: tmp.path().to_path_buf(),
+        };
+        fs::write(
+            paths.config(),
+            "inner-wrapper = \"sccache\"\nauto-gc = true\nobject-grace = 10\n",
+        )
+        .unwrap();
+        let config = settings(Some(&paths));
+        assert_eq!(config.inner_wrapper.as_deref(), Some("sccache"));
+        assert!(config.auto_gc);
+        assert_eq!(object_grace(&config), DEFAULT_OBJECT_GRACE);
+        assert_eq!(settings(None), Config::default());
     }
 
     #[test]

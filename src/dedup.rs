@@ -67,7 +67,7 @@ pub struct Summary {
 /// `cargo steward dedup`.
 pub fn run(apply: bool, verbose: bool) -> Result<()> {
     let paths = Paths::resolve().context("cannot locate the home directory")?;
-    let config = config::load(&paths)?;
+    let config = config::load_warning(&paths);
     let (_, dirs) = gc::inventory(&paths, &config.scan_roots, apply)?;
     if dirs.is_empty() {
         println!("No build directories found yet.");

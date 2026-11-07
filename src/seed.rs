@@ -78,7 +78,7 @@ pub(crate) enum Outcome {
 /// `cargo steward seed`.
 pub fn run_seed(args: &SeedArgs) -> Result<()> {
     let paths = Paths::resolve().context("cannot locate the home directory")?;
-    let config = config::load(&paths)?;
+    let config = config::load_warning(&paths);
     let say = |line: String| {
         if !args.quiet {
             println!("{line}");

@@ -224,7 +224,7 @@ pub fn run(options: Options) -> Result<()> {
         fs::create_dir_all(&paths.home)
             .with_context(|| format!("creating {}", paths.home.display()))?;
     }
-    let config = config::load(&paths)?;
+    let config = config::load_warning(&paths);
     let policy = config.policy()?;
 
     let _singleton = if options.apply {
@@ -722,7 +722,7 @@ fn remove_build_dir(
 /// isn't a cargo build directory is refused, and pinned ones need `force`.
 pub fn remove_requested(roots: &[PathBuf], apply: bool, force: bool) -> Result<()> {
     let paths = Paths::resolve().context("cannot locate the home directory")?;
-    let config = config::load(&paths)?;
+    let config = config::load_warning(&paths);
     let policy = config.policy()?;
     let running = if config.process_guard {
         Running::collect()
@@ -811,7 +811,7 @@ pub fn build_dir_of(worktree: &Path) -> Result<PathBuf> {
         .canonicalize()
         .with_context(|| format!("{} doesn't exist", worktree.display()))?;
     let config = Paths::resolve()
-        .and_then(|p| config::load(&p).ok())
+        .map(|p| config::load_lenient(&p).0)
         .unwrap_or_default();
     if let Ok(plan) = crate::proxy::Plan::new(&config, &worktree, &[])
         && plan.skip.is_none()

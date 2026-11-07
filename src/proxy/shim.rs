@@ -242,14 +242,19 @@ fn explain(args: &[OsString]) -> Result<()> {
     let paths = Paths::resolve();
     let config = settings(paths.as_ref(), false);
     match &paths {
-        Some(p) => match config::load(p) {
-            Ok(_) if p.config().exists() => println!("settings:     {}", p.config().display()),
-            Ok(_) => println!(
-                "settings:     {} (missing: defaults, nothing routed)",
-                p.config().display()
-            ),
-            Err(e) => println!("settings:     unusable, the proxy uses the defaults: {e:#}"),
-        },
+        Some(p) => {
+            if p.config().exists() {
+                println!("settings:     {}", p.config().display());
+            } else {
+                println!(
+                    "settings:     {} (missing: defaults, nothing routed)",
+                    p.config().display()
+                );
+            }
+            for problem in config::load_lenient(p).1 {
+                println!("              {problem}");
+            }
+        }
         None => println!("settings:     none (no HOME): defaults"),
     }
     println!(

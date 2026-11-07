@@ -74,7 +74,7 @@ pub fn run_hooks(args: &HooksArgs) -> Result<()> {
                 println!("It runs the hook that was there first ({CHAINED}).");
             }
             if let Some(paths) = Paths::resolve()
-                && config::load(&paths).is_ok_and(|c| !c.seed)
+                && !config::load_lenient(&paths).0.seed
             {
                 println!(
                     "Note: seeding is turned off (`seed = false` in {}).",
@@ -221,7 +221,7 @@ fn status(dir: &Path) -> String {
         line.push_str(&format!(" (runs {CHAINED} first)"));
     }
     if let Some(paths) = Paths::resolve()
-        && config::load(&paths).is_ok_and(|c| !c.seed)
+        && !config::load_lenient(&paths).0.seed
     {
         line.push_str("\nSeeding is turned off (`seed = false`), so the hook does nothing.");
     }

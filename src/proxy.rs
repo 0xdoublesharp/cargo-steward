@@ -107,18 +107,19 @@ fn warn(message: &str) {
     eprintln!("warning: cargo-steward: {}", message.replace('\n', " "));
 }
 
-/// The settings; the defaults when there are none or they can't be read.
+/// The settings, each one that can't be used replaced by its default
+/// ([`config::load_lenient`]).
 fn settings(paths: Option<&Paths>, warn_if_broken: bool) -> Config {
-    match paths.map(config::load) {
-        Some(Ok(config)) => config,
-        Some(Err(e)) => {
-            if warn_if_broken {
-                warn(&format!("ignoring its settings ({e}); using the defaults"));
-            }
-            Config::default()
+    let Some(paths) = paths else {
+        return Config::default();
+    };
+    let (config, problems) = config::load_lenient(paths);
+    if warn_if_broken {
+        for problem in problems {
+            warn(&format!("settings: {problem}"));
         }
-        None => Config::default(),
     }
+    config
 }
 
 /// This executable, resolved (on macOS it may be reported as the `cargo`

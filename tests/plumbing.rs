@@ -507,8 +507,10 @@ fn explain_describes_settings_and_build_slots() {
 
     env.config("max-builds = \"lots\"\n");
     let out = explain(&[]);
+    // The bad setting alone falls back to its default.
     assert!(
-        out.contains("settings:     unusable, the proxy uses the defaults"),
+        out.contains("max-builds: invalid type: string \"lots\"")
+            && out.contains("using the default"),
         "{out}"
     );
 
