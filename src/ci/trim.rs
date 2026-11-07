@@ -96,6 +96,9 @@ struct Report {
     kept_bytes: u64,
     before: u64,
     after: u64,
+    /// What's left that trim doesn't remove, whatever the budget: profiles a
+    /// build holds, `doc/`, final outputs cargo copies up, its own files.
+    outside: u64,
 }
 
 impl Report {
@@ -321,13 +324,32 @@ fn trim(options: &Options, tracking: Tracking) -> Report {
             (u, bytes)
         })
         .collect();
-    let size = out.report.before.saturating_sub(out.report.removed_bytes());
+    // The budget weighs only what trim could remove: evicting units can't
+    // make up for bytes it leaves alone, such as a busy profile or `doc/`.
+    // A dry run hasn't removed the stale objects counted in units' sizes.
+    let stale_pending = if apply {
+        0
+    } else {
+        out.report
+            .removed
+            .iter()
+            .filter(|r| r.0 == Reason::StaleObjects)
+            .map(|r| r.2)
+            .sum()
+    };
+    let removable = remaining
+        .iter()
+        .map(|(_, b)| b)
+        .sum::<u64>()
+        .saturating_sub(stale_pending);
     if let Some(budget) = options.budget
-        && size > budget
+        && removable > budget
     {
         let items: Vec<(SystemTime, u64)> =
             remaining.iter().map(|(u, b)| (u.last_used, *b)).collect();
-        let chosen: BTreeSet<usize> = over_budget(&items, size - budget).into_iter().collect();
+        let chosen: BTreeSet<usize> = over_budget(&items, removable - budget)
+            .into_iter()
+            .collect();
         let mut stay = Vec::new();
         for (i, (unit, bytes)) in remaining.into_iter().enumerate() {
             if chosen.contains(&i) {
@@ -361,6 +383,7 @@ fn trim(options: &Options, tracking: Tracking) -> Report {
     } else {
         report.before.saturating_sub(report.removed_bytes())
     };
+    report.outside = report.after.saturating_sub(report.kept_bytes);
     drop(locks);
     report
 }
@@ -449,7 +472,25 @@ fn render_text(options: &Options, tracking: Tracking, report: &Report) -> String
         let _ = write!(s, ", budget {}", human(budget));
     }
     s.push('\n');
+    if let Some(note) = budget_unmet(options, report) {
+        let _ = writeln!(
+            s,
+            "{:>12} {:>10}  {note}",
+            "Can't remove",
+            human(report.outside)
+        );
+    }
     s
+}
+
+/// Why the build directory is still over the budget, when it is: what's
+/// left of it that trim doesn't remove.
+fn budget_unmet(options: &Options, report: &Report) -> Option<&'static str> {
+    let budget = options.budget?;
+    (report.after > budget).then_some(
+        "outside what trim removes (profiles a build is using, doc/, final outputs), so \
+         the build directory stays over the budget",
+    )
 }
 
 fn render_markdown(options: &Options, tracking: Tracking, report: &Report) -> String {
@@ -485,6 +526,9 @@ fn render_markdown(options: &Options, tracking: Tracking, report: &Report) -> St
         .budget
         .map(|b| format!(" (budget {})", human(b)))
         .unwrap_or_default();
+    if let Some(note) = budget_unmet(options, report) {
+        let _ = writeln!(s, "| Can't remove: {note} | | {} |", human(report.outside));
+    }
     let _ = writeln!(
         s,
         "| **Build directory**{budget} | was {} | **{}** |\n",
@@ -518,7 +562,14 @@ mod tests {
     fn fixture() -> (tempfile::TempDir, PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("target");
-        let profile = root.join("debug");
+        populate(&root.join("debug"));
+        fs::write(root.join(".rustc_info.json"), "{}").unwrap();
+        (tmp, root)
+    }
+
+    /// Three units (`used`, `unused`, the member `app`) and two incremental
+    /// caches, of 8 KiB files: 64 KiB in all.
+    fn populate(profile: &Path) {
         let used = "1111111111111111";
         let unused = "2222222222222222";
         let member = "3333333333333333";
@@ -536,8 +587,6 @@ mod tests {
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(&path, vec![1u8; 8192]).unwrap();
         }
-        fs::write(root.join(".rustc_info.json"), "{}").unwrap();
-        (tmp, root)
     }
 
     fn opts(root: &Path) -> Options {
@@ -829,10 +878,11 @@ mod tests {
             dry_run: true,
             ..opts(&root)
         };
-        let before = trim(&all, Tracking::NoMarker).before;
-        // One byte over: only the least recently used item goes.
+        // What trim could remove, all kept; one byte over the budget: only
+        // the least recently used item goes.
+        let removable = trim(&all, Tracking::NoMarker).kept_bytes;
         let options = Options {
-            budget: Some(before - 1),
+            budget: Some(removable - 1),
             ..all
         };
         let report = trim(&options, Tracking::NoMarker);
@@ -889,6 +939,75 @@ mod tests {
         assert!(report.removed.is_empty(), "{report:?}");
         assert_eq!(fingerprint_count(&root), 3);
         drop(lock);
+    }
+
+    #[test]
+    fn the_budget_weighs_only_what_trim_can_remove() {
+        let removed = |report: &Report| {
+            report
+                .removed
+                .iter()
+                .map(|r| (r.0, r.1))
+                .collect::<Vec<_>>()
+        };
+        let options = |root: &Path, budget: u64| Options {
+            members: BTreeSet::new(),
+            budget: Some(budget),
+            keep_incremental: true,
+            ..opts(root)
+        };
+
+        // A busy `release` as big as the idle `debug`. Each case starts
+        // afresh: a process another test forks can briefly share the locks
+        // a trim took.
+        let busy_release = || {
+            let (tmp, root) = fixture();
+            populate(&root.join("release"));
+            let lock = fsutil::try_lock_file(&root.join("release/.cargo-lock"))
+                .unwrap()
+                .unwrap();
+            (tmp, root, lock)
+        };
+
+        // A budget that holds `debug` keeps all of it, though the directory
+        // is over.
+        let (_tmp, root, lock) = busy_release();
+        let report = trim(&options(&root, 72 << 10), Tracking::NoMarker);
+        assert!(report.removed.is_empty(), "{report:?}");
+        assert_eq!(fingerprint_count(&root), 3);
+        assert!(report.after > 72 << 10, "{report:?}");
+        let text = render_text(&options(&root, 72 << 10), Tracking::NoMarker, &report);
+        assert!(text.contains("Can't remove"), "{text}");
+        assert!(text.contains("stays over the budget"), "{text}");
+        drop(lock);
+        // A budget below `debug`'s units removes from them only.
+        let (_tmp, root, lock) = busy_release();
+        let report = trim(&options(&root, 40 << 10), Tracking::NoMarker);
+        assert!(
+            matches!(removed(&report).as_slice(), [(Reason::Budget, n)] if *n < 5),
+            "{report:?}"
+        );
+        assert!(report.kept_bytes <= 40 << 10, "{report:?}");
+        assert_eq!(
+            fsutil::entries(&root.join("release/.fingerprint")).count(),
+            3
+        );
+        drop(lock);
+
+        // `doc/` alone over the budget: no unit goes to make up for it.
+        let (_tmp, root) = fixture();
+        let doc = root.join("doc/app");
+        fs::create_dir_all(&doc).unwrap();
+        fs::write(doc.join("index.html"), vec![1u8; 512 << 10]).unwrap();
+        let report = trim(&options(&root, 400 << 10), Tracking::NoMarker);
+        assert!(report.removed.is_empty(), "{report:?}");
+        assert_eq!(fingerprint_count(&root), 3);
+        assert!(report.outside >= 512 << 10, "{report:?}");
+        let markdown = render_markdown(&options(&root, 400 << 10), Tracking::NoMarker, &report);
+        assert!(markdown.contains("| Can't remove: "), "{markdown}");
+        // Under the budget, no note.
+        let text = render_text(&options(&root, 1 << 30), Tracking::NoMarker, &report);
+        assert!(!text.contains("Can't remove"), "{text}");
     }
 
     #[test]

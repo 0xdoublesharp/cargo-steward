@@ -12,7 +12,9 @@ inputs:
       job's start), or `trim` as the job's last step, before the cache is saved.
     required: true
   budget:
-    description: For `trim`, the largest size to leave the build directory at, such as `8GiB`. Empty for no limit.
+    description: >-
+      For `trim`, the most to keep of the build units it can remove, such as `8GiB`
+      (`doc/`, final outputs and profiles a build is using don't count). Empty for no limit.
     required: false
     default: ''
   keep-workspace:

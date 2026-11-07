@@ -15,8 +15,13 @@ cargo steward ci trim --budget 8GiB    # the job's last step, before the cache i
    commits, so a cached copy rarely helps);
 3. incremental caches, unless `--keep-incremental`;
 4. object files that later compiles replaced (the [debug-object leak]);
-5. then, if the build directory is still over `--budget`, the least recently
-   used units that are left, until it's under.
+5. then, if the units that are left still come to more than `--budget`, the
+   least recently used of them, until they fit.
+
+The budget weighs only what `trim` can remove. Profiles a running build holds,
+`target/doc`, and final outputs cargo copies up into the profile directory
+stay whatever the budget, and no unit is removed to make up for them; when
+they leave the build directory over the budget, `trim` says so.
 
 It prints a summary, and when `$GITHUB_STEP_SUMMARY` is set (as it is on
 GitHub Actions) adds a table of kept and removed units and sizes to the job's
@@ -98,7 +103,7 @@ The build uses the runner's default toolchain, not your workspace's
 | Input | Default | |
 |---|---|---|
 | `mode` | (required) | `start` or `trim` |
-| `budget` | none | `trim`: largest size to leave, such as `8GiB` |
+| `budget` | none | `trim`: most to keep of what it can remove, such as `8GiB` |
 | `keep-workspace` | `false` | `trim`: keep the workspace's own crates |
 | `keep-incremental` | `false` | `trim`: keep incremental caches |
 | `target-dir` | from `cargo metadata` | the build directory |

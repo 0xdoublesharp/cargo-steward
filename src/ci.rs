@@ -51,7 +51,8 @@ struct TrimArgs {
     /// The build directory; by default the one `cargo metadata` reports
     #[arg(long, value_name = "DIR")]
     target_dir: Option<PathBuf>,
-    /// Largest size to leave the build directory at, such as `8GiB`
+    /// Most to keep of the build units trim can remove, such as `8GiB`;
+    /// `doc/`, final outputs and profiles a build is using don't count
     #[arg(long, value_name = "SIZE")]
     budget: Option<String>,
     /// Keep the workspace's own crates (removed by default: they change with

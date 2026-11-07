@@ -4,6 +4,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `ci trim --budget` weighs only what it can remove: it no longer evicts
+  build units to make up for profiles a build is using, `doc/` or final
+  outputs, and says when those leave the directory over the budget.
+
 ### Added
 
 - `link-target` setting for the `cargo` proxy: when it routes a workspace's
