@@ -49,9 +49,14 @@ impl Fixture {
         fs::write(project.join("src/main.rs"), main).unwrap();
         let home = root.join("steward-home");
         fs::create_dir_all(&home).unwrap();
+        // These tests rebuild seconds apart and expect each replaced
+        // generation gone at once; `tests/safety.rs` covers the grace.
         fs::write(
             home.join("config.toml"),
-            format!("scan-roots = [{:?}]\n", root.display().to_string()),
+            format!(
+                "scan-roots = [{:?}]\nobject-grace = \"0s\"\n",
+                root.display().to_string()
+            ),
         )
         .unwrap();
         Fixture {

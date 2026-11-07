@@ -1,12 +1,11 @@
 //! `cargo steward status`: the build directories cargo-steward knows about.
 
 use std::collections::BTreeMap;
-use std::thread;
 
 use anyhow::{Context, Result};
 
 use crate::config::{self, Paths};
-use crate::fsutil::{self, ago, human};
+use crate::fsutil::{self, Usage, ago, human};
 use crate::gc::{self, BuildDir};
 
 pub fn run(sizes: bool) -> Result<()> {
@@ -23,24 +22,21 @@ pub fn run(sizes: bool) -> Result<()> {
     }
     dirs.sort_by_key(|d| std::cmp::Reverse(d.last_used));
 
-    let sizes: Vec<Option<u64>> = if sizes {
-        thread::scope(|s| {
-            let jobs: Vec<_> = dirs
-                .iter()
-                .map(|d| s.spawn(|| fsutil::tree_size(&d.root)))
-                .collect();
-            jobs.into_iter().map(|j| j.join().ok()).collect()
-        })
+    let sizes: Vec<Option<Usage>> = if sizes {
+        fsutil::parallel_map(&dirs, |d| Some(fsutil::tree_usage(&d.root)))
     } else {
         vec![None; dirs.len()]
     };
 
     println!(
-        "{:>9} {:>10}  {:<7}  BUILD DIRECTORY",
-        "LAST USED", "SIZE", "LAYOUT"
+        "{:>9} {:>10} {:>10}  {:<7}  BUILD DIRECTORY",
+        "LAST USED", "SIZE", "UNSHARED", "LAYOUT"
     );
-    for (dir, size) in dirs.iter().zip(&sizes) {
-        let size = size.map_or_else(|| "-".to_owned(), human);
+    for (dir, usage) in dirs.iter().zip(&sizes) {
+        let size = usage.map_or_else(|| "-".to_owned(), |u| human(u.allocated));
+        let unshared = usage
+            .and_then(|u| u.private)
+            .map_or_else(|| "-".to_owned(), human);
         let mut notes = Vec::new();
         if dir.pinned {
             notes.push("pinned".to_owned());
@@ -54,17 +50,24 @@ pub fn run(sizes: bool) -> Result<()> {
             format!("  [{}]", notes.join(", "))
         };
         println!(
-            "{:>9} {size:>10}  {:<7}  {}{notes}",
+            "{:>9} {size:>10} {unshared:>10}  {:<7}  {}{notes}",
             ago(dir.last_used),
             layout(dir),
             dir.root.display()
         );
     }
-    if let Some(total) = sizes.iter().copied().sum::<Option<u64>>() {
+    if let Some(usages) = sizes.iter().copied().collect::<Option<Vec<Usage>>>() {
+        let total: u64 = usages.iter().map(|u| u.allocated).sum();
+        let unshared = usages
+            .iter()
+            .map(|u| u.private)
+            .sum::<Option<u64>>()
+            .map_or_else(|| "-".to_owned(), human);
+        println!("{:>9} {:>10} {unshared:>10}", "", human(total));
         println!(
-            "{:>9} {:>10}  (blocks shared by clones count in each directory)",
-            "",
-            human(total)
+            "\nSIZE counts every file's blocks, as `du` does, so blocks APFS or btrfs clones share\n\
+             count in each directory. UNSHARED counts only blocks no other file shares. Removing\n\
+             a directory frees at least its UNSHARED size and at most its SIZE."
         );
     }
 
