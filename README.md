@@ -110,7 +110,7 @@ Cheapest-to-rebuild first. Every threshold is a setting.
 | Object files a later compile replaced | Right after the compile, by the wrapper, once older than `object-grace` (10 minutes); any left over, by cleanup | None. Nothing reads them. |
 | Old-layout files (`deps/`, `.fingerprint/`, `build/<pkg>-<hash>/`) | Once Cargo 1.100's layout is in use in that directory and no older toolchain has built there for `legacy-idle` (3 days) | None |
 | A crate's incremental cache | Unused for `incremental-idle` (7 days) | That crate compiles from scratch once |
-| A build unit (new layout) | Unused for `unit-idle` (14 days) | That unit rebuilds if needed again |
+| A build unit (new layout) | Unused for `unit-idle` (14 days), and no unit used since was built from it (cargo's fingerprints link them) | That unit rebuilds if needed again |
 | A whole build directory | Every workspace that built there is deleted, for `orphan-grace` (2 days); or unused for `dir-idle` (21 days) | Full rebuild |
 | Whole build directories, cheapest to rebuild first (idle time × size ÷ recorded compile time) | The disk has under `min-free` (50 GiB) free; until it has `target-free` (100 GiB). Never one used within `recent-guard` (1 day) | Full rebuild |
 

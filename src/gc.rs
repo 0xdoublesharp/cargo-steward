@@ -408,13 +408,80 @@ fn clean_dir(dir: &BuildDir, sweep: Sweep) -> (Cleanup, bool) {
             }
         }
     }
+    let live = if dir.pinned {
+        None
+    } else {
+        live_units(&dir.profiles, sweep)
+    };
     for profile in &dir.profiles {
-        out.absorb(clean_profile(profile, dir.pinned, sweep));
+        out.absorb(clean_profile(profile, dir.pinned, live.as_ref(), sweep));
     }
     (out, false)
 }
 
-fn clean_profile(profile: &Profile, pinned: bool, sweep: Sweep) -> Cleanup {
+/// The new-layout units of a build directory that builds still need: those
+/// used within `unit-idle`, and every unit they were built from, followed
+/// through cargo's fingerprints across all of the directory's profiles
+/// (with `--target`, build scripts and proc macros live in the host's).
+///
+/// A unit's own times only change when it's rebuilt: reading its outputs
+/// doesn't move them (APFS, and `noatime` mounts, keep a file's access time
+/// once it's newer than its modification time). So a dependency every
+/// build links against looks as old as its last rebuild, and only what
+/// depends on it shows it's in use.
+///
+/// `None` when a unit in use has a fingerprint that doesn't parse: what it
+/// depends on is unknown, so no unit is removed.
+fn live_units(profiles: &[Profile], sweep: Sweep) -> Option<BTreeSet<PathBuf>> {
+    let nodes: Vec<scan::UnitNode> = profiles
+        .iter()
+        .filter(|p| p.v2)
+        .flat_map(|p| scan::v2_unit_nodes(&p.path))
+        .collect();
+    let mut by_hash: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
+    for (i, node) in nodes.iter().enumerate() {
+        for &hash in &node.hashes {
+            by_hash.entry(hash).or_default().push(i);
+        }
+    }
+    let recent = |node: &scan::UnitNode| {
+        sweep
+            .now
+            .duration_since(node.unit.last_used)
+            .unwrap_or_default()
+            < sweep.policy.unit_idle
+    };
+    let mut live = vec![false; nodes.len()];
+    let mut stack: Vec<usize> = (0..nodes.len()).filter(|&i| recent(&nodes[i])).collect();
+    while let Some(i) = stack.pop() {
+        if std::mem::replace(&mut live[i], true) {
+            continue;
+        }
+        if !nodes[i].readable {
+            return None;
+        }
+        for dep in &nodes[i].deps {
+            stack.extend(by_hash.get(dep).into_iter().flatten().copied());
+        }
+    }
+    Some(
+        nodes
+            .into_iter()
+            .zip(live)
+            .filter(|(_, live)| *live)
+            .map(|(node, _)| node.unit.path)
+            .collect(),
+    )
+}
+
+/// `live`: the new-layout units builds still need ([`live_units`]); `None`
+/// keeps every unit.
+fn clean_profile(
+    profile: &Profile,
+    pinned: bool,
+    live: Option<&BTreeSet<PathBuf>>,
+    sweep: Sweep,
+) -> Cleanup {
     let _lock = if sweep.apply {
         match fsutil::lock_profile(&profile.path) {
             Lock::Busy => return Cleanup::default(),
@@ -471,9 +538,11 @@ fn clean_profile(profile: &Profile, pinned: bool, sweep: Sweep) -> Cleanup {
             );
         }
     }
-    for unit in scan::v2_units(&profile.path) {
-        if idle(unit.last_used, policy.unit_idle) {
-            remove_dated(Kind::IdleUnit, &unit, sweep, &mut out);
+    if let Some(live) = live {
+        for unit in scan::v2_units(&profile.path) {
+            if idle(unit.last_used, policy.unit_idle) && !live.contains(&unit.path) {
+                remove_dated(Kind::IdleUnit, &unit, sweep, &mut out);
+            }
         }
     }
     let mut sessions: Vec<PathBuf> = Vec::new();
@@ -1656,5 +1725,85 @@ mod tests {
         assert_eq!(cleanup.actions.len(), 2, "{:?}", cleanup.actions);
         assert!(cleanup.actions.iter().all(|a| a.kind == Kind::LowSpace));
         assert!(dirs.iter().all(|d| !d.root.exists()));
+    }
+
+    /// A new-layout unit `build/<pkg>/<hash>/` whose fingerprint records its
+    /// own hash and its dependencies', as cargo writes them.
+    fn unit(profile: &Path, pkg: &str, hash: u64, deps: &[u64], json: Option<&str>) -> PathBuf {
+        let dir = profile.join(format!("build/{pkg}/{hash:016x}"));
+        let fingerprint = dir.join("fingerprint");
+        fs::create_dir_all(&fingerprint).unwrap();
+        let hex: String = hash
+            .to_le_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        fs::write(fingerprint.join(format!("lib-{pkg}")), hex).unwrap();
+        let deps: Vec<String> = deps
+            .iter()
+            .map(|d| format!("[7,\"{pkg}\",false,{d}]"))
+            .collect();
+        let record = json.map_or_else(
+            || format!("{{\"deps\":[{}]}}", deps.join(",")),
+            str::to_owned,
+        );
+        fs::write(fingerprint.join(format!("lib-{pkg}.json")), record).unwrap();
+        make(&fingerprint.join("invoked.timestamp"));
+        make(&dir.join(format!("out/lib{pkg}.rlib")));
+        dir
+    }
+
+    #[test]
+    fn keeps_old_units_that_a_recent_one_was_built_from() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = build_dir(tmp.path(), "target");
+        // With `--target`, build scripts and their dependencies are the
+        // host's: another profile.
+        let target = root.join("aarch64-apple-darwin/debug");
+        let host = root.join("debug");
+        let app = unit(&target, "app", 1, &[2], None);
+        let serde = unit(&target, "serde", 2, &[3], None);
+        let script = unit(&host, "serde", 3, &[4], None);
+        let cc = unit(&host, "cc", 4, &[], None);
+        let dead = unit(&target, "old", 5, &[2], None);
+        for old in [&serde, &script, &cc, &dead] {
+            age(old, 30 * DAY);
+        }
+        let dirs = vec![BuildDir::inspect(&root, None)];
+        let removed: Vec<PathBuf> = run_clean(&dirs, true)
+            .into_iter()
+            .filter(|a| a.kind == Kind::IdleUnit)
+            .map(|a| a.path)
+            .collect();
+        assert_eq!(removed, [dead]);
+        for kept in [&app, &serde, &script, &cc] {
+            assert!(kept.exists(), "{}", kept.display());
+        }
+    }
+
+    #[test]
+    fn an_unreadable_fingerprint_in_use_keeps_every_unit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = build_dir(tmp.path(), "target");
+        let debug = root.join("debug");
+        unit(&debug, "app", 1, &[], Some("{\"deps\": [tru"));
+        let dead = unit(&debug, "old", 2, &[], None);
+        age(&dead, 30 * DAY);
+        let dirs = vec![BuildDir::inspect(&root, None)];
+        assert!(run_clean(&dirs, true).is_empty());
+        assert!(dead.exists());
+
+        // One nothing uses doesn't matter: what it depended on is unknown,
+        // but nothing in use needs it.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = build_dir(tmp.path(), "target");
+        let debug = root.join("debug");
+        unit(&debug, "app", 1, &[], None);
+        let dead = unit(&debug, "old", 2, &[], Some("not json"));
+        age(&dead, 30 * DAY);
+        let dirs = vec![BuildDir::inspect(&root, None)];
+        let kinds: Vec<Kind> = run_clean(&dirs, true).iter().map(|a| a.kind).collect();
+        assert_eq!(kinds, [Kind::IdleUnit]);
+        assert!(!dead.exists());
     }
 }

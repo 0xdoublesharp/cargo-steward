@@ -219,6 +219,77 @@ pub fn v2_units(profile: &Path) -> Vec<Dated> {
     units
 }
 
+/// A new-layout unit and what its fingerprints say about it: the hashes
+/// cargo records for it, and those of the units it depends on.
+#[derive(Debug, Clone)]
+pub struct UnitNode {
+    pub unit: Dated,
+    /// Its own fingerprint hashes, one per target kind built in it.
+    pub hashes: Vec<u64>,
+    /// The fingerprint hashes of the units it depends on.
+    pub deps: Vec<u64>,
+    /// Every fingerprint record in it parsed. When not, its dependencies are
+    /// unknown.
+    pub readable: bool,
+}
+
+/// [`v2_units`] with their fingerprints read. Cargo keeps a unit's hash in
+/// `fingerprint/<kind>-<target>` as the little-endian hex of a `u64`, and
+/// its dependencies' hashes as the fourth field of each `deps` entry in
+/// `fingerprint/<kind>-<target>.json`; together they link each unit to the
+/// units it was built from, build scripts and build-dependencies included.
+pub fn v2_unit_nodes(profile: &Path) -> Vec<UnitNode> {
+    v2_units(profile)
+        .into_iter()
+        .map(|unit| {
+            let mut node = UnitNode {
+                hashes: Vec::new(),
+                deps: Vec::new(),
+                readable: true,
+                unit,
+            };
+            for (name, path) in entries(&node.unit.path.join("fingerprint")) {
+                if name.ends_with(".json") {
+                    match fingerprint_deps(&path) {
+                        Some(deps) => node.deps.extend(deps),
+                        None => node.readable = false,
+                    }
+                } else if !name.starts_with("dep-")
+                    && !name.starts_with("output-")
+                    && name != "invoked.timestamp"
+                    && let Some(hash) = fs::read_to_string(&path)
+                        .ok()
+                        .and_then(|text| fingerprint_hash(text.trim()))
+                {
+                    node.hashes.push(hash);
+                }
+            }
+            node
+        })
+        .collect()
+}
+
+/// A fingerprint hash file's contents: 16 hex digits of a little-endian u64.
+fn fingerprint_hash(text: &str) -> Option<u64> {
+    if text.len() != 16 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut bytes = [0u8; 8];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(text.get(2 * i..2 * i + 2)?, 16).ok()?;
+    }
+    Some(u64::from_le_bytes(bytes))
+}
+
+/// The dependency hashes in a fingerprint record; `None` if it doesn't parse.
+fn fingerprint_deps(path: &Path) -> Option<Vec<u64>> {
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    let deps = value.get("deps")?.as_array()?;
+    deps.iter()
+        .map(|dep| dep.as_array()?.get(3)?.as_u64())
+        .collect()
+}
+
 /// Incremental caches: `incremental/<crate>-<id>/`, each holding session
 /// directories that rustc replaces on every compile. A cache is removed whole;
 /// removing part of a session can crash rustc.
@@ -1437,5 +1508,37 @@ mod tests {
         let stale = stale_objects_in(&dir, no_grace());
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
         assert!(stale.is_empty(), "{}", stale.len());
+    }
+
+    #[test]
+    fn reads_fingerprint_hashes_as_cargo_writes_them() {
+        // `run-build-script-...` and the `deps` entry naming it, from a
+        // Cargo 1.100 build of serde_core.
+        assert_eq!(
+            fingerprint_hash("bb77cc6cea257cfc"),
+            Some(18_193_458_283_447_875_515)
+        );
+        assert_eq!(fingerprint_hash("bb77cc6cea257cf"), None);
+        assert_eq!(fingerprint_hash("not a hash at al"), None);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fingerprint = tmp
+            .path()
+            .join("debug/build/serde/0123456789abcdef/fingerprint");
+        write(&fingerprint.join("lib-serde"), b"b043a6746cb6a463\n");
+        write(
+            &fingerprint.join("lib-serde.json"),
+            br#"{"path":1,"deps":[[11029742160753049355,"build_script_build",false,18193458283447875515]]}"#,
+        );
+        write(&fingerprint.join("dep-lib-serde"), b"0123456789abcdef");
+        write(&fingerprint.join("invoked.timestamp"), b"");
+        let nodes = v2_unit_nodes(&tmp.path().join("debug"));
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].hashes, [7_180_064_282_865_189_808]);
+        assert_eq!(nodes[0].deps, [18_193_458_283_447_875_515]);
+        assert!(nodes[0].readable);
+
+        write(&fingerprint.join("lib-serde.json"), b"{\"deps\": 5}");
+        assert!(!v2_unit_nodes(&tmp.path().join("debug"))[0].readable);
     }
 }
