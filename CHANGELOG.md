@@ -79,3 +79,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `build` that isn't a table instead of overwriting it.
 - `setup` stops when Cargo's config exists but can't be read (permissions,
   not UTF-8) instead of treating it as empty and replacing it with no backup.
+- `setup --undo` puts back the `build.rustc-wrapper` and `build.build-dir`
+  that setup replaced, recorded in the new `previous-wrapper` and
+  `previous-build-dir` settings. It used to set the inner wrapper as the
+  wrapper even when that came from `--inner` and was never configured, and
+  removed a `build-dir` that `--build-dir` had overwritten. Settings written
+  by earlier versions are undone as before.

@@ -581,6 +581,49 @@ fn setup_keeps_an_inline_build_table() {
     assert_eq!(fx.cargo_config(), "build = \"fast\"\n");
 }
 
+/// Undo puts back the wrapper and build-dir that were there, not the inner
+/// wrapper given with `--inner` or nothing.
+#[test]
+fn setup_undo_restores_the_previous_wrapper_and_build_dir() {
+    let fx = Fixture::new();
+    let original = "[build]\nbuild-dir = \"/old/{workspace-path-hash}\"\n";
+    fs::write(fx.cargo_home.join("config.toml"), original).unwrap();
+    fx.run(&[
+        "setup",
+        "--inner",
+        "sccache",
+        "--build-dir",
+        "builds",
+        "--scan-root",
+        ".",
+    ]);
+    // Running setup again doesn't forget what was there first.
+    fx.run(&["setup", "--build-dir", "other"]);
+    let text = fx.cargo_config();
+    assert!(text.contains("/other/{workspace-path-hash}"), "{text}");
+    assert!(fx.settings().contains("previous-wrapper = \"\""));
+    fx.run(&["setup", "--undo"]);
+    assert_eq!(fx.cargo_config(), original);
+    let settings = fx.settings();
+    assert!(!settings.contains("previous-"), "{settings}");
+
+    // Settings from before the record existed: the inner wrapper goes back,
+    // and the managed build-dir is removed.
+    let fx = Fixture::new();
+    fs::write(
+        fx.cargo_home.join("config.toml"),
+        "[build]\nrustc-wrapper = \"/x/cargo-steward\"\nbuild-dir = \"/b/{workspace-path-hash}\"\n",
+    )
+    .unwrap();
+    fs::write(
+        fx.steward.join("config.toml"),
+        "inner-wrapper = \"sccache\"\nmanaged-build-dir = true\n",
+    )
+    .unwrap();
+    fx.run(&["setup", "--undo"]);
+    assert_eq!(fx.cargo_config(), "[build]\nrustc-wrapper = \"sccache\"\n");
+}
+
 /// A symlinked Cargo config (from a dotfile manager) stays a link, and the
 /// config and its backup keep the original's permissions.
 #[cfg(unix)]

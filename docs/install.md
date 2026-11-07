@@ -122,7 +122,7 @@ rm -rf ~/.cargo/steward           # settings, records and the cleanup log
 ```
 
 `cargo steward hooks status` and `cargo steward shim status` show whether
-those are installed. `setup --undo` also removes `build.build-dir` if
-`setup --build-dir` set it. It leaves build directories alone; remove any you
-no longer want with `rm -rf`, or run `cargo steward gc --apply` before
-uninstalling.
+those are installed. `setup --undo` puts back the `build.rustc-wrapper` and
+`build.build-dir` that setup replaced, removing them where there were none. It
+leaves build directories alone; remove any you no longer want with `rm -rf`,
+or run `cargo steward gc --apply` before uninstalling.

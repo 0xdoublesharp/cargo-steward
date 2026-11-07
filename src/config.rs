@@ -118,6 +118,17 @@ pub struct Config {
     pub target_free: String,
     /// `setup` set `build.build-dir`, so `setup --undo` removes it.
     pub managed_build_dir: bool,
+    /// The `build.rustc-wrapper` Cargo's config had before `setup` made it
+    /// cargo-steward, which `setup --undo` puts back; empty when there was
+    /// none. Unset in settings from versions that didn't record it, where
+    /// `setup --undo` puts back the inner wrapper instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_wrapper: Option<String>,
+    /// The `build.build-dir` Cargo's config had before `setup --build-dir`
+    /// replaced it, which `setup --undo` puts back; empty when there was
+    /// none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_build_dir: Option<String>,
     /// Keep replaced object files this long, so binaries that are still
     /// running keep readable backtraces.
     pub object_grace: String,
@@ -191,6 +202,8 @@ impl Default for Config {
             min_free: "50GiB".into(),
             target_free: "100GiB".into(),
             managed_build_dir: false,
+            previous_wrapper: None,
+            previous_build_dir: None,
             object_grace: "10m".into(),
             process_guard: true,
             seed: true,
@@ -691,6 +704,26 @@ mod tests {
         let private = tmp.path().join("private");
         write_with_permissions(&private, b"x", Some(&fs::Permissions::from_mode(0o600))).unwrap();
         assert_eq!(mode(&private), 0o600);
+    }
+
+    /// Settings files written before setup recorded what it replaced still
+    /// load, and an unset record isn't written.
+    #[test]
+    fn records_of_what_setup_replaced_are_optional() {
+        let config: Config = toml::from_str("managed-build-dir = true\n").unwrap();
+        assert_eq!(config.previous_wrapper, None);
+        assert_eq!(config.previous_build_dir, None);
+        let text = toml::to_string_pretty(&Config::default()).unwrap();
+        assert!(!text.contains("previous"), "{text}");
+        let config = Config {
+            previous_wrapper: Some(String::new()),
+            previous_build_dir: Some("/b/{workspace-path-hash}".into()),
+            ..Config::default()
+        };
+        let text = toml::to_string_pretty(&config).unwrap();
+        assert!(text.contains("previous-wrapper = \"\""), "{text}");
+        assert!(text.contains("previous-build-dir = "), "{text}");
+        assert_eq!(toml::from_str::<Config>(&text).unwrap(), config);
     }
 
     /// Cargo reads the extensionless `config` whenever it exists.

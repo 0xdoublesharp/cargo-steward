@@ -78,11 +78,20 @@ pub fn run(args: &Args) -> Result<()> {
             .map(str::to_owned)
     };
     let current = build_key("rustc-wrapper");
+    let current_build_dir = build_key("build-dir");
     let current_is_us = current.as_deref().is_some_and(is_steward);
 
     if args.undo {
         undo(&mut doc, &mut settings, current_is_us)?;
     } else {
+        // Record what setup replaces, for `--undo`. Once cargo-steward is the
+        // wrapper (or manages build-dir), the record from that first run stays.
+        if !current_is_us {
+            settings.previous_wrapper = Some(current.clone().unwrap_or_default());
+        }
+        if args.build_dir.is_some() && !settings.managed_build_dir {
+            settings.previous_build_dir = Some(current_build_dir.unwrap_or_default());
+        }
         let inner = match (&args.inner, &current) {
             (Some(inner), _) => Some(inner.clone()),
             (None, Some(current)) if !current_is_us => Some(current.clone()),
@@ -176,23 +185,41 @@ pub fn run(args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// Puts back what setup replaced: the wrapper and build-dir recorded when
+/// setup ran, or, for settings from versions that didn't record them, the
+/// inner wrapper and no build-dir.
 fn undo(doc: &mut DocumentMut, settings: &mut Config, current_is_us: bool) -> Result<()> {
     let build = build_table(doc)?;
     if current_is_us {
-        match &settings.inner_wrapper {
-            Some(inner) => build["rustc-wrapper"] = value(inner.as_str()),
+        let previous = match &settings.previous_wrapper {
+            Some(recorded) => Some(recorded.as_str()).filter(|w| !w.is_empty()),
+            None => settings.inner_wrapper.as_deref(),
+        };
+        match previous {
+            Some(wrapper) => build["rustc-wrapper"] = value(wrapper),
             None => {
                 build.remove("rustc-wrapper");
             }
         }
     }
     if settings.managed_build_dir {
-        build.remove("build-dir");
+        match settings
+            .previous_build_dir
+            .as_deref()
+            .filter(|d| !d.is_empty())
+        {
+            Some(dir) => build["build-dir"] = value(dir),
+            None => {
+                build.remove("build-dir");
+            }
+        }
         settings.managed_build_dir = false;
     }
     if build.is_empty() {
         doc.remove("build");
     }
+    settings.previous_wrapper = None;
+    settings.previous_build_dir = None;
     settings.auto_gc = false;
     Ok(())
 }
@@ -426,7 +453,7 @@ mod tests {
             .parse()
             .unwrap();
         let mut settings = Config {
-            inner_wrapper: Some("sccache".into()),
+            previous_wrapper: Some("sccache".into()),
             ..Config::default()
         };
         undo(&mut doc, &mut settings, true).unwrap();
@@ -443,6 +470,43 @@ mod tests {
             undo(&mut doc, &mut Config::default(), true).unwrap_err()
         );
         assert!(err.contains("not a table"), "{err}");
+    }
+
+    /// Undo restores the wrapper and build-dir that were there before setup,
+    /// not the inner wrapper given with `--inner`.
+    #[test]
+    fn undo_restores_what_setup_recorded() {
+        let mut doc: DocumentMut =
+            "[build]\nrustc-wrapper = \"/x/cargo-steward\"\nbuild-dir = \"/new/{h}\"\n"
+                .parse()
+                .unwrap();
+        let mut settings = Config {
+            inner_wrapper: Some("sccache".into()),
+            previous_wrapper: Some(String::new()),
+            managed_build_dir: true,
+            previous_build_dir: Some("/old/{h}".into()),
+            ..Config::default()
+        };
+        undo(&mut doc, &mut settings, true).unwrap();
+        assert_eq!(doc.to_string(), "[build]\nbuild-dir = \"/old/{h}\"\n");
+        assert_eq!(settings.previous_wrapper, None);
+        assert_eq!(settings.previous_build_dir, None);
+        assert!(!settings.managed_build_dir);
+
+        // A recorded wrapper is put back; no build-dir before means none after.
+        let mut doc: DocumentMut =
+            "[build]\nrustc-wrapper = \"/x/cargo-steward\"\nbuild-dir = \"/new/{h}\"\n"
+                .parse()
+                .unwrap();
+        let mut settings = Config {
+            inner_wrapper: Some("other".into()),
+            previous_wrapper: Some("sccache".into()),
+            managed_build_dir: true,
+            previous_build_dir: Some(String::new()),
+            ..Config::default()
+        };
+        undo(&mut doc, &mut settings, true).unwrap();
+        assert_eq!(doc.to_string(), "[build]\nrustc-wrapper = \"sccache\"\n");
     }
 
     /// A package manager's link on PATH is recorded, not the versioned file
