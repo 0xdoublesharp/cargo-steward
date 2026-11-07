@@ -253,7 +253,11 @@ pub fn save(paths: &Paths, config: &Config) -> Result<()> {
 pub fn write_atomic(path: &std::path::Path, contents: &[u8]) -> Result<()> {
     let tmp = path.with_extension(format!("tmp{}", std::process::id()));
     fs::write(&tmp, contents).with_context(|| format!("writing {}", tmp.display()))?;
-    fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("writing {}", path.display()));
+    }
+    Ok(())
 }
 
 /// Parses sizes like `50GiB`, `100G`, `512MiB` or `1024`. Units are binary
@@ -370,5 +374,64 @@ mod tests {
         };
         let err = format!("{:#}", config.policy().unwrap_err());
         assert!(err.contains("min-free"), "{err}");
+
+        let bad = || "never".to_string();
+        type Set = fn(&mut Config, String);
+        let cases: [(&str, Set); 8] = [
+            ("gc-interval", |c, v| c.gc_interval = v),
+            ("unit-idle", |c, v| c.unit_idle = v),
+            ("incremental-idle", |c, v| c.incremental_idle = v),
+            ("legacy-idle", |c, v| c.legacy_idle = v),
+            ("orphan-grace", |c, v| c.orphan_grace = v),
+            ("recent-guard", |c, v| c.recent_guard = v),
+            ("target-free", |c, v| c.target_free = v),
+            ("object-grace", |c, v| c.object_grace = v),
+        ];
+        for (key, set) in cases {
+            let mut config = Config::default();
+            set(&mut config, bad());
+            let err = format!("{:#}", config.policy().unwrap_err());
+            assert!(err.contains(&format!("{key} = \"never\"")), "{err}");
+        }
+    }
+
+    #[test]
+    fn parses_every_unit() {
+        assert_eq!(parse_size("3b").unwrap(), 3);
+        assert_eq!(parse_size("2k").unwrap(), 2 << 10);
+        assert_eq!(parse_size("2KiB").unwrap(), 2 << 10);
+        assert_eq!(parse_size("5mb").unwrap(), 5 << 20);
+        assert_eq!(parse_size("1t").unwrap(), 1 << 40);
+    }
+
+    #[test]
+    fn reports_settings_that_cant_be_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The home is a file, so it can't be created as a directory.
+        let file = tmp.path().join("file");
+        fs::write(&file, "x").unwrap();
+        let err = format!(
+            "{:#}",
+            save(&Paths { home: file.clone() }, &Config::default()).unwrap_err()
+        );
+        assert!(err.contains("creating"), "{err}");
+
+        // No directory to write the temporary file in.
+        let err = format!(
+            "{:#}",
+            write_atomic(&tmp.path().join("missing/config.toml"), b"x").unwrap_err()
+        );
+        assert!(err.contains("writing"), "{err}");
+
+        // A non-empty directory where the file goes can't be replaced, and
+        // the temporary file is still named in the error.
+        let dir = tmp.path().join("config.toml");
+        fs::create_dir_all(dir.join("inside")).unwrap();
+        let err = format!("{:#}", write_atomic(&dir, b"x").unwrap_err());
+        assert!(err.contains(&format!("writing {}", dir.display())), "{err}");
+        assert!(dir.join("inside").is_dir());
+        // The temporary file isn't left behind.
+        let names: Vec<_> = fs::read_dir(tmp.path()).unwrap().flatten().collect();
+        assert_eq!(names.len(), 2, "{names:?}");
     }
 }
