@@ -48,7 +48,7 @@ pub fn run(argv: Vec<OsString>) -> ! {
     let Some(out_dir) = args.out_dir.clone() else {
         exec(&command);
     };
-    let fix = if config.leak_fix && args.writes_objects() {
+    let fix = if wants_leak_fix(&config, &args) {
         LeakFix::prepare(&args, &out_dir)
     } else {
         None
@@ -74,6 +74,14 @@ pub fn run(argv: Vec<OsString>) -> ! {
         }
     }
     process::exit(exit_code(status));
+}
+
+/// Whether to look for objects this compile replaces. Only incremental
+/// compiles give their objects new names; others rewrite the same files in
+/// place, so listing the output directory (all of `deps/` in the old layout)
+/// beforehand would be wasted work.
+fn wants_leak_fix(config: &Config, args: &RustcArgs) -> bool {
+    config.leak_fix && args.incremental && args.writes_objects()
 }
 
 /// How long replaced objects are kept for binaries that may still be
@@ -155,6 +163,8 @@ pub struct RustcArgs {
     pub out_dir: Option<PathBuf>,
     pub emit: Option<String>,
     pub save_temps: bool,
+    /// `-C incremental=...` is set.
+    pub incremental: bool,
 }
 
 impl RustcArgs {
@@ -198,6 +208,7 @@ impl RustcArgs {
                 let (key, val) = option.split_once('=').unwrap_or((&option, ""));
                 match key {
                     "extra-filename" => parsed.extra_filename = Some(val.to_owned()),
+                    "incremental" => parsed.incremental = !val.is_empty(),
                     "save-temps" => {
                         parsed.save_temps = !matches!(val, "no" | "n" | "off" | "false")
                     }
@@ -366,9 +377,31 @@ mod tests {
                 out_dir: Some("/t/debug/deps".into()),
                 emit: Some("dep-info,link".into()),
                 save_temps: false,
+                incremental: true,
             }
         );
         assert!(parsed.writes_objects());
+    }
+
+    #[test]
+    fn only_incremental_compiles_look_for_replaced_objects() {
+        let config = Config::default();
+        let incremental = RustcArgs::parse(&args(&[
+            "--crate-name",
+            "app",
+            "-C",
+            "incremental=/t/debug/incremental",
+        ]));
+        assert!(wants_leak_fix(&config, &incremental));
+        // A registry dependency or a release build: objects keep their names.
+        let plain = RustcArgs::parse(&args(&["--crate-name", "dep", "-C", "opt-level=3"]));
+        assert!(!plain.incremental);
+        assert!(!wants_leak_fix(&config, &plain));
+        let off = Config {
+            leak_fix: false,
+            ..Config::default()
+        };
+        assert!(!wants_leak_fix(&off, &incremental));
     }
 
     #[test]
