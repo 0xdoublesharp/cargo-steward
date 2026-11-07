@@ -178,21 +178,27 @@ need_cargo() {
     command -v cargo >/dev/null 2>&1 || die "cargo isn't installed (see https://rustup.rs), or use --release"
 }
 
+# Builds without the configured rustc-wrapper: when that is a cargo-steward
+# that has gone missing, every build fails, including this reinstall.
+cargo_install() {
+    RUSTC_WRAPPER='' CARGO_BUILD_RUSTC_WRAPPER='' cargo install "$@"
+}
+
 case $mode in
     source)
         need_cargo
         [ -f "$source_dir/Cargo.toml" ] || die "$source_dir has no Cargo.toml"
         say "Installing cargo-steward from $source_dir"
-        cargo install --locked --path "$source_dir"
+        cargo_install --locked --path "$source_dir"
         bin_dir=${CARGO_INSTALL_ROOT:-$cargo_home}/bin
         ;;
     git)
         need_cargo
         say "Installing cargo-steward from $git_url${git_rev:+ at $git_rev}"
         if [ -n "$git_rev" ]; then
-            cargo install --locked --git "$git_url" --rev "$git_rev" cargo-steward
+            cargo_install --locked --git "$git_url" --rev "$git_rev" cargo-steward
         else
-            cargo install --locked --git "$git_url" cargo-steward
+            cargo_install --locked --git "$git_url" cargo-steward
         fi
         bin_dir=${CARGO_INSTALL_ROOT:-$cargo_home}/bin
         ;;

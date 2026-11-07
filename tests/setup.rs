@@ -516,3 +516,56 @@ fn background_gc_runs_quietly() {
     let out = fx.run(&["gc", "--auto"]);
     assert!(out.is_empty(), "{out}");
 }
+
+/// The script's `cargo install`s run without the configured rustc-wrapper,
+/// which may be a cargo-steward that has gone missing.
+#[cfg(unix)]
+#[test]
+fn install_script_builds_without_the_configured_wrapper() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = Fixture::new();
+    let bin = fx.root.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let log = fx.root.join("cargo.log");
+    let cargo = bin.join("cargo");
+    fs::write(
+        &cargo,
+        "#!/bin/sh\n\
+         printf '%s|%s|%s\\n' \"${RUSTC_WRAPPER-unset}\" \"${CARGO_BUILD_RUSTC_WRAPPER-unset}\" \"$*\" >>\"$FAKE_CARGO_LOG\"\n\
+         mkdir -p \"$CARGO_HOME/bin\"\n\
+         printf '#!/bin/sh\\necho cargo-steward 0.0.0\\n' >\"$CARGO_HOME/bin/cargo-steward\"\n\
+         chmod 755 \"$CARGO_HOME/bin/cargo-steward\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/install.sh");
+    let missing = fx.cargo_home.join("bin/cargo-steward");
+    let install = |args: &[&str]| {
+        let out = Command::new("sh")
+            .arg(&script)
+            .args(args)
+            .arg("--no-setup")
+            .env_clear()
+            .env("HOME", &fx.home)
+            .env("CARGO_HOME", &fx.cargo_home)
+            .env("PATH", format!("{}:/bin:/usr/bin", bin.display()))
+            .env("FAKE_CARGO_LOG", &log)
+            .env("RUSTC_WRAPPER", &missing)
+            .env("CARGO_BUILD_RUSTC_WRAPPER", &missing)
+            .output()
+            .unwrap();
+        assert_ok(&out, args);
+    };
+    install(&["--from-source", env!("CARGO_MANIFEST_DIR")]);
+    install(&["--git", "https://example.invalid/x.git"]);
+    install(&["--git", "https://example.invalid/x.git", "--rev", "abc"]);
+    let lines: Vec<String> = fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    for line in &lines {
+        assert!(line.starts_with("||install --locked "), "{line}");
+    }
+}

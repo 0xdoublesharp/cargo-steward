@@ -58,3 +58,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - `doctor` quotes scan roots in its `tmutil addexclusion` and `mdutil -i off`
   fix commands, so they work for volume names with spaces.
+- `scripts/install.sh` runs `cargo install` without the configured
+  `rustc-wrapper`, so it can reinstall cargo-steward when the binary that
+  wrapper names is missing and every other build fails.
