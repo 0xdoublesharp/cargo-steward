@@ -140,7 +140,9 @@ pub fn run(args: &Args) -> Result<()> {
         if !original.is_empty() {
             let backup = cargo_config
                 .with_extension(format!("toml.steward-backup-{}", crate::ledger::now_secs()));
-            fs::write(&backup, &original)
+            // The backup holds what the config does, so it is as private.
+            let permissions = fs::metadata(&cargo_config).ok().map(|m| m.permissions());
+            config::write_with_permissions(&backup, original.as_bytes(), permissions.as_ref())
                 .with_context(|| format!("writing {}", backup.display()))?;
             println!("Backed up the previous config to {}", backup.display());
         }

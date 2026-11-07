@@ -517,6 +517,37 @@ fn background_gc_runs_quietly() {
     assert!(out.is_empty(), "{out}");
 }
 
+/// A symlinked Cargo config (from a dotfile manager) stays a link, and the
+/// config and its backup keep the original's permissions.
+#[cfg(unix)]
+#[test]
+fn setup_writes_through_a_linked_config_and_keeps_it_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = Fixture::new();
+    let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    let real = fx.root.join("dotfiles/cargo-config.toml");
+    fs::create_dir_all(real.parent().unwrap()).unwrap();
+    fs::write(&real, "[build]\njobs = 2\n").unwrap();
+    fs::set_permissions(&real, fs::Permissions::from_mode(0o600)).unwrap();
+    let link = fx.cargo_home.join("config.toml");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let out = fx.run(&["setup", "--scan-root", "."]);
+    assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
+    let text = fs::read_to_string(&real).unwrap();
+    assert!(
+        text.contains("jobs = 2") && text.contains("cargo-steward"),
+        "{text}"
+    );
+    assert_eq!(mode(&real), 0o600);
+    let backup = out
+        .lines()
+        .find_map(|l| l.strip_prefix("Backed up the previous config to "))
+        .unwrap();
+    assert_eq!(fs::read_to_string(backup).unwrap(), "[build]\njobs = 2\n");
+    assert_eq!(mode(Path::new(backup)), 0o600);
+}
+
 /// Cargo reads the extensionless `config` even when `config.toml` exists, so
 /// that's the one setup edits.
 #[test]

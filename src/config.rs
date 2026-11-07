@@ -4,6 +4,7 @@
 use std::env;
 use std::fs;
 use std::io;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -365,15 +366,66 @@ pub fn save(paths: &Paths, config: &Config) -> Result<()> {
 }
 
 /// Writes through a temporary file and a rename, so readers never see a
-/// partial file.
-pub fn write_atomic(path: &std::path::Path, contents: &[u8]) -> Result<()> {
+/// partial file. A symlink is written through, so it stays a link to the
+/// replaced file (as dotfile managers set up), and the replaced file's
+/// permissions are kept.
+pub fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
+    let path = resolve_links(path);
+    let permissions = fs::metadata(&path)
+        .ok()
+        .filter(fs::Metadata::is_file)
+        .map(|m| m.permissions());
     let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-    fs::write(&tmp, contents).with_context(|| format!("writing {}", tmp.display()))?;
-    if let Err(e) = fs::rename(&tmp, path) {
+    if let Err(e) = write_with_permissions(&tmp, contents, permissions.as_ref()) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("writing {}", tmp.display()));
+    }
+    if let Err(e) = fs::rename(&tmp, &path) {
         let _ = fs::remove_file(&tmp);
         return Err(e).with_context(|| format!("writing {}", path.display()));
     }
     Ok(())
+}
+
+/// Writes `contents` to `path`, giving a file it creates `permissions` (if
+/// any) from the start, so it is never readable by more than it should be.
+pub fn write_with_permissions(
+    path: &Path,
+    contents: &[u8],
+    permissions: Option<&fs::Permissions>,
+) -> io::Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    if let Some(permissions) = permissions {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        options.mode(permissions.mode());
+    }
+    let mut file = options.open(path)?;
+    file.write_all(contents)?;
+    // The mode given at creation is reduced by the umask, and an existing
+    // file keeps its own.
+    if let Some(permissions) = permissions {
+        file.set_permissions(permissions.clone())?;
+    }
+    Ok(())
+}
+
+/// The file `path` finally names after following symlinks, which need not
+/// exist yet. Gives up after as many links as the system would follow.
+fn resolve_links(path: &Path) -> PathBuf {
+    let mut path = path.to_path_buf();
+    for _ in 0..40 {
+        let Ok(target) = fs::read_link(&path) else {
+            break;
+        };
+        // An absolute target replaces the whole path.
+        path = match path.parent() {
+            Some(dir) => dir.join(target),
+            None => target,
+        };
+    }
+    path
 }
 
 /// Parses sizes like `50GiB`, `100G`, `512MiB` or `1024`. Units are binary
@@ -600,6 +652,45 @@ mod tests {
             home: tmp.path().to_path_buf(),
         };
         assert_eq!(load_lenient(&paths), (Config::default(), Vec::new()));
+    }
+
+    /// A symlinked config stays a link to the file it names, and a private
+    /// file stays private.
+    #[cfg(unix)]
+    #[test]
+    fn writes_through_links_and_keeps_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let dotfiles = tmp.path().join("dotfiles");
+        fs::create_dir_all(&dotfiles).unwrap();
+        let real = dotfiles.join("cargo.toml");
+        fs::write(&real, "old").unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o600)).unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let link = home.join("config.toml");
+        // A relative link, resolved against the link's directory.
+        std::os::unix::fs::symlink("../dotfiles/cargo.toml", &link).unwrap();
+
+        write_atomic(&link, b"new").unwrap();
+        assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert_eq!(fs::read_to_string(&real).unwrap(), "new");
+        assert_eq!(mode(&real), 0o600);
+        assert_eq!(fs::read_dir(&home).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(&dotfiles).unwrap().count(), 1);
+
+        // A link to a file that doesn't exist yet creates that file.
+        let dangling = home.join("other.toml");
+        std::os::unix::fs::symlink(dotfiles.join("new.toml"), &dangling).unwrap();
+        write_atomic(&dangling, b"x").unwrap();
+        assert!(fs::symlink_metadata(&dangling).unwrap().is_symlink());
+        assert_eq!(fs::read_to_string(dotfiles.join("new.toml")).unwrap(), "x");
+
+        // Permissions given to a new file apply from the start.
+        let private = tmp.path().join("private");
+        write_with_permissions(&private, b"x", Some(&fs::Permissions::from_mode(0o600))).unwrap();
+        assert_eq!(mode(&private), 0o600);
     }
 
     /// Cargo reads the extensionless `config` whenever it exists.

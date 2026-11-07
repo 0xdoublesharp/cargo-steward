@@ -66,3 +66,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `config.toml`. With only that file, `doctor` reported no wrapper and
   skipped the missing-binary check, and flagged `~/.cargo/config` as a
   project that bypasses cargo-steward.
+- Writing a settings or Cargo config file through a symlink (as dotfile
+  managers set up) updates the file it links to instead of replacing the
+  link, and keeps the file's permissions; `setup`'s backup of Cargo's config
+  gets the original's permissions instead of 0644.
