@@ -19,7 +19,6 @@ mod units;
 use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsString;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -117,7 +116,17 @@ pub fn run(args: &Args) -> Result<()> {
 
 /// `probe` is [`marker::probe_atime`]; tests pass one for a `noatime` mount.
 fn start(root: &Path, probe: fn(&Path) -> std::io::Result<bool>) -> Result<()> {
-    fs::create_dir_all(root).with_context(|| format!("creating {}", root.display()))?;
+    if !root.is_dir() {
+        // Cargo tags a build directory it creates (`CACHEDIR.TAG`, and on
+        // macOS a Time Machine exclusion), but not one that already exists,
+        // so creating it is left to cargo. Everything the job builds there is
+        // new and so used: there's nothing to mark.
+        println!(
+            "cargo-steward: {} doesn't exist yet, so everything the job builds there counts as used",
+            root.display()
+        );
+        return Ok(());
+    }
     let start = marker::now_secs();
     let atime =
         probe(root).with_context(|| format!("checking access times in {}", root.display()))?;
@@ -187,6 +196,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn start_leaves_creating_the_build_directory_to_cargo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("target");
+        start(&root, marker::probe_atime).unwrap();
+        assert!(
+            !root.exists(),
+            "cargo only tags a build directory it creates"
+        );
+    }
+
+    #[test]
     fn reads_the_build_directory_and_members_from_metadata() {
         let json = br#"{"packages":[{"name":"app"},{"name":"app-core"}],
             "target_directory":"/w/target","build_directory":"/w/build","version":1}"#;
@@ -208,6 +228,8 @@ mod tests {
     fn start_on_a_noatime_mount_records_budget_only() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("target");
+        // An existing build directory: one cargo creates has nothing to mark.
+        std::fs::create_dir_all(&root).unwrap();
         start(&root, |_| Ok(false)).unwrap();
         let marker = marker::read(&root).unwrap().unwrap();
         assert!(!marker.atime);

@@ -646,6 +646,7 @@ fn ci_reports_metadata_failures_and_bad_budgets() {
     // An explicit build dir works without metadata, with a warning that
     // workspace crates can't be told apart.
     let target = env.root.join("target");
+    fs::create_dir_all(&target).unwrap();
     let out = env.ok(env
         .cmd(
             &plain,
@@ -687,15 +688,25 @@ fn ci_start_finds_the_build_dir_with_cargo_metadata() {
     let out = env.ok(env
         .cmd(&project, &["ci", "start"])
         .env("CARGO", env!("CARGO")));
+    // Cargo creates (and tags) the build directory, not `ci start`.
     assert!(
-        out.contains(&format!("start in {}", project.join("target").display())),
+        out.contains(&format!(
+            "{} doesn't exist yet",
+            project.join("target").display()
+        )),
         "{out}"
     );
-    assert!(project.join("target").is_dir());
+    assert!(!project.join("target").exists());
     let out = env.ok(env
         .cmd(&project, &["ci", "trim", "--dry-run"])
         .env("CARGO", env!("CARGO")));
-    assert!(out.contains("cargo-steward ci trim:"), "{out}");
+    assert!(
+        out.contains(&format!(
+            "nothing to trim, {} doesn't exist",
+            project.join("target").display()
+        )),
+        "{out}"
+    );
 }
 
 // ---- the rustc wrapper ----

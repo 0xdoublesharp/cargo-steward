@@ -60,7 +60,11 @@ impl Tracking {
             Tracking::Frozen => {
                 "this filesystem doesn't record reads (noatime), so only the budget applied".into()
             }
-            Tracking::NoMarker => "`ci start` didn't run here, so only the budget applied".into(),
+            Tracking::NoMarker => {
+                "`ci start` left no mark here (it didn't run, or the job started \
+                                   without a build directory), so only the budget applied"
+                    .into()
+            }
         }
     }
 }
@@ -753,7 +757,7 @@ mod tests {
         assert!(
             Tracking::NoMarker
                 .describe()
-                .contains("`ci start` didn't run")
+                .contains("`ci start` left no mark")
         );
         let reads = Tracking::from_marker(Some(Marker {
             start: 1_700_000_000,

@@ -9,6 +9,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `ci trim --budget` weighs only what it can remove: it no longer evicts
   build units to make up for profiles a build is using, `doc/` or final
   outputs, and says when those leave the directory over the budget.
+- `ci start` no longer creates a missing build directory, so cargo still
+  creates it with `CACHEDIR.TAG` (and, on macOS, a Time Machine exclusion).
 
 ### Added
 

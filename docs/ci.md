@@ -164,6 +164,11 @@ neither read nor written since the start was in none of its builds. `trim`
 removes those units, then gives the fingerprints of the units it keeps their
 modification time as access time again, and removes the marker.
 
+When the build directory doesn't exist yet, `start` leaves it alone: cargo
+marks a build directory as a cache (`CACHEDIR.TAG`, and on macOS a Time
+Machine exclusion) only when it creates it. Everything the job then builds is
+its own, so `trim` has nothing to tell apart and applies only the budget.
+
 Before resetting anything, `start` checks that this filesystem updates access
 times: it creates a file, sets its access time to the epoch, reads it, and
 looks. The result goes in the marker (`atime=updates` or `atime=frozen`). On a

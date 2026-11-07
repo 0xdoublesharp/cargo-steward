@@ -276,6 +276,21 @@ fn trim_removes_what_the_job_did_not_build_and_keeps_the_rest_fresh() {
 }
 
 #[test]
+fn a_build_directory_cargo_creates_after_start_is_tagged() {
+    let fx = Fixture::new();
+    let started = fx.steward(&["ci", "start"]);
+    assert!(started.contains("doesn't exist yet"), "{started}");
+    assert!(!fx.target.exists(), "{started}");
+    fx.cargo(&["build"]);
+    let tag = fs::read_to_string(fx.target.join("CACHEDIR.TAG")).unwrap();
+    assert!(tag.contains("created by cargo"), "{tag}");
+    // Everything there is the job's own.
+    let trimmed = fx.steward(&["ci", "trim", "--keep-workspace", "--keep-incremental"]);
+    assert!(trimmed.contains("nothing"), "{trimmed}");
+    fx.assert_fresh(&["a", "b", "app"]);
+}
+
+#[test]
 fn without_start_trim_applies_only_the_budget() {
     let fx = Fixture::new();
     fx.cargo(&["build"]);
