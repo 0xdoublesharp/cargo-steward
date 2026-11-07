@@ -145,6 +145,12 @@ pub struct Route {
     /// As the top-level `max-builds`, with its own set of slots.
     #[serde(default)]
     pub max_builds: Option<u32>,
+    /// Route even when `CARGO_TARGET_DIR` is already set or a workspace
+    /// config sets `build.target-dir`, as a per-invocation shim that always
+    /// sets the target dir would. Only `--target-dir` and `--config` on the
+    /// command line still win.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub force: bool,
 }
 
 impl Default for Config {

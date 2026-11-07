@@ -48,7 +48,7 @@ cargo steward shim uninstall
 executable. The default `<bin-dir>` is `bin` in the steward home
 (`$CARGO_STEWARD_HOME`, else `$CARGO_HOME/steward`). Use `--bin-dir DIR`
 to pick another directory. It won't replace a `cargo` there that isn't its
-own. `--shell` adds a marked block to `~/.zshrc` (`$ZDOTDIR/.zshrc`),
+own. `--shell` adds a marked block to `~/.zshenv` (`$ZDOTDIR/.zshenv`, read by every zsh, including non-interactive ones),
 `~/.bashrc` or `~/.config/fish/config.fish` that puts the bin directory first
 on PATH. `uninstall` removes the symlink and any such blocks.
 
@@ -90,6 +90,13 @@ target-root = "/Volumes/Scratch/0xdiesis/cargo"   # the names its old shim used
 tmp-root = "/Volumes/Scratch/0xdiesis/tmp"
 max-builds = 3
 ```
+
+A route with `force = true` routes even when `CARGO_TARGET_DIR` is already set
+or a workspace config sets `build.target-dir`, as a shim that always sets the
+target directory does; only `--target-dir` or `--config` on the command line
+win. Use it when replacing such a shim, so that a target directory exported
+for one checkout (say, by a shell hook) doesn't leak into builds run in
+another (`make -C other-repo`).
 
 `cargo steward shim explain` shows which route applies to the current
 directory.

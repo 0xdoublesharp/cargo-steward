@@ -144,6 +144,9 @@ pub struct Effective {
     pub slots: String,
     /// The route's `path`, when one applies.
     pub route: Option<PathBuf>,
+    /// Route over a target dir chosen by the environment or a workspace
+    /// config.
+    pub force: bool,
 }
 
 impl Effective {
@@ -164,6 +167,7 @@ impl Effective {
                     route::repo_name("", path.as_os_str()).trim_start_matches('-')
                 ),
                 route: Some(path),
+                force: r.force,
             },
             None => Effective {
                 target_root: config.target_root.clone(),
@@ -171,6 +175,7 @@ impl Effective {
                 max_builds: config.max_builds,
                 slots: String::new(),
                 route: None,
+                force: false,
             },
         }
     }
@@ -225,12 +230,17 @@ impl Plan {
         let namespace = Namespace::of(&dir);
         let real_cwd = route::resolve(cwd);
         let cargo_home = config::cargo_home();
-        let skip = route::target_dir_chosen(
-            args,
-            |name| env::var_os(name),
-            &[&real_cwd, &dir],
-            cargo_home.as_deref(),
-        );
+        let skip = if effective.force {
+            // Only the command line can override a forced route.
+            route::target_dir_chosen(args, |_| None, &[], None)
+        } else {
+            route::target_dir_chosen(
+                args,
+                |name| env::var_os(name),
+                &[&real_cwd, &dir],
+                cargo_home.as_deref(),
+            )
+        };
         let label = namespace
             .repo
             .rsplit_once('-')
@@ -420,12 +430,14 @@ mod tests {
                     target_root: Some(base.join("work-root")),
                     tmp_root: None,
                     max_builds: Some(2),
+                    force: false,
                 },
                 config::Route {
                     path: repo.clone(),
                     target_root: Some(base.join("proj-root")),
                     tmp_root: Some(base.join("proj-tmp")),
                     max_builds: Some(3),
+                    force: false,
                 },
             ],
             ..Config::default()
@@ -466,12 +478,55 @@ mod tests {
                 target_root: None,
                 tmp_root: None,
                 max_builds: Some(1),
+                force: false,
             }],
             ..Config::default()
         };
         let plan = Plan::new(&config, &other, &none).unwrap();
         assert!(plan.skip.is_some() && plan.vars().is_empty());
         assert_eq!(plan.max_builds, Some(1));
+    }
+
+    #[test]
+    fn a_forced_route_overrides_a_workspace_target_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let repo = base.join("proj");
+        std::fs::create_dir_all(repo.join(".cargo")).unwrap();
+        let status = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::write(
+            repo.join(".cargo/config.toml"),
+            "[build]\ntarget-dir = \"elsewhere\"\n",
+        )
+        .unwrap();
+        let route = |force| config::Route {
+            path: repo.clone(),
+            target_root: Some(base.join("root")),
+            tmp_root: None,
+            max_builds: None,
+            force,
+        };
+        let none: [OsString; 0] = [];
+        let respectful = Config {
+            routes: vec![route(false)],
+            ..Config::default()
+        };
+        assert!(Plan::new(&respectful, &repo, &none).unwrap().skip.is_some());
+        let forced = Config {
+            routes: vec![route(true)],
+            ..Config::default()
+        };
+        let plan = Plan::new(&forced, &repo, &none).unwrap();
+        assert_eq!(plan.skip, None);
+        assert!(plan.target.is_some());
+        // The command line still wins.
+        let args = [OsString::from("build"), OsString::from("--target-dir=x")];
+        assert!(Plan::new(&forced, &repo, &args).unwrap().skip.is_some());
     }
 
     #[test]

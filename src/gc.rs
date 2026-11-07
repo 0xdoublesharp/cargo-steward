@@ -263,6 +263,33 @@ pub fn run(options: Options) -> Result<()> {
         ledger::save(&paths, &registry)?;
     }
     report(&cleanup, &freed, options);
+
+    // Share identical files across what's left. Only where the filesystem
+    // can tell files that already share blocks apart (APFS clone IDs), so
+    // repeated cleanups don't re-read and re-clone the same duplicates.
+    if options.apply && config.dedup && cfg!(target_os = "macos") {
+        let removed: BTreeSet<&PathBuf> = cleanup
+            .actions
+            .iter()
+            .filter(|a| a.kind >= Kind::Orphaned)
+            .map(|a| &a.path)
+            .collect();
+        let remaining: Vec<BuildDir> = dirs
+            .iter()
+            .filter(|d| !removed.contains(&d.root))
+            .cloned()
+            .collect();
+        match crate::dedup::dedup(&remaining, true) {
+            Ok(summary) if summary.files > 0 => println!(
+                "{:>12} {:>10}  identical files now shared across build dirs ({} files)",
+                "Shared",
+                human(summary.bytes),
+                summary.files
+            ),
+            Ok(_) => {}
+            Err(e) => eprintln!("warning: cargo-steward: dedup: {e:#}"),
+        }
+    }
     Ok(())
 }
 

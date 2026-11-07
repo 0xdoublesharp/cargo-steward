@@ -105,18 +105,23 @@ Cheapest-to-rebuild first. Every threshold is a setting.
 
 | What | When | Rebuild cost |
 |---|---|---|
-| Object files a later compile replaced | Right after the compile, by the wrapper; any left over, by cleanup | None. Nothing reads them. |
+| Object files a later compile replaced | Right after the compile, by the wrapper, once older than `object-grace` (10 minutes); any left over, by cleanup | None. Nothing reads them. |
 | Old-layout files (`deps/`, `.fingerprint/`, `build/<pkg>-<hash>/`) | Once Cargo 1.100's layout is in use in that directory and no older toolchain has built there for `legacy-idle` (3 days) | None |
 | A crate's incremental cache | Unused for `incremental-idle` (7 days) | That crate compiles from scratch once |
 | A build unit (new layout) | Unused for `unit-idle` (14 days) | That unit rebuilds if needed again |
 | A whole build directory | Every workspace that built there is deleted, for `orphan-grace` (2 days); or unused for `dir-idle` (21 days) | Full rebuild |
-| Whole build directories, least recently used first | The disk has under `min-free` (50 GiB) free; until it has `target-free` (100 GiB). Never one used within `recent-guard` (1 day) | Full rebuild |
+| Whole build directories, cheapest to rebuild first (idle time × size ÷ recorded compile time) | The disk has under `min-free` (50 GiB) free; until it has `target-free` (100 GiB). Never one used within `recent-guard` (1 day) | Full rebuild |
 
 Safety:
 
 - Every removal from a build directory happens while holding cargo's own
-  locks on it (`.cargo-lock` and `.cargo-build-lock`, exclusively), so a running
-  build is never touched; a busy directory is skipped until next time.
+  locks on it (`.cargo-lock`, `.cargo-build-lock` and `.cargo-artifact-lock`,
+  exclusively), so a running build is never touched; a busy directory is
+  skipped until next time.
+- A directory a running program was started from (a test node, a server) is
+  kept, whatever its age (`process-guard`).
+- Replaced object files are kept for `object-grace`, so a binary that's still
+  running keeps symbolized backtraces.
 - Directories are renamed aside before they're deleted, so nothing ever sees
   one half removed.
 - Incremental caches are removed whole. Removing part of one can crash rustc.
@@ -125,8 +130,11 @@ Safety:
   info: the objects they reference are the ones kept.
 - `gc` without `--apply` only reports.
 
-Sizes are counted the way `du` counts them. APFS and btrfs clones share blocks
-that each copy counts in full, so the disk's free space is the real measure.
+Sizes are counted the way `du` counts them, so blocks that APFS or btrfs clones
+share count in every copy. `status --sizes` also shows each directory's
+UNSHARED size (what removing it alone would free), and `gc --apply` reports
+the change in each disk's free space ("Freed on disk"), which is the real
+measure.
 
 ## Settings
 
@@ -153,10 +161,15 @@ seed = true                   # start new worktrees' build directories as clones
 dedup = true                  # let cleanup replace identical files with clones (`dedup`)
 
 # For the cargo proxy (`cargo steward shim`); unset by default:
-# target-root = "/Volumes/Scratch/cargo"   # each worktree's target dir goes under this
-# tmp-root = "/Volumes/Scratch/tmp"        # and its TMPDIR for builds under this
-# max-builds = 4                           # at most this many cargo builds at once
-# real-cargo = "/path/to/cargo"            # the cargo to run; found on PATH if unset
+# target-root = "/Volumes/Scratch/{label}/cargo"   # each worktree's target dir goes under this
+# tmp-root = "/Volumes/Scratch/{label}/tmp"        # and its TMPDIR for builds under this
+# max-builds = 4                                   # at most this many cargo builds at once
+# real-cargo = "/path/to/cargo"                    # the cargo to run; found on PATH if unset
+#
+# [[routes]]                                       # per-directory overrides; see docs/proxy.md
+# path = "/Users/me/Workspaces/bigproject"
+# target-root = "/Volumes/Scratch/bigproject/cargo"
+# max-builds = 3
 ```
 
 `CARGO_STEWARD_INNER` overrides `inner-wrapper` (empty for none).

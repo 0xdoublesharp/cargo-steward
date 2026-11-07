@@ -402,7 +402,7 @@ fn installs_and_uninstalls_the_shim() {
     let fx = Fixture::new("");
     let user_home = fx.root.join("user-home");
     fs::create_dir_all(&user_home).unwrap();
-    fs::write(user_home.join(".zshrc"), "export EDITOR=vi\n").unwrap();
+    fs::write(user_home.join(".zshenv"), "export EDITOR=vi\n").unwrap();
     let shim = |args: &[&str]| {
         let out = Command::new(BIN)
             .arg("shim")
@@ -423,7 +423,7 @@ fn installs_and_uninstalls_the_shim() {
     shim(&["install", "--shell", "zsh"]);
     assert_eq!(fs::read_link(&link).unwrap(), me);
     shim(&["install", "--shell", "zsh"]);
-    let rc = fs::read_to_string(user_home.join(".zshrc")).unwrap();
+    let rc = fs::read_to_string(user_home.join(".zshenv")).unwrap();
     assert!(rc.starts_with("export EDITOR=vi\n"), "{rc}");
     assert_eq!(
         rc.matches(&format!("{}:$PATH", fx.home.join("bin").display()))
@@ -442,7 +442,7 @@ fn installs_and_uninstalls_the_shim() {
     shim(&["uninstall"]);
     assert!(fs::symlink_metadata(&link).is_err());
     assert_eq!(
-        fs::read_to_string(user_home.join(".zshrc")).unwrap(),
+        fs::read_to_string(user_home.join(".zshenv")).unwrap(),
         "export EDITOR=vi\n"
     );
 

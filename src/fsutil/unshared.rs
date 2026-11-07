@@ -186,6 +186,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("plain");
         fs::write(&file, vec![9u8; 1 << 20]).unwrap();
+        // APFS only reports a file's private size once its data is on disk;
+        // build outputs that cleanup measures are long since flushed.
+        fs::File::open(&file).unwrap().sync_all().unwrap();
         let Some(private) = private_size(&file) else {
             return; // Not a filesystem that can tell.
         };

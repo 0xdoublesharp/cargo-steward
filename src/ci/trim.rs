@@ -6,7 +6,7 @@ use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 
@@ -286,7 +286,10 @@ fn trim(options: &Options, tracking: Tracking) -> Report {
             if out.is_gone(&dir) {
                 continue;
             }
-            let files: Vec<PathBuf> = scan::stale_objects_in(&dir)
+            // The job is over: nothing it built is still running and
+            // needs old objects for backtraces, so no grace applies.
+            let no_grace = SystemTime::now() + Duration::from_secs(86_400);
+            let files: Vec<PathBuf> = scan::stale_objects_in(&dir, no_grace)
                 .into_iter()
                 .flat_map(|s| s.files)
                 .filter(|f| !out.is_gone(f))

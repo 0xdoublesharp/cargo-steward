@@ -543,6 +543,7 @@ mod tests {
             workspaces: Default::default(),
             pinned: false,
             device: fsutil::device(root),
+            compile_ms: 0,
         }
     }
 

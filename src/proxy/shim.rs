@@ -352,7 +352,9 @@ fn rc_file(shell: Shell) -> Result<PathBuf> {
     };
     let home = var("HOME").context("HOME isn't set");
     Ok(match shell {
-        Shell::Zsh => var("ZDOTDIR").map_or_else(|| home, Ok)?.join(".zshrc"),
+        // `.zshenv` is read by every zsh, including the non-interactive ones
+        // scripts and agents run, not just interactive shells.
+        Shell::Zsh => var("ZDOTDIR").map_or_else(|| home, Ok)?.join(".zshenv"),
         Shell::Bash => home?.join(".bashrc"),
         Shell::Fish => var("XDG_CONFIG_HOME")
             .map_or_else(|| home.map(|h| h.join(".config")), Ok)?
