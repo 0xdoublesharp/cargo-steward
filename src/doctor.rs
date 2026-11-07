@@ -68,7 +68,9 @@ pub fn run() -> Result<()> {
         let binary_probe = s.spawn(|| binary::probe(configured.as_deref()));
         let root_probe = s.spawn(|| backup::probe_roots(&settings.scan_roots));
 
-        let registry = ledger::compact(&paths)?;
+        // Read only: doctor reports, and agents run it in sandboxes where
+        // the steward home can't be written.
+        let registry = ledger::peek(&paths);
         // Build directories on the system disk share it with Time Machine's
         // local snapshots, which keep deleted files around for about a day.
         let home_device = home.as_deref().and_then(fsutil::device);

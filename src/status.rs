@@ -11,7 +11,7 @@ use crate::gc::{self, BuildDir};
 pub fn run(sizes: bool) -> Result<()> {
     let paths = Paths::resolve().context("cannot locate the home directory")?;
     let config = config::load(&paths)?;
-    let (_, mut dirs) = gc::inventory(&paths, &config.scan_roots)?;
+    let (_, mut dirs) = gc::inventory(&paths, &config.scan_roots, false)?;
     if dirs.is_empty() {
         println!("No build directories found yet.");
         println!(

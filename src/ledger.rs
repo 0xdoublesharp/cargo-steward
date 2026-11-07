@@ -102,6 +102,26 @@ pub fn save(paths: &Paths, registry: &Registry) -> Result<()> {
     write_atomic(&paths.registry(), &serde_json::to_vec_pretty(registry)?)
 }
 
+/// The registry with the ledger's records folded in, changing nothing on
+/// disk: for commands that only report, which may run where the steward
+/// home is read-only (an agent's sandbox).
+pub fn peek(paths: &Paths) -> Registry {
+    let mut registry = load(paths);
+    let pending = crate::fsutil::entries(&paths.home)
+        .filter(|(name, _)| name.starts_with("ledger.") && name.ends_with(".processing"))
+        .map(|(_, path)| path);
+    for path in std::iter::once(paths.ledger()).chain(pending) {
+        let text = fs::read_to_string(path).unwrap_or_default();
+        for record in text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Record>(l).ok())
+        {
+            registry.merge(record);
+        }
+    }
+    registry
+}
+
 /// Folds the ledger into the registry and empties it. The ledger is renamed
 /// first, so compiles that finish meanwhile start a fresh one and nothing is
 /// lost; leftovers from an interrupted compaction are picked up too.
@@ -254,5 +274,36 @@ mod tests {
         // The records are still there for the next try.
         assert!(paths.ledger().exists());
         assert_eq!(compact(&paths).unwrap().roots.len(), 1);
+    }
+
+    #[test]
+    fn peeking_reads_every_record_and_changes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            home: tmp.path().to_path_buf(),
+        };
+        let root = PathBuf::from("/b/target");
+        let record = |ts| Record {
+            ts,
+            root: root.clone(),
+            workspace: None,
+            ms: 2,
+        };
+        append(&paths, &record(10));
+        compact(&paths).unwrap();
+        append(&paths, &record(30));
+        // Left by a compaction that was interrupted.
+        fs::write(
+            tmp.path().join("ledger.99.processing"),
+            format!("{}\n", serde_json::to_string(&record(20)).unwrap()),
+        )
+        .unwrap();
+        let before: Vec<_> = crate::fsutil::entries(tmp.path()).map(|(n, _)| n).collect();
+        let registry = peek(&paths);
+        assert_eq!(registry.roots[&root].last_used, 30);
+        assert_eq!(registry.roots[&root].compile_ms, 6);
+        let after: Vec<_> = crate::fsutil::entries(tmp.path()).map(|(n, _)| n).collect();
+        assert_eq!(before, after);
+        assert_eq!(load(&paths).roots[&root].last_used, 10, "not saved");
     }
 }

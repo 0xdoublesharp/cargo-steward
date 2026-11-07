@@ -176,15 +176,26 @@ impl BuildDir {
 /// under the scan roots. Registry entries are re-resolved to the build
 /// directory's root (merging any recorded against a subdirectory), and
 /// dropped once the directory is gone.
-pub fn inventory(paths: &Paths, scan_roots: &[PathBuf]) -> Result<(Registry, Vec<BuildDir>)> {
-    let compacted = ledger::compact(paths)?;
+///
+/// With `write` off nothing in the steward home changes (the ledger is read
+/// but not compacted), so reports work where it's read-only.
+pub fn inventory(
+    paths: &Paths,
+    scan_roots: &[PathBuf],
+    write: bool,
+) -> Result<(Registry, Vec<BuildDir>)> {
+    let compacted = if write {
+        ledger::compact(paths)?
+    } else {
+        ledger::peek(paths)
+    };
     let mut registry = Registry::default();
     for (root, info) in &compacted.roots {
         if let Some(root) = scan::find_root(root) {
             registry.roots.entry(root).or_default().absorb(info);
         }
     }
-    if registry != compacted {
+    if write && registry != compacted {
         ledger::save(paths, &registry)?;
     }
     let mut roots: Vec<PathBuf> = registry.roots.keys().cloned().collect();
@@ -209,8 +220,10 @@ pub struct Options {
 
 pub fn run(options: Options) -> Result<()> {
     let paths = Paths::resolve().context("cannot locate the home directory")?;
-    fs::create_dir_all(&paths.home)
-        .with_context(|| format!("creating {}", paths.home.display()))?;
+    if options.apply {
+        fs::create_dir_all(&paths.home)
+            .with_context(|| format!("creating {}", paths.home.display()))?;
+    }
     let config = config::load(&paths)?;
     let policy = config.policy()?;
 
@@ -231,7 +244,7 @@ pub fn run(options: Options) -> Result<()> {
         touch(&paths.stamp());
     }
 
-    let (mut registry, dirs) = inventory(&paths, &config.scan_roots)?;
+    let (mut registry, dirs) = inventory(&paths, &config.scan_roots, options.apply)?;
     let running = if config.process_guard {
         Running::collect()
     } else {
@@ -716,7 +729,11 @@ pub fn remove_requested(roots: &[PathBuf], apply: bool, force: bool) -> Result<(
     } else {
         Running::default()
     };
-    let mut registry = ledger::compact(&paths)?;
+    let mut registry = if apply {
+        ledger::compact(&paths)?
+    } else {
+        ledger::peek(&paths)
+    };
     let sweep = Sweep {
         policy: &policy,
         running: &running,
@@ -1662,7 +1679,7 @@ mod tests {
             .insert(base.join("missing"), RootInfo::default());
         ledger::save(&paths, &recorded).unwrap();
 
-        let (registry, dirs) = inventory(&paths, &[]).unwrap();
+        let (registry, dirs) = inventory(&paths, &[], true).unwrap();
         assert_eq!(registry.roots.len(), 1);
         let info = &registry.roots[&root];
         assert_eq!(info.last_used, 9);
