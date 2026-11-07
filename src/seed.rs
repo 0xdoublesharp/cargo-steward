@@ -693,4 +693,156 @@ mod tests {
         git_ok(&bare, &["init", "-q", "--bare"]);
         assert_eq!(main_worktree(&bare), None);
     }
+
+    #[test]
+    fn plans_nothing_when_the_main_worktree_isnt_a_cargo_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().canonicalize().unwrap().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        git_ok(&repo, &["init", "-q", "-b", "main"]);
+        let args = SeedArgs {
+            target_dir: Some(repo.join("target")),
+            ..SeedArgs::default()
+        };
+        assert_eq!(main_worktree(&repo), Some(repo.clone()));
+        assert!(plan(&args, &repo).is_empty());
+    }
+
+    #[test]
+    fn a_baseline_that_isnt_a_build_dir_is_no_baseline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("notes");
+        fs::create_dir_all(&base).unwrap();
+        fs::write(base.join("readme"), "x").unwrap();
+        let target = tmp.path().join("wt/target");
+        assert_eq!(
+            seed_dir(&target, &base, Duration::ZERO).unwrap(),
+            Outcome::NoBaseline
+        );
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn a_target_without_a_name_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("main/target");
+        build_dir(&base);
+        let other = tmp.path().join("other");
+        fs::create_dir_all(&other).unwrap();
+        // `other/missing/..` names no directory of its own to create.
+        let target = other.join("missing/..");
+        assert_eq!(
+            seed_dir(&target, &base, Duration::ZERO).unwrap(),
+            Outcome::Same
+        );
+        assert!(!other.join("missing").exists());
+    }
+
+    /// A target on another volume can't share the baseline's blocks.
+    #[cfg(unix)]
+    #[test]
+    fn a_target_on_another_volume_is_unsupported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("main/target");
+        build_dir(&base);
+        // Never created: the device check comes first.
+        let target = Path::new("/dev/cargo-steward-seed-test");
+        if fsutil::device(Path::new("/dev")) == fsutil::device(&base) {
+            return;
+        }
+        assert_eq!(
+            seed_dir(target, &base, Duration::ZERO).unwrap(),
+            Outcome::Unsupported
+        );
+        assert!(!target.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_clone_that_fails_is_an_error_and_leaves_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("main/target");
+        build_dir(&base);
+        let parent = tmp.path().join("readonly");
+        fs::create_dir_all(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o555)).unwrap();
+        let result = seed_dir(&parent.join("target"), &base, Duration::ZERO);
+        let names: Vec<String> = fsutil::entries(&parent).map(|(n, _)| n).collect();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+        match result {
+            Ok(outcome) => assert_eq!(outcome, Outcome::Unsupported),
+            Err(e) => assert!(format!("{e:#}").contains("cloning"), "{e:#}"),
+        }
+        assert!(names.is_empty(), "{names:?}");
+    }
+
+    /// A dangling symlink looks missing, but the clone can't replace it.
+    #[cfg(unix)]
+    #[test]
+    fn a_clone_that_cant_be_moved_into_place_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("main/target");
+        build_dir(&base);
+        let wt = tmp.path().join("wt");
+        fs::create_dir_all(&wt).unwrap();
+        let target = wt.join("target");
+        std::os::unix::fs::symlink(tmp.path().join("nowhere"), &target).unwrap();
+        match seed_dir(&target, &base, Duration::ZERO) {
+            Ok(outcome) => assert_eq!(outcome, Outcome::Unsupported),
+            Err(e) => assert!(format!("{e:#}").contains("moving the clone"), "{e:#}"),
+        }
+        // The staged clone is gone; the symlink is untouched.
+        let names: Vec<String> = fsutil::entries(&wt).map(|(n, _)| n).collect();
+        assert_eq!(names, ["target"]);
+        assert!(fs::symlink_metadata(&target).unwrap().is_symlink());
+    }
+
+    /// With a separate build-dir, both it and the target dir are seeded,
+    /// each from the main worktree's.
+    #[test]
+    fn plans_the_build_and_target_dirs_of_a_linked_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let repo = root.join("repo");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::create_dir_all(repo.join(".cargo")).unwrap();
+        fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(repo.join("src/lib.rs"), "").unwrap();
+        fs::write(
+            repo.join(".cargo/config.toml"),
+            "[build]\nbuild-dir = \"bdir\"\n",
+        )
+        .unwrap();
+        git_ok(&repo, &["init", "-q", "-b", "main"]);
+        git_ok(&repo, &["add", "."]);
+        git_ok(
+            &repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                "init",
+            ],
+        );
+        let wt = root.join("wt");
+        git_ok(&repo, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+        let dirs = cargo_dirs(&wt).expect("cargo metadata in the worktree");
+        if dirs.build == dirs.target {
+            // A Cargo too old to report build_directory.
+            return;
+        }
+        let pairs = plan(&SeedArgs::default(), &wt);
+        assert_eq!(pairs.len(), 2, "{pairs:?}");
+        assert_eq!(pairs[0], (wt.join("bdir"), repo.join("bdir")));
+        // The target dirs, unless CARGO_TARGET_DIR puts both elsewhere.
+        assert_eq!(pairs[1].0, dirs.target);
+    }
 }

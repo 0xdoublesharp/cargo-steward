@@ -197,6 +197,14 @@ mod tests {
         if let Some(parent) = mount.parent() {
             assert_ne!(fsutil::device(parent), fsutil::device(&deep));
         }
+        // A mount point below the root: devfs.
+        #[cfg(unix)]
+        {
+            let dev = Path::new("/dev");
+            assert_eq!(mount_point(dev).as_deref(), Some(dev));
+            assert_ne!(fsutil::device(Path::new("/")), fsutil::device(dev));
+        }
+        assert_eq!(mount_point(&tmp.path().join("missing")), None);
     }
 
     #[test]
@@ -320,32 +328,42 @@ mod tests {
         };
         assert!(detect(&same).is_empty());
 
-        // On another volume than home: that volume's mount point.
-        let elsewhere = Path::new("/");
-        if fsutil::device(elsewhere) == fsutil::device(&base) {
-            return;
+        // On another volume than home: that volume's mount point, unless
+        // it's the filesystem root, which is too broad to search.
+        #[cfg(unix)]
+        {
+            let elsewhere = Path::new("/dev");
+            assert_ne!(fsutil::device(elsewhere), fsutil::device(&base));
+            let mount = mount_point(&one).unwrap().canonicalize().unwrap();
+            let detected = detect(&Sources {
+                recorded,
+                home: Some(elsewhere.to_path_buf()),
+                ..Sources::default()
+            });
+            if mount.parent().is_none() {
+                assert!(detected.is_empty(), "{detected:?}");
+            } else {
+                assert_eq!(
+                    detected,
+                    [Detected {
+                        root: mount,
+                        reason: "volume holding 2 recorded build directories".into()
+                    }]
+                );
+            }
+            // devfs, recorded from a home elsewhere.
+            let detected = detect(&Sources {
+                recorded: vec![elsewhere.to_path_buf()],
+                home: Some(base.clone()),
+                ..Sources::default()
+            });
+            assert_eq!(
+                detected,
+                [Detected {
+                    root: elsewhere.to_path_buf(),
+                    reason: "volume holding 1 recorded build directory".into()
+                }]
+            );
         }
-        let mount = mount_point(&one).unwrap().canonicalize().unwrap();
-        let detected = detect(&Sources {
-            recorded,
-            home: Some(elsewhere.to_path_buf()),
-            ..Sources::default()
-        });
-        assert_eq!(
-            detected,
-            [Detected {
-                root: mount,
-                reason: "volume holding 2 recorded build directories".into()
-            }]
-        );
-        let detected = detect(&Sources {
-            recorded: vec![one],
-            home: Some(elsewhere.to_path_buf()),
-            ..Sources::default()
-        });
-        assert_eq!(
-            detected[0].reason,
-            "volume holding 1 recorded build directory"
-        );
     }
 }

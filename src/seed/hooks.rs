@@ -374,6 +374,21 @@ mod tests {
         assert!(!dir.join(HOOK).exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_hook_that_cant_be_removed_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("hooks");
+        install(&dir, "cargo-steward").unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let result = uninstall(&dir);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let err = format!("{:#}", result.unwrap_err());
+        assert!(err.contains("removing"), "{err}");
+        assert!(is_ours(&dir.join(HOOK)));
+    }
+
     #[test]
     fn refuses_to_clobber_a_parked_hook() {
         let tmp = tempfile::tempdir().unwrap();

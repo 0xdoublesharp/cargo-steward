@@ -478,7 +478,13 @@ mod tests {
         fixture(&src);
         let here = fs::metadata(tmp.path()).unwrap().dev();
         // Somewhere writable on another volume; skip if there's none.
-        let candidates = ["/dev/shm".into(), std::env::var("HOME").unwrap_or_default()];
+        // Not the home directory: a test mustn't write there. On macOS,
+        // cloning into devfs fails before anything is created.
+        let candidates: &[&str] = if cfg!(target_os = "macos") {
+            &["/dev"]
+        } else {
+            &["/dev/shm"]
+        };
         let Some(other) = candidates
             .iter()
             .map(PathBuf::from)
@@ -510,5 +516,39 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(!dst.exists());
         assert!(clone_file(&tmp.path().join("missing"), &dst).is_err());
+    }
+
+    #[test]
+    fn may_clone_and_clone_id_answer_no_for_what_they_cant_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("missing");
+        assert!(!may_clone(&missing));
+        assert!(!may_clone(Path::new("a\0b")));
+        assert_eq!(clone_id(&missing), None);
+        assert_eq!(clone_id(Path::new("a\0b")), None);
+        // Devices have no clone ID.
+        #[cfg(unix)]
+        assert_eq!(clone_id(Path::new("/dev/null")), None);
+    }
+
+    /// A source that can't be read is an error, and leaves nothing.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_unreadable_source_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        if !may_clone(tmp.path()) {
+            return;
+        }
+        let src = tmp.path().join("a");
+        fs::write(&src, "x").unwrap();
+        // Write-only.
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o200)).unwrap();
+        let dst = tmp.path().join("b");
+        let result = clone_file(&src, &dst);
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o600)).unwrap();
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+        assert!(fs::symlink_metadata(&dst).is_err());
     }
 }

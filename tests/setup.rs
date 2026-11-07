@@ -402,6 +402,90 @@ fn pins_and_unpins_a_build_dir() {
     );
     let err = fx.fail(&["pin", "does-not-exist"]);
     assert!(err.contains("does-not-exist"), "{err}");
+
+    // A pin that can't be removed is an error, and stays.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fx.run(&["pin", target.to_str().unwrap()]);
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o555)).unwrap();
+        let out = fx
+            .cmd(&["unpin", target.to_str().unwrap()])
+            .output()
+            .unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!out.status.success());
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("ermission denied"), "{err}");
+        assert!(pin.is_file());
+    }
+}
+
+/// `setup --volume` with a fake `diskutil` first on PATH, so no volume is
+/// ever created.
+#[cfg(target_os = "macos")]
+#[test]
+fn setup_volume_reports_what_diskutil_did() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = Fixture::new();
+    let bin = fx.root.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let diskutil = bin.join("diskutil");
+    let fake = |body: &str| {
+        fs::write(&diskutil, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&diskutil, fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    let name = format!("cargo-steward-test-{}", std::process::id());
+    let setup = |dry_run: bool| {
+        let mut args = vec!["setup", "--volume", &name];
+        if dry_run {
+            args.push("--dry-run");
+        }
+        let out = fx.cmd(&args).env("PATH", &bin).output().unwrap();
+        assert!(!out.status.success(), "{args:?} succeeded");
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    let plist = "<key>APFSContainerReference</key><string>disk9</string>";
+
+    fake("echo 'no such disk' >&2; exit 1");
+    let err = setup(true);
+    assert!(
+        err.contains("diskutil info -plist / failed: no such disk"),
+        "{err}"
+    );
+
+    fake(&format!(
+        "[ \"$1\" = info ] && {{ echo '{plist}'; exit 0; }}; exit 3"
+    ));
+    let err = setup(false);
+    assert!(
+        err.contains(&format!("diskutil apfs addVolume disk9 APFS {name} failed")),
+        "{err}"
+    );
+
+    // Claims success but mounts nothing.
+    fake(&format!("[ \"$1\" = info ] && echo '{plist}'; exit 0"));
+    let err = setup(false);
+    assert!(err.contains("it isn't mounted at /Volumes/"), "{err}");
+    assert!(!Path::new("/Volumes").join(&name).exists());
+    assert!(!fx.cargo_home.join("config.toml").exists());
+    assert!(!fx.steward.join("config.toml").exists());
+}
+
+/// Without CARGO_HOME, Cargo's config is the one in ~/.cargo.
+#[test]
+fn setup_finds_cargo_home_under_home() {
+    let fx = Fixture::new();
+    let out = fx
+        .cmd(&["setup", "--dry-run"])
+        .env_remove("CARGO_HOME")
+        .output()
+        .unwrap();
+    assert_ok(&out, &[]);
+    let out = String::from_utf8_lossy(&out.stdout);
+    let expected = fx.home.join(".cargo/config.toml");
+    assert!(out.contains(&expected.display().to_string()), "{out}");
+    assert!(!expected.exists());
 }
 
 #[test]

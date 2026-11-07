@@ -208,11 +208,25 @@ mod tests {
         let err = mounted(&plain).unwrap_err().to_string();
         assert!(err.contains("isn't a mounted volume"), "{err}");
         // A mount point lives on another device than its parent.
-        if let Some(mount) = crate::setup::roots::mount_point(tmp.path())
-            && mount.parent().is_some()
-        {
-            assert!(mounted(&mount).unwrap(), "{}", mount.display());
-        }
+        #[cfg(unix)]
+        assert!(mounted(Path::new("/dev")).unwrap());
+    }
+
+    /// An existing volume is reused: nothing to create, no container needed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn reuses_a_mounted_volume() {
+        let Some(name) = fs::read_dir("/Volumes")
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .find(|n| {
+                validate_name(n).is_ok() && mounted(&Path::new("/Volumes").join(n)).is_ok_and(|m| m)
+            })
+        else {
+            return;
+        };
+        assert_eq!(run(&name, true).unwrap(), Path::new("/Volumes").join(&name));
     }
 
     #[test]
