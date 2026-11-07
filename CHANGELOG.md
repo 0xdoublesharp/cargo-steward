@@ -70,3 +70,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   managers set up) updates the file it links to instead of replacing the
   link, and keeps the file's permissions; `setup`'s backup of Cargo's config
   gets the original's permissions instead of 0644.
+- `setup` records cargo-steward as installed on PATH (such as Homebrew's or
+  Nix's link) rather than the versioned file it resolves to, which an upgrade
+  removes and then every build fails.

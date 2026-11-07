@@ -8,6 +8,7 @@ mod roots;
 mod volume;
 
 use std::env;
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -187,15 +188,30 @@ fn build_table(doc: &mut DocumentMut) -> &mut Table {
     item.as_table_mut().expect("just made a table")
 }
 
-/// The installed binary cargo should run: `$CARGO_HOME/bin/cargo-steward`
-/// when that's where this one is installed, else this executable.
+/// The binary cargo should run, by a path that outlives upgrades:
+/// `$CARGO_HOME/bin/cargo-steward` when it exists, else the first
+/// `cargo-steward` on PATH that is this executable (a package manager's link,
+/// not the versioned file it points at), else this executable as it was run.
 fn steward_exe(cargo_home: &Path) -> Result<PathBuf> {
+    let current = env::current_exe().context("locating cargo-steward")?;
+    Ok(pick_exe(
+        cargo_home,
+        env::var_os("PATH").as_deref(),
+        current,
+    ))
+}
+
+fn pick_exe(cargo_home: &Path, path: Option<&OsStr>, current: PathBuf) -> PathBuf {
     let installed = cargo_home.join("bin").join(exe_name());
     if installed.is_file() {
-        return Ok(installed);
+        return installed;
     }
-    let current = env::current_exe().context("locating cargo-steward")?;
-    Ok(current.canonicalize().unwrap_or(current))
+    path.into_iter()
+        .flat_map(env::split_paths)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(exe_name()))
+        .find(|candidate| crate::fsutil::same_file(candidate, &current))
+        .unwrap_or(current)
 }
 
 fn exe_name() -> &'static str {
@@ -371,6 +387,39 @@ mod tests {
         build_table(&mut doc)["jobs"] = value(2);
         let doc: DocumentMut = doc.to_string().parse().unwrap();
         assert_eq!(doc["build"]["jobs"].as_integer(), Some(2));
+    }
+
+    /// A package manager's link on PATH is recorded, not the versioned file
+    /// it points at, which an upgrade removes.
+    #[cfg(unix)]
+    #[test]
+    fn records_the_link_on_path_rather_than_the_versioned_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let cellar = root.join("Cellar/cargo-steward/1.0/bin");
+        let bin = root.join("bin");
+        let elsewhere = root.join("elsewhere");
+        for dir in [&cellar, &bin, &elsewhere] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        let real = cellar.join(exe_name());
+        fs::write(&real, "").unwrap();
+        std::os::unix::fs::symlink(&real, bin.join(exe_name())).unwrap();
+        // A different cargo-steward earlier on PATH isn't this one.
+        fs::write(elsewhere.join(exe_name()), "").unwrap();
+        let path =
+            env::join_paths(["relative".as_ref(), elsewhere.as_path(), bin.as_path()]).unwrap();
+        let cargo_home = root.join("cargo");
+        assert_eq!(
+            pick_exe(&cargo_home, Some(&path), real.clone()),
+            bin.join(exe_name())
+        );
+        // Not on PATH: this executable, as it was run (not resolved).
+        let link = root.join("run-as");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let unrelated = env::join_paths([elsewhere.as_path()]).unwrap();
+        assert_eq!(pick_exe(&cargo_home, Some(&unrelated), link.clone()), link);
+        assert_eq!(pick_exe(&cargo_home, None, link.clone()), link);
     }
 
     #[test]
