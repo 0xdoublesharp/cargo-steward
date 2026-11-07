@@ -315,4 +315,60 @@ mod tests {
         };
         assert!(config.policy().is_err());
     }
+
+    #[test]
+    fn keeps_every_file_in_the_home_directory() {
+        let paths = Paths {
+            home: PathBuf::from("/s"),
+        };
+        assert_eq!(paths.config(), PathBuf::from("/s/config.toml"));
+        assert_eq!(paths.ledger(), PathBuf::from("/s/ledger.jsonl"));
+        assert_eq!(paths.registry(), PathBuf::from("/s/registry.json"));
+        assert_eq!(paths.stamp(), PathBuf::from("/s/gc.stamp"));
+        assert_eq!(paths.gc_lock(), PathBuf::from("/s/gc.lock"));
+        assert_eq!(paths.log(), PathBuf::from("/s/gc.log"));
+    }
+
+    #[test]
+    fn saves_loads_and_reports_unreadable_settings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            home: tmp.path().join("steward"),
+        };
+        assert_eq!(load(&paths).unwrap(), Config::default());
+        let config = Config {
+            auto_gc: true,
+            scan_roots: vec!["/v".into()],
+            ..Config::default()
+        };
+        save(&paths, &config).unwrap();
+        assert_eq!(load(&paths).unwrap(), config);
+        // Only the settings file is left; the temporary one was renamed.
+        let names: Vec<_> = fs::read_dir(&paths.home).unwrap().flatten().collect();
+        assert_eq!(names.len(), 1);
+
+        fs::write(paths.config(), "auto-gc = \"yes\"\n").unwrap();
+        let err = format!("{:#}", load(&paths).unwrap_err());
+        assert!(err.contains("reading"), "{err}");
+
+        fs::remove_file(paths.config()).unwrap();
+        fs::create_dir(paths.config()).unwrap();
+        assert!(load(&paths).is_err(), "a directory isn't a missing file");
+    }
+
+    #[test]
+    fn names_the_setting_that_doesnt_parse() {
+        let config = Config {
+            dir_idle: "soon".into(),
+            ..Config::default()
+        };
+        let err = format!("{:#}", config.policy().unwrap_err());
+        assert!(err.contains("dir-idle = \"soon\""), "{err}");
+        let config = Config {
+            min_free: "lots".into(),
+            ..Config::default()
+        };
+        let err = format!("{:#}", config.policy().unwrap_err());
+        assert!(err.contains("min-free"), "{err}");
+    }
 }

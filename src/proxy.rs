@@ -52,26 +52,13 @@ pub fn run(args: Vec<OsString>) -> ! {
         process::exit(127);
     };
 
-    let plan = match env::current_dir() {
-        Ok(cwd) => Plan::new(&config, &cwd, &cargo_args),
-        Err(e) => Err(e.into()),
-    };
-    let mut vars = Vec::new();
-    match &plan {
-        Ok(plan) => match route_env(plan, me.as_deref()) {
-            Ok(routed) => vars = routed,
-            Err(e) => warn(&format!("not routing this build: {e:#}")),
-        },
-        Err(e) => warn(&format!("not routing this build: {e:#}")),
-    }
-    if let Ok(plan) = &plan
-        && let Some(limit) = plan.max_builds.filter(|&n| n > 0)
-        && let Some(paths) = &paths
-        && gate::is_build(&cargo_args)
-        && let Err(e) = gate::acquire(&slot_dir(paths, &plan.slots), limit, &mut vars)
-    {
-        warn(&format!("running without a build slot: {e}"));
-    }
+    let vars = prepare(
+        &config,
+        paths.as_ref(),
+        env::current_dir(),
+        &cargo_args,
+        me.as_deref(),
+    );
 
     let mut command = Command::new(&real);
     command.arg0("cargo").args(&cargo_args).envs(vars);
@@ -81,6 +68,38 @@ pub fn run(args: Vec<OsString>) -> ! {
         real.display()
     );
     process::exit(127);
+}
+
+/// Routes the build and takes a build slot, returning the variables to run
+/// cargo with. Never fails: what goes wrong is a warning and less routing.
+fn prepare(
+    config: &Config,
+    paths: Option<&Paths>,
+    cwd: std::io::Result<PathBuf>,
+    cargo_args: &[OsString],
+    me: Option<&Path>,
+) -> Vec<(OsString, OsString)> {
+    let plan = match cwd {
+        Ok(cwd) => Plan::new(config, &cwd, cargo_args),
+        Err(e) => Err(e.into()),
+    };
+    let mut vars = Vec::new();
+    match &plan {
+        Ok(plan) => match route_env(plan, me) {
+            Ok(routed) => vars = routed,
+            Err(e) => warn(&format!("not routing this build: {e:#}")),
+        },
+        Err(e) => warn(&format!("not routing this build: {e:#}")),
+    }
+    if let Ok(plan) = &plan
+        && let Some(limit) = plan.max_builds.filter(|&n| n > 0)
+        && let Some(paths) = paths
+        && gate::is_build(cargo_args)
+        && let Err(e) = gate::acquire(&slot_dir(paths, &plan.slots), limit, &mut vars)
+    {
+        warn(&format!("running without a build slot: {e}"));
+    }
+    vars
 }
 
 /// One warning line on stderr.
@@ -648,5 +667,243 @@ mod tests {
         assert_eq!(config.routes[0].tmp_root, None);
         let again: Config = toml::from_str(&toml::to_string_pretty(&config).unwrap()).unwrap();
         assert_eq!(again, config);
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    }
+
+    /// A forced route over `base`, so the test's own `CARGO_TARGET_DIR`
+    /// doesn't stop the routing.
+    fn forced(base: &Path, target: Option<PathBuf>, tmp: Option<PathBuf>) -> config::Route {
+        config::Route {
+            path: base.to_path_buf(),
+            target_root: target,
+            tmp_root: tmp,
+            max_builds: None,
+            force: true,
+        }
+    }
+
+    fn os(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(OsString::from).collect()
+    }
+
+    fn var<'a>(vars: &'a [(OsString, OsString)], name: &str) -> Option<&'a OsString> {
+        vars.iter().find(|(n, _)| n == name).map(|(_, v)| v)
+    }
+
+    #[test]
+    fn prepare_routes_and_creates_the_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let work = base.join("work");
+        fs::create_dir_all(&work).unwrap();
+        let config = Config {
+            routes: vec![forced(
+                &base,
+                Some(base.join("targets")),
+                Some(base.join("tmps")),
+            )],
+            ..Config::default()
+        };
+        let vars = prepare(&config, None, Ok(work.clone()), &os(&["build"]), None);
+        let target = PathBuf::from(var(&vars, "CARGO_TARGET_DIR").unwrap());
+        assert!(target.starts_with(base.join("targets")) && target.is_dir());
+        let tmpdir = PathBuf::from(var(&vars, "TMP").unwrap());
+        assert!(tmpdir.starts_with(base.join("tmps")) && tmpdir.is_dir());
+        // No slot without `max-builds`.
+        assert!(var(&vars, gate::SLOT_VAR).is_none());
+    }
+
+    #[test]
+    fn prepare_never_fails_the_build() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let build = os(&["build"]);
+        // No working directory: nothing routed.
+        let none = prepare(
+            &Config::default(),
+            None,
+            Err(std::io::Error::other("gone")),
+            &build,
+            None,
+        );
+        assert!(none.is_empty());
+
+        // A root that can't be created (a file is in the way): nothing
+        // routed, but cargo still runs.
+        fs::write(base.join("blocked"), "").unwrap();
+        let config = Config {
+            routes: vec![forced(&base, Some(base.join("blocked/sub")), None)],
+            ..Config::default()
+        };
+        assert!(prepare(&config, None, Ok(base.clone()), &build, None).is_empty());
+        let config = Config {
+            routes: vec![forced(&base, None, Some(base.join("blocked/sub")))],
+            ..Config::default()
+        };
+        assert!(prepare(&config, None, Ok(base.clone()), &build, None).is_empty());
+
+        // A relative root is an error for the plan, not for cargo.
+        let config = Config {
+            routes: vec![forced(&base, Some("relative".into()), None)],
+            ..Config::default()
+        };
+        assert!(prepare(&config, None, Ok(base.clone()), &build, None).is_empty());
+    }
+
+    #[test]
+    fn prepare_takes_a_build_slot_only_for_builds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let paths = Paths {
+            home: base.join("home"),
+        };
+        let config = Config {
+            max_builds: Some(2),
+            ..Config::default()
+        };
+        let vars = prepare(
+            &config,
+            Some(&paths),
+            Ok(base.clone()),
+            &os(&["build"]),
+            None,
+        );
+        let slot = PathBuf::from(var(&vars, gate::SLOT_VAR).unwrap());
+        assert_eq!(slot.parent(), Some(base.join("home/slots").as_path()));
+        assert!(var(&vars, gate::FD_VAR).is_some());
+        // Not a build, no paths, or a zero limit: no slot.
+        let meta = prepare(
+            &config,
+            Some(&paths),
+            Ok(base.clone()),
+            &os(&["metadata"]),
+            None,
+        );
+        assert!(meta.is_empty());
+        assert!(prepare(&config, None, Ok(base.clone()), &os(&["build"]), None).is_empty());
+        let zero = Config {
+            max_builds: Some(0),
+            ..Config::default()
+        };
+        assert!(prepare(&zero, Some(&paths), Ok(base.clone()), &os(&["build"]), None).is_empty());
+
+        // A slot directory that can't be made: a warning, and no slot.
+        fs::write(base.join("file-home"), "").unwrap();
+        let broken = Paths {
+            home: base.join("file-home"),
+        };
+        assert!(prepare(&config, Some(&broken), Ok(base), &os(&["build"]), None).is_empty());
+    }
+
+    #[test]
+    fn slot_sets_and_settings_fall_back_to_defaults() {
+        let paths = Paths { home: "/h".into() };
+        assert_eq!(slot_dir(&paths, ""), PathBuf::from("/h/slots"));
+        assert_eq!(
+            slot_dir(&paths, "route-x"),
+            PathBuf::from("/h/slots/route-x")
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            home: tmp.path().to_path_buf(),
+        };
+        assert_eq!(settings(None, true), Config::default());
+        // Missing settings are the defaults.
+        assert_eq!(settings(Some(&paths), true), Config::default());
+        fs::write(paths.config(), "max-builds = 3\n").unwrap();
+        assert_eq!(settings(Some(&paths), true).max_builds, Some(3));
+        // Unreadable settings are the defaults too, warned about or not.
+        fs::write(paths.config(), "max-builds = \"many\"\n").unwrap();
+        assert_eq!(settings(Some(&paths), true), Config::default());
+        assert_eq!(settings(Some(&paths), false), Config::default());
+    }
+
+    #[test]
+    fn a_configured_real_cargo_is_used() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cargo = tmp.path().join("my-cargo");
+        fs::write(&cargo, "").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+        let config = Config {
+            real_cargo: Some(cargo.clone()),
+            ..Config::default()
+        };
+        assert_eq!(real_cargo(&config, None), Some(cargo));
+        assert!(this_exe().is_some_and(|p| p.is_absolute()));
+    }
+
+    #[test]
+    fn a_new_linked_worktree_is_seeded_from_main() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let repo = base.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        fs::write(repo.join("f"), "x").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-qm", "init"]);
+        let wt = base.join("wt");
+        git(&repo, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+
+        // Stands in for cargo-steward: records how `seed` was run.
+        let log = base.join("seed.log");
+        let me = base.join("fake-steward");
+        fs::write(
+            &me,
+            format!("#!/bin/sh\necho \"$@\" >> '{}'\n", log.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&me, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let config = Config {
+            seed: true,
+            routes: vec![forced(&base, Some(base.join("targets")), None)],
+            ..Config::default()
+        };
+        let build = os(&["build"]);
+        let plan = Plan::new(&config, &wt, &build).unwrap();
+        let from = plan.seed_from.clone().unwrap();
+        assert!(from.ends_with("main"));
+
+        // Main hasn't built yet: nothing to seed from.
+        let vars = prepare(&config, None, Ok(wt.clone()), &build, Some(&me));
+        assert!(var(&vars, "CARGO_TARGET_DIR").is_some());
+        assert!(!log.exists());
+
+        // Main has built, and the worktree's target dir is new: seeded once.
+        fs::create_dir_all(&from).unwrap();
+        let target = plan.target.clone().unwrap();
+        fs::remove_dir(&target).unwrap();
+        prepare(&config, None, Ok(wt.clone()), &build, Some(&me));
+        let logged = fs::read_to_string(&log).unwrap();
+        assert!(logged.starts_with("seed --target-dir "), "{logged}");
+        assert!(logged.contains(&format!("--from {}", from.display())));
+        assert!(logged.contains(&format!("--worktree {}", wt.display())));
+        assert!(logged.trim_end().ends_with("--quiet"));
+
+        // A target dir with files isn't seeded again.
+        fs::write(target.join("keep"), "").unwrap();
+        prepare(&config, None, Ok(wt), &build, Some(&me));
+        assert_eq!(fs::read_to_string(&log).unwrap().lines().count(), 1);
     }
 }
