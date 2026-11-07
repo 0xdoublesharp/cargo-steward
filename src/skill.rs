@@ -90,25 +90,31 @@ fn targets(given: &[PathBuf]) -> Result<Vec<PathBuf>> {
     Ok(found)
 }
 
-/// Skills directories of the agents whose config directories exist:
-/// `$CLAUDE_CONFIG_DIR` or `~/.claude`, and `$CODEX_HOME` or `~/.codex`.
+/// Skills directories of the agents whose config directories exist: Claude
+/// Code's `~/.claude` (and `$CLAUDE_CONFIG_DIR` when that points elsewhere),
+/// and Codex's `~/.codex` (and `$CODEX_HOME`).
 fn detected() -> Vec<PathBuf> {
     let home = env::var_os("HOME").map(PathBuf::from);
-    let config = |var: &str, default: &str| {
-        env::var_os(var)
+    let var = |name: &str| {
+        env::var_os(name)
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
-            .or_else(|| home.as_ref().map(|h| h.join(default)))
     };
-    [
-        config("CLAUDE_CONFIG_DIR", ".claude"),
-        config("CODEX_HOME", ".codex"),
-    ]
-    .into_iter()
-    .flatten()
-    .filter(|dir| dir.is_dir())
-    .map(|dir| dir.join("skills"))
-    .collect()
+    let candidates = [
+        var("CLAUDE_CONFIG_DIR"),
+        home.as_ref().map(|h| h.join(".claude")),
+        var("CODEX_HOME"),
+        home.as_ref().map(|h| h.join(".codex")),
+    ];
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for dir in candidates.into_iter().flatten() {
+        let skills = dir.join("skills");
+        let same = |d: &PathBuf| d.canonicalize().ok() == skills.canonicalize().ok() && d.exists();
+        if dir.is_dir() && !dirs.iter().any(|d| d == &skills || same(d)) {
+            dirs.push(skills);
+        }
+    }
+    dirs
 }
 
 /// Writes the skill into `skills_dir/cargo-steward/SKILL.md`.
