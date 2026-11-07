@@ -227,4 +227,32 @@ mod tests {
         );
         assert_eq!(fs::metadata(paths.ledger()).unwrap().len(), MAX_LEDGER + 1);
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn compact_fails_when_it_cannot_claim_the_ledger() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            home: tmp.path().join("home"),
+        };
+        append(
+            &paths,
+            &Record {
+                ts: 1,
+                root: PathBuf::from("/x"),
+                workspace: None,
+                ms: 0,
+            },
+        );
+        let mode = |m| fs::set_permissions(&paths.home, fs::Permissions::from_mode(m)).unwrap();
+        mode(0o555);
+        let result = compact(&paths);
+        mode(0o755);
+        let err = format!("{:#}", result.unwrap_err());
+        assert!(err.contains("claiming the ledger"), "{err}");
+        // The records are still there for the next try.
+        assert!(paths.ledger().exists());
+        assert_eq!(compact(&paths).unwrap().roots.len(), 1);
+    }
 }

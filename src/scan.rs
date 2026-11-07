@@ -1283,4 +1283,159 @@ mod tests {
             [tmp.path().join("p/a/target")]
         );
     }
+
+    /// A 60-byte archive member header.
+    fn header(name: &str, size: &str, end: &str) -> Vec<u8> {
+        format!(
+            "{name:<16}{:<12}{:<6}{:<6}{:<8}{size:<10}{end}",
+            0, 0, 0, 644
+        )
+        .into_bytes()
+    }
+
+    fn archive_parses(bytes: Vec<u8>) -> bool {
+        archive_names(&mut io::Cursor::new(bytes), &mut HashSet::new())
+    }
+
+    #[test]
+    fn malformed_archives_do_not_parse() {
+        // A header cut short.
+        assert!(!archive_parses(header("a.o", "4", "`\n")[..30].to_vec()));
+        // A header that doesn't end as headers do.
+        assert!(!archive_parses(header("a.o", "4", "xx")));
+        // A size that isn't a number.
+        assert!(!archive_parses(header("a.o", "four", "`\n")));
+        // A BSD long name longer than its member.
+        assert!(!archive_parses(header("#1/9", "4", "`\n")));
+        // A BSD long name cut short.
+        let mut cut = header("#1/8", "8", "`\n");
+        cut.extend(b"abc");
+        assert!(!archive_parses(cut));
+        // A GNU name table too big to read, and one cut short.
+        assert!(!archive_parses(header("// ", "9999999999", "`\n")));
+        let mut cut = header("// ", "8", "`\n");
+        cut.extend(b"abc");
+        assert!(!archive_parses(cut));
+        // A well-formed member still parses.
+        let mut ok = header("a.x.0a.rcgu.o", "2", "`\n");
+        ok.extend(b"zz");
+        let mut names = HashSet::new();
+        assert!(archive_names(&mut io::Cursor::new(ok), &mut names));
+        assert_eq!(names, HashSet::from(["a.x.0a.rcgu.o".to_owned()]));
+    }
+
+    fn macho_parses(dir: &Path, words: &[u32]) -> bool {
+        let path = dir.join("bin");
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        fs::write(&path, bytes).unwrap();
+        let mut file = BufReader::new(File::open(&path).unwrap());
+        // The magic is read before the rest is parsed.
+        file.read_exact(&mut [0u8; 8]).unwrap();
+        macho_names(&mut file, &mut HashSet::new())
+    }
+
+    #[test]
+    fn malformed_mach_o_files_do_not_parse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let head = |count: u32, size: u32| vec![MH_MAGIC_64, 0, 0, 2, count, size, 0, 0];
+        // A header cut short.
+        assert!(!macho_parses(dir, &[MH_MAGIC_64, 0, 0, 2]));
+        // Load commands too big to believe, and ones cut short.
+        assert!(!macho_parses(dir, &head(1, 32 << 20)));
+        assert!(!macho_parses(dir, &head(1, 64)));
+        // More commands than the commands' size holds.
+        let mut words = head(2, 8);
+        words.extend([0x19, 8]);
+        assert!(!macho_parses(dir, &words));
+        // A command too small to step past.
+        let mut words = head(1, 8);
+        words.extend([0x19, 4]);
+        assert!(!macho_parses(dir, &words));
+        // No symbol table.
+        assert!(!macho_parses(dir, &head(0, 0)));
+        // A file that doesn't parse is searched in full.
+        let path = dir.join("named");
+        let mut bytes: Vec<u8> = head(0, 0).iter().flat_map(|w| w.to_le_bytes()).collect();
+        bytes.extend(b" app.x.0a.rcgu.o ");
+        fs::write(&path, bytes).unwrap();
+        assert_eq!(
+            named_objects(&path),
+            HashSet::from(["app.x.0a.rcgu.o".to_owned()])
+        );
+    }
+
+    #[test]
+    fn a_missing_output_names_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(named_objects(&tmp.path().join("missing")).is_empty());
+    }
+
+    #[test]
+    fn only_rcgu_objects_count_as_names() {
+        let mut names = HashSet::new();
+        find_names(b"a.rcgu.x b.rcgu.dwo c.rcgu.otmp d.rcgu.o", &mut names);
+        assert_eq!(
+            names,
+            HashSet::from(["b.rcgu.dwo".to_owned(), "d.rcgu.o".to_owned()])
+        );
+    }
+
+    #[test]
+    fn a_read_error_ends_reading() {
+        struct Failing;
+        impl Read for Failing {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("broken"))
+            }
+        }
+        assert_eq!(read_up_to(&mut Failing, &mut [0u8; 4]), 0);
+    }
+
+    #[test]
+    fn a_superseded_session_without_a_lock_file_is_still_returned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("app-1a2b3c");
+        write(&cache.join("s-h1aaaa-xyz1-3abc/dep-graph.bin"), b"g");
+        // A name that doesn't follow rustc's pattern has no lock to find.
+        write(&cache.join("s-h0odd/dep-graph.bin"), b"g");
+        write(&cache.join("s-h2bbbb-xyz2-4def/dep-graph.bin"), b"g");
+        File::open(cache.join("s-h1aaaa-xyz1-3abc"))
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(3600)))
+            .unwrap();
+        File::open(cache.join("s-h0odd"))
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(7200)))
+            .unwrap();
+        let mut found = superseded_sessions(&cache);
+        found.sort();
+        assert_eq!(
+            found,
+            [cache.join("s-h0odd"), cache.join("s-h1aaaa-xyz1-3abc")]
+        );
+    }
+
+    #[test]
+    fn object_names_without_an_invocation_are_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp.path().join("plain.rcgu.o"), b"o");
+        assert!(stale_objects_in(tmp.path(), no_grace()).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn objects_that_cannot_be_examined_are_left_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("deps");
+        for invocation in ["0a", "0b"] {
+            write(&dir.join(obj("app-1", "x", invocation)), b"o");
+        }
+        // Listable, but its entries can't be looked up.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o444)).unwrap();
+        let stale = stale_objects_in(&dir, no_grace());
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(stale.is_empty(), "{}", stale.len());
+    }
 }

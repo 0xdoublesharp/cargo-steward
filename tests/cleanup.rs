@@ -278,3 +278,77 @@ fn remove_worktree_fails_for_a_missing_or_non_cargo_dir() {
     let out = fx.steward_fails(&["remove", "--worktree", plain.to_str().unwrap()]);
     assert!(out.contains("cargo metadata"), "{out}");
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn gc_apply_shares_duplicates_across_the_dirs_it_keeps() {
+    let fx = Fixture::new("");
+    let (a, b) = duplicate_pair(&fx);
+    let out = fx.steward(&["gc", "--apply"]);
+    assert!(
+        out.contains("identical files now shared across build dirs (2 files)"),
+        "{out}"
+    );
+    assert!(a.exists() && b.exists(), "{out}");
+}
+
+#[test]
+fn gc_verbose_counts_the_stale_object_files() {
+    let fx = Fixture::new("");
+    let root = fx.root.join("target");
+    let unit = root.join("debug/build/app/0123456789abcdef");
+    fs::create_dir_all(unit.join("fingerprint")).unwrap();
+    fs::create_dir_all(unit.join("out")).unwrap();
+    fs::write(
+        root.join("CACHEDIR.TAG"),
+        "Signature: x\n# created by cargo.\n",
+    )
+    .unwrap();
+    fs::write(unit.join("fingerprint/bin-app"), "x").unwrap();
+    let old = unit.join("out/app.x.0old.rcgu.o");
+    fs::write(&old, "o").unwrap();
+    age(&old, DAY);
+    fs::write(unit.join("out/app.x.0new.rcgu.o"), "o").unwrap();
+    let out = fx.steward(&["gc", "--verbose"]);
+    assert!(out.contains("1 files, "), "{out}");
+    assert!(old.exists(), "a dry run removes nothing");
+}
+
+#[test]
+fn remove_worktree_follows_the_proxy_route_without_the_process_guard() {
+    let fx = Fixture::new("process-guard = false\ntarget-root = \"ROUTED\"\n");
+    let routed = fx.root.join("routed");
+    let config = fx.home.join("config.toml");
+    let settings = fs::read_to_string(&config).unwrap();
+    fs::write(
+        &config,
+        settings.replace("ROUTED", routed.to_str().unwrap()),
+    )
+    .unwrap();
+    let worktree = fx.root.join("wt");
+    fs::create_dir_all(&worktree).unwrap();
+    let out = Command::new(BIN)
+        .args([
+            "remove",
+            "--apply",
+            "--worktree",
+            worktree.to_str().unwrap(),
+        ])
+        .env("CARGO_STEWARD_HOME", &fx.home)
+        .env_remove("CARGO")
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO_BUILD_TARGET_DIR")
+        .output()
+        .unwrap();
+    let out = text(&out);
+    // No cargo metadata needed: the route says where it builds.
+    assert!(
+        out.contains(&format!("builds into {}", routed.display())),
+        "{out}"
+    );
+
+    // Nor does removing a build dir look for programs running from it.
+    let dir = fx.build_dir("old", DAY);
+    let out = fx.steward(&["remove", "--apply", dir.to_str().unwrap()]);
+    assert!(!dir.exists(), "{out}");
+}

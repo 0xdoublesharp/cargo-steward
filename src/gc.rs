@@ -1523,4 +1523,138 @@ mod tests {
         // The merged registry was saved.
         assert_eq!(ledger::load(&paths), registry);
     }
+
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn stale_objects_of_several_units_are_counted_together() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = build_dir(tmp.path(), "target");
+        let out = root.join("debug/build/app/0123456789abcdef/out");
+        make(&root.join("debug/build/app/0123456789abcdef/fingerprint/bin-app"));
+        for unit in ["app-aaaa", "lib-bbbb"] {
+            for (invocation, age) in [("0old", 3600), ("0new", 0)] {
+                let path = out.join(format!("{unit}.x.{invocation}.rcgu.o"));
+                make(&path);
+                set_modified(&path, Duration::from_secs(age));
+            }
+        }
+        let dirs = vec![BuildDir::inspect(&root, None)];
+        let actions = run_clean(&dirs, false);
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        assert_eq!(actions[0].kind, Kind::StaleObjects);
+        assert_eq!(actions[0].files, 2);
+        assert_eq!(actions[0].note, "2 units");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_session_that_cannot_be_removed_is_left_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = build_dir(tmp.path(), "target");
+        let cache = root.join("debug/incremental/app-1a2b");
+        make(&root.join("debug/.fingerprint/app-0123456789abcdef/bin-app"));
+        make(&cache.join("s-h1aaaa-xyz1-3abc/dep-graph.bin"));
+        make(&cache.join("s-h2bbbb-xyz2-4def/dep-graph.bin"));
+        age(&cache.join("s-h1aaaa-xyz1-3abc"), Duration::from_secs(3600));
+        let dirs = vec![BuildDir::inspect(&root, None)];
+        // Nothing in the cache can be renamed or unlinked.
+        set_mode(&cache, 0o555);
+        let actions = run_clean(&dirs, true);
+        set_mode(&cache, 0o755);
+        let kinds: Vec<Kind> = actions.iter().map(|a| a.kind).collect();
+        assert_eq!(kinds, [Kind::OldSessions]);
+        assert!(cache.join("s-h1aaaa-xyz1-3abc").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_build_dir_that_cannot_be_removed_is_not_reported_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("locked");
+        let root = build_dir(&parent, "target");
+        make(&root.join("debug/.fingerprint/a-0123456789abcdef/lib-a"));
+        age(&root, 400 * DAY);
+        let dirs = vec![BuildDir::inspect(&root, None)];
+        set_mode(&parent, 0o555);
+        let actions = run_clean(&dirs, true);
+        set_mode(&parent, 0o755);
+        assert!(actions.iter().all(|a| a.path != root), "{actions:?}");
+        assert!(root.exists());
+    }
+
+    #[test]
+    fn volumes_skip_dirs_without_a_device() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = build_dir(tmp.path(), "target");
+        let mut dir = BuildDir::inspect(&root, None);
+        dir.device = None;
+        assert!(Volume::measure(&[dir]).is_empty());
+    }
+
+    #[test]
+    fn low_space_skips_a_volume_it_cannot_measure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = build_dir(tmp.path(), "target");
+        make(&root.join("debug/.fingerprint/a-0123456789abcdef/lib-a"));
+        age(&root, 3 * DAY);
+        let dir = BuildDir::inspect(&root, None);
+        assert!(dir.device.is_some());
+        fs::remove_dir_all(tmp.path()).unwrap();
+        let mut policy = policy();
+        policy.min_free = u64::MAX / 2;
+        policy.target_free = u64::MAX / 2;
+        let running = Running::default();
+        let cleanup = free_space(
+            &[dir],
+            &BTreeSet::new(),
+            &[],
+            sweep(&policy, &running, false),
+        );
+        assert!(cleanup.actions.is_empty());
+    }
+
+    /// Low-space dirs: `n` build dirs idle for a few days.
+    fn low_space_dirs(parent: &Path, n: usize) -> Vec<BuildDir> {
+        (0..n)
+            .map(|i| {
+                let root = build_dir(parent, &format!("t{i}"));
+                make(&root.join("debug/.fingerprint/a-0123456789abcdef/lib-a"));
+                age(&root, (3 + i as u32) * DAY);
+                BuildDir::inspect(&root, None)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn low_space_stops_once_the_target_is_met() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = low_space_dirs(tmp.path(), 2);
+        let mut policy = policy();
+        policy.min_free = u64::MAX / 2;
+        // Already above the target: nothing is evicted.
+        policy.target_free = 0;
+        let running = Running::default();
+        let cleanup = free_space(&dirs, &BTreeSet::new(), &[], sweep(&policy, &running, true));
+        assert!(cleanup.actions.is_empty(), "{:?}", cleanup.actions);
+        assert!(dirs.iter().all(|d| d.root.exists()));
+    }
+
+    #[test]
+    fn low_space_rereads_free_space_after_each_removal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = low_space_dirs(tmp.path(), 2);
+        let mut policy = policy();
+        policy.min_free = u64::MAX / 2;
+        policy.target_free = u64::MAX / 2;
+        let running = Running::default();
+        let cleanup = free_space(&dirs, &BTreeSet::new(), &[], sweep(&policy, &running, true));
+        // The disk never gets that free, so both go.
+        assert_eq!(cleanup.actions.len(), 2, "{:?}", cleanup.actions);
+        assert!(cleanup.actions.iter().all(|a| a.kind == Kind::LowSpace));
+        assert!(dirs.iter().all(|d| !d.root.exists()));
+    }
 }

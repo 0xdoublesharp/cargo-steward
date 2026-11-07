@@ -787,4 +787,123 @@ mod tests {
         let summary = dedup(&twice, false).unwrap();
         assert_eq!(summary.files, 0);
     }
+
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    fn candidate(path: &Path, profile: &Path) -> Candidate {
+        Candidate {
+            path: path.to_path_buf(),
+            profile: profile.to_path_buf(),
+            meta: fs::symlink_metadata(path).unwrap(),
+            clone_id: None,
+        }
+    }
+
+    #[test]
+    fn a_volume_that_cannot_clone_is_skipped_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut dirs = fixture(tmp.path());
+        // Gone since it was found: it can't be asked whether it clones.
+        let gone = tmp.path().join("gone");
+        for dir in &mut dirs {
+            dir.root = gone.clone();
+        }
+        let summary = dedup(&dirs, false).unwrap();
+        assert_eq!(summary.unsupported_volumes, 1);
+        assert_eq!(summary.files, 0);
+    }
+
+    #[test]
+    fn replace_skips_a_duplicate_changed_since_comparing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kept = tmp.path().join("kept");
+        let dup = tmp.path().join("dup");
+        fs::write(&kept, b"same").unwrap();
+        fs::write(&dup, b"same").unwrap();
+        let class = vec![
+            vec![candidate(&kept, tmp.path())],
+            vec![candidate(&dup, tmp.path())],
+        ];
+        fs::write(&dup, b"diff").unwrap();
+        let mut summary = Summary::default();
+        let group = replace_class(class, true, &mut summary).unwrap();
+        assert!(group.replaced.is_empty());
+        assert_eq!((summary.skipped, summary.files), (1, 0));
+        assert_eq!(fs::read(&dup).unwrap(), b"diff");
+    }
+
+    #[test]
+    fn replace_skips_a_path_without_a_file_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kept = tmp.path().join("kept");
+        fs::write(&kept, b"same").unwrap();
+        let root = candidate(Path::new("/"), tmp.path());
+        assert!(matches!(
+            replace(&candidate(&kept, tmp.path()), &root),
+            Replaced::Skipped
+        ));
+    }
+
+    #[test]
+    fn replace_skips_when_the_clone_cannot_be_made() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kept = tmp.path().join("kept");
+        fs::write(&kept, b"same").unwrap();
+        let ro = tmp.path().join("ro");
+        fs::create_dir(&ro).unwrap();
+        let dup = ro.join("dup");
+        fs::write(&dup, b"same").unwrap();
+        let (k, d) = (candidate(&kept, tmp.path()), candidate(&dup, tmp.path()));
+        set_mode(&ro, 0o555);
+        let replaced = replace(&k, &d);
+        set_mode(&ro, 0o755);
+        assert!(matches!(replaced, Replaced::Skipped));
+        assert_eq!(fsutil::entries(&ro).count(), 1, "nothing left behind");
+    }
+
+    #[test]
+    fn replace_skips_when_the_clone_cannot_take_the_duplicates_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kept = tmp.path().join("kept");
+        fs::write(&kept, b"same").unwrap();
+        // A non-empty directory where the duplicate was: a file can't
+        // be renamed over it.
+        let dup = tmp.path().join("dup");
+        fs::create_dir(&dup).unwrap();
+        fs::write(dup.join("inside"), b"x").unwrap();
+        let replaced = replace(&candidate(&kept, tmp.path()), &candidate(&dup, tmp.path()));
+        assert!(matches!(replaced, Replaced::Skipped));
+        assert!(dup.join("inside").exists());
+        assert!(
+            fsutil::entries(tmp.path()).all(|(n, _)| !n.contains(TEMP_MARK)),
+            "temporary file left behind"
+        );
+    }
+
+    #[test]
+    fn files_that_cannot_be_examined_are_not_candidates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = tmp.path().join("debug");
+        let hidden = profile.join("deps");
+        fs::create_dir_all(&hidden).unwrap();
+        fs::write(hidden.join("big"), vec![1u8; MIN_SIZE as usize]).unwrap();
+        fs::write(profile.join("seen"), vec![1u8; MIN_SIZE as usize]).unwrap();
+        // Listable, but its entries can't be looked up.
+        set_mode(&hidden, 0o444);
+        let found = collect(&profile);
+        set_mode(&hidden, 0o755);
+        let names: Vec<&Path> = found.iter().map(|c| c.path.as_path()).collect();
+        assert_eq!(names, [profile.join("seen").as_path()]);
+    }
+
+    #[test]
+    fn a_read_error_is_not_a_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut dir = File::open(tmp.path()).unwrap();
+        assert!(read_full(&mut dir, &mut [0u8; 8]).is_err());
+        assert!(same_contents(tmp.path(), tmp.path()).is_err());
+    }
 }

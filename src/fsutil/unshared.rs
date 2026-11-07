@@ -223,4 +223,11 @@ mod tests {
         assert_eq!(usage.private, Some(0));
         assert!(usage.allocated >= 8 << 20, "{usage:?}");
     }
+
+    /// devfs keeps no private sizes.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_filesystem_that_cannot_tell_gives_none() {
+        assert_eq!(private_size(Path::new("/dev/null")), None);
+    }
 }
