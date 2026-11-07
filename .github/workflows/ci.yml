@@ -52,3 +52,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      - name: Shellcheck
+        run: shellcheck scripts/install.sh
+
+  install:
+    name: Install script (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: Swatinem/rust-cache@v2
+      # `sh` is dash on Ubuntu, which keeps the script POSIX. Setup runs
+      # against the runner's own Cargo config, which is thrown away after.
+      - run: sh scripts/install.sh --scan-root "$RUNNER_TEMP"
+      - run: cargo steward --version

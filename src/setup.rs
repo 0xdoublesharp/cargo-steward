@@ -1,6 +1,11 @@
 //! `cargo steward setup`: makes cargo-steward cargo's `rustc-wrapper` in the
 //! user-wide Cargo config, keeping whatever wrapper was there (such as
 //! sccache) as the inner wrapper, and writes cargo-steward's own settings.
+//! On a first run it also finds where build output already goes and adds
+//! those places as scan roots; on macOS it can create a build volume.
+
+mod roots;
+mod volume;
 
 use std::env;
 use std::fs;
@@ -26,8 +31,12 @@ pub struct Args {
     /// Don't clean up automatically after builds
     #[arg(long)]
     no_auto_gc: bool,
+    /// macOS: create (or reuse) the APFS volume /Volumes/NAME in the system
+    /// disk's container for build output, and add it as a scan root
+    #[arg(long, value_name = "NAME")]
+    volume: Option<String>,
     /// Put the previous wrapper back and remove what setup added to Cargo's config
-    #[arg(long, conflicts_with_all = ["inner", "scan_roots", "build_dir", "no_auto_gc"])]
+    #[arg(long, conflicts_with_all = ["inner", "scan_roots", "build_dir", "no_auto_gc", "volume"])]
     undo: bool,
     /// Show the changes without making them
     #[arg(long)]
@@ -65,10 +74,38 @@ pub fn run(args: &Args) -> Result<()> {
         }
         settings.inner_wrapper = inner.filter(|i| !i.is_empty());
         settings.auto_gc = !args.no_auto_gc;
+        let mut new_roots = Vec::new();
+        if let Some(name) = &args.volume {
+            let mount = volume::run(name, args.dry_run)?;
+            // In a dry run the volume may not exist yet.
+            new_roots.push(mount.canonicalize().unwrap_or(mount));
+        }
         for root in &args.scan_roots {
-            let root = root
-                .canonicalize()
-                .with_context(|| format!("scan root {}", root.display()))?;
+            new_roots.push(
+                root.canonicalize()
+                    .with_context(|| format!("scan root {}", root.display()))?,
+            );
+        }
+        if new_roots.is_empty() && settings.scan_roots.is_empty() {
+            let detected = roots::detect(&roots::Sources {
+                target_dir_env: env::var_os("CARGO_TARGET_DIR")
+                    .filter(|v| !v.is_empty())
+                    .map(PathBuf::from),
+                cargo_config: Some(&doc),
+                cargo_home: cargo_home.clone(),
+                recorded: roots::recorded_build_dirs(&paths),
+                home: env::var_os("HOME").map(PathBuf::from),
+            });
+            if !detected.is_empty() {
+                println!("No scan roots were configured; adding where build output already goes:");
+                for d in &detected {
+                    println!("  {}  ({})", d.root.display(), d.reason);
+                }
+                println!();
+            }
+            new_roots.extend(detected.into_iter().map(|d| d.root));
+        }
+        for root in new_roots {
             if !settings.scan_roots.contains(&root) {
                 settings.scan_roots.push(root);
             }
@@ -84,6 +121,17 @@ pub fn run(args: &Args) -> Result<()> {
 
     let updated = doc.to_string();
     print_plan(&cargo_config, &original, &updated, &paths, &settings);
+    if args.undo {
+        print_other_pieces(&paths);
+    } else if let Some(name) = &args.volume
+        && args.build_dir.is_none()
+    {
+        println!(
+            "\nTo send every workspace's build output to the volume:\n  \
+             cargo steward setup --build-dir {}",
+            shell_quote(&Path::new("/Volumes").join(name).join("cargo-build"))
+        );
+    }
     if args.dry_run {
         println!("\n(dry run: nothing written)");
         return Ok(());
@@ -217,6 +265,34 @@ fn print_plan(
     }
 }
 
+/// `setup --undo` reverts only what setup itself changed; these pieces are
+/// installed and removed by their own commands.
+fn print_other_pieces(paths: &Paths) {
+    println!(
+        "\nsetup --undo doesn't remove these, which may also be installed:\n  \
+         git hooks that seed new worktrees   cargo steward hooks status    (remove: cargo steward hooks uninstall)\n  \
+         the cargo proxy                     cargo steward shim status     (remove: cargo steward shim uninstall)\n  \
+         settings and records                {}\n  \
+         the binary                          cargo uninstall cargo-steward\n\
+         See docs/install.md, \"Uninstall\".",
+        paths.home.display()
+    );
+}
+
+/// Quotes a path for a shell command line when it needs it.
+pub fn shell_quote(path: &Path) -> String {
+    let text = path.display().to_string();
+    if !text.is_empty()
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/._-+@%:,=".contains(&b))
+    {
+        text
+    } else {
+        format!("'{}'", text.replace('\'', r"'\''"))
+    }
+}
+
 /// An environment variable outranks the config file, which would bypass
 /// cargo-steward.
 fn warn_about_overrides() {
@@ -270,6 +346,13 @@ mod tests {
         let mut settings = Config::default();
         undo(&mut doc, &mut settings, true);
         assert_eq!(doc.to_string().trim(), "");
+    }
+
+    #[test]
+    fn quotes_paths_for_the_shell() {
+        assert_eq!(shell_quote(Path::new("/a/b-c_d.e")), "/a/b-c_d.e");
+        assert_eq!(shell_quote(Path::new("/a/b c")), "'/a/b c'");
+        assert_eq!(shell_quote(Path::new("/a/it's")), r"'/a/it'\''s'");
     }
 
     #[test]
