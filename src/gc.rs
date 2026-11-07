@@ -189,22 +189,57 @@ pub fn inventory(
     } else {
         ledger::peek(paths)
     };
-    let mut registry = Registry::default();
-    for (root, info) in &compacted.roots {
-        if let Some(root) = scan::find_root(root) {
-            registry.roots.entry(root).or_default().absorb(info);
-        }
-    }
+    let registry = resolve_registry(&compacted, MOUNT_CONTAINERS);
     if write && registry != compacted {
         ledger::save(paths, &registry)?;
     }
-    let mut roots: Vec<PathBuf> = registry.roots.keys().cloned().collect();
+    let mut roots: Vec<PathBuf> = registry
+        .roots
+        .keys()
+        .filter(|root| root.exists())
+        .cloned()
+        .collect();
     roots.extend(scan::discover(scan_roots, SCAN_DEPTH));
     let roots = scan::outermost(roots);
     let dirs = fsutil::parallel_map(&roots, |root| {
         BuildDir::inspect(root, registry.roots.get(root))
     });
     Ok((registry, dirs))
+}
+
+/// Where volumes are mounted: macOS's `/Volumes`, and Linux's `/media`,
+/// `/media/<user>`, `/run/media/<user>` and `/mnt`.
+const MOUNT_CONTAINERS: &[&str] = &["/Volumes", "/media", "/run/media", "/mnt"];
+
+/// The registry with each entry re-resolved to its build directory's root.
+/// Entries whose directory is gone are dropped, unless the volume it was on
+/// isn't mounted (an external or scratch disk): its history (workspaces,
+/// compile time) is kept for when it's back.
+fn resolve_registry(compacted: &Registry, containers: &[&str]) -> Registry {
+    let mut registry = Registry::default();
+    for (root, info) in &compacted.roots {
+        if let Some(found) = scan::find_root(root) {
+            registry.roots.entry(found).or_default().absorb(info);
+        } else if on_missing_volume(root, containers) {
+            registry.roots.entry(root.clone()).or_default().absorb(info);
+        }
+    }
+    registry
+}
+
+/// Whether `path` is on a volume that isn't mounted: the nearest of its
+/// ancestors that exists is a mount container itself (or a user's directory
+/// in `/media` or `/run/media`).
+fn on_missing_volume(path: &Path, containers: &[&str]) -> bool {
+    let Some(existing) = path.ancestors().skip(1).find(|a| a.exists()) else {
+        return false;
+    };
+    let is_container = |dir: &Path| containers.iter().any(|c| dir == Path::new(c));
+    is_container(existing)
+        || (existing.parent().is_some_and(is_container)
+            && existing
+                .parent()
+                .is_some_and(|p| p.ends_with("media") || p.ends_with("run/media")))
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -2083,5 +2118,32 @@ mod tests {
             .collect();
         // `du` counts the clones in full; only the unique one frees its size.
         assert_eq!(order.first(), Some(&tmp.path().join("unique")), "{order:?}");
+    }
+
+    #[test]
+    fn keeps_the_history_of_build_dirs_on_an_unmounted_volume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let volumes = base.join("Volumes");
+        fs::create_dir_all(volumes.join("Mounted/ws")).unwrap();
+        let containers = [volumes.to_str().unwrap()];
+        let info = RootInfo {
+            last_used: 5,
+            workspaces: [base.join("ws")].into(),
+            compile_ms: 7,
+        };
+        let mut recorded = Registry::default();
+        // Its volume isn't mounted: kept.
+        let away = volumes.join("Scratch/cargo/ws/target");
+        // Deleted from a mounted volume, or from anywhere else: dropped.
+        let deleted = volumes.join("Mounted/ws/target");
+        let elsewhere = base.join("home/ws/target");
+        for root in [&away, &deleted, &elsewhere] {
+            recorded.roots.insert(root.clone(), info.clone());
+        }
+        let resolved = resolve_registry(&recorded, &containers);
+        assert_eq!(resolved.roots.keys().collect::<Vec<_>>(), [&away]);
+        assert_eq!(resolved.roots[&away], info);
+        assert!(!on_missing_volume(&elsewhere, &containers));
     }
 }
