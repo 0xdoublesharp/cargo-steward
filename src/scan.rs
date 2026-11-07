@@ -666,7 +666,7 @@ fn archive_names(file: &mut (impl Read + Seek), names: &mut HashSet<String>) -> 
             return false;
         }
     }
-    find_names(&text, names);
+    find_names(&text, false, names);
     true
 }
 
@@ -733,7 +733,7 @@ fn search_names(reader: &mut impl Read, names: &mut HashSet<String>) {
             Ok(n) => n,
         };
         buf.truncate(kept + read);
-        find_names(&buf, names);
+        find_names(&buf, kept > 0, names);
         buf.drain(..buf.len().saturating_sub(OVERLAP));
     }
 }
@@ -745,7 +745,12 @@ fn is_name_byte(b: &u8) -> bool {
 /// Adds every object file name in `buf`: a run of name bytes ending in one
 /// of [`OBJECT_SUFFIXES`] and not followed by more (`x.rcgu.o.tmp` isn't
 /// one).
-fn find_names(buf: &[u8], names: &mut HashSet<String>) {
+///
+/// `carried`: `buf` starts with the end of the previous read, so a name
+/// reaching back to its first byte may have begun before it. Such a name
+/// was already found whole in that read (names are shorter than the bytes
+/// carried over), and is skipped rather than recorded cut short.
+fn find_names(buf: &[u8], carried: bool, names: &mut HashSet<String>) {
     const MARK: &[u8] = b".rcgu.";
     let mut at = 0;
     while let Some(dot) = buf[at..].iter().position(|&b| b == b'.') {
@@ -769,6 +774,10 @@ fn find_names(buf: &[u8], names: &mut HashSet<String>) {
             .iter()
             .rposition(|b| !is_name_byte(b))
             .map_or(0, |i| i + 1);
+        if start == 0 && carried {
+            at = end;
+            continue;
+        }
         names.insert(String::from_utf8_lossy(&buf[start..end]).into_owned());
         at = end;
     }
@@ -1456,7 +1465,7 @@ mod tests {
     #[test]
     fn only_rcgu_objects_count_as_names() {
         let mut names = HashSet::new();
-        find_names(b"a.rcgu.x b.rcgu.dwo c.rcgu.otmp d.rcgu.o", &mut names);
+        find_names(b"a.rcgu.x b.rcgu.dwo c.rcgu.otmp d.rcgu.o", false, &mut names);
         assert_eq!(
             names,
             HashSet::from(["b.rcgu.dwo".to_owned(), "d.rcgu.o".to_owned()])
@@ -1551,5 +1560,20 @@ mod tests {
 
         write(&fingerprint.join("lib-serde.json"), b"{\"deps\": 5}");
         assert!(!v2_unit_nodes(&tmp.path().join("debug"))[0].readable);
+    }
+
+    #[test]
+    fn a_name_carried_into_the_next_read_isnt_recorded_cut_short() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output = tmp.path().join("bin");
+        let name = "clap_builder-a75bec2d0da09b09.clap_builder.65f45cd6fef9cfe4-cgu.06.rcgu.o";
+        // Whole in the first read, but starting before the 256 bytes carried
+        // into the second, which then begin partway into it.
+        let mut contents = vec![0u8; (1 << 20) - 280];
+        contents.extend(name.as_bytes());
+        contents.resize(1 << 20, 0);
+        contents.extend([0u8; 1000]);
+        write(&output, &contents);
+        assert_eq!(named_objects(&output), HashSet::from([name.to_owned()]));
     }
 }
