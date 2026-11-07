@@ -203,6 +203,8 @@ pub struct Options {
     /// Started by the wrapper: quiet, low priority, one at a time.
     pub auto: bool,
     pub verbose: bool,
+    /// The command that produced the report, for its closing hint.
+    pub command: &'static str,
 }
 
 pub fn run(options: Options) -> Result<()> {
@@ -664,6 +666,7 @@ pub fn remove_requested(roots: &[PathBuf], apply: bool, force: bool) -> Result<(
             apply,
             auto: false,
             verbose: true,
+            command: "remove",
         },
     );
     Ok(())
@@ -902,7 +905,10 @@ fn report(cleanup: &Cleanup, freed: &[(PathBuf, i128)], options: Options) {
         println!(
             "\nSizes count blocks shared with APFS or btrfs clones in full; the disk's free space\nis what actually changes."
         );
-        println!("Run `cargo steward gc --apply` to remove these.");
+        println!(
+            "Run `cargo steward {} --apply` to remove these.",
+            options.command
+        );
     }
 }
 

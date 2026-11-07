@@ -167,6 +167,7 @@ fn main() -> ExitCode {
                 apply: apply || auto,
                 auto,
                 verbose,
+                command: "gc",
             })
         }
         Cmd::Pin { dir } => pin(&dir, true),
