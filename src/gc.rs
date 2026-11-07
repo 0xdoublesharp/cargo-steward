@@ -47,6 +47,7 @@ const MAX_LOG: u64 = 1 << 20;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Kind {
     StaleObjects,
+    OldSessions,
     LegacyLayout,
     IdleIncremental,
     IdleUnit,
@@ -59,6 +60,7 @@ impl Kind {
     pub fn describe(self) -> &'static str {
         match self {
             Kind::StaleObjects => "stale object files",
+            Kind::OldSessions => "superseded incremental sessions",
             Kind::LegacyLayout => "old-layout build files",
             Kind::IdleIncremental => "idle incremental caches",
             Kind::IdleUnit => "idle build units",
@@ -470,10 +472,36 @@ fn clean_profile(profile: &Profile, pinned: bool, sweep: Sweep) -> Cleanup {
             remove_dated(Kind::IdleUnit, &unit, sweep, &mut out);
         }
     }
+    let mut sessions: Vec<PathBuf> = Vec::new();
     for cache in scan::incremental_dirs(&profile.path) {
         if idle(cache.last_used, policy.incremental_idle) {
             remove_dated(Kind::IdleIncremental, &cache, sweep, &mut out);
+        } else {
+            sessions.extend(scan::superseded_sessions(&cache.path));
         }
+    }
+    if !sessions.is_empty() {
+        // Each session directory, and the lock file next to it.
+        let session_dirs: Vec<&PathBuf> = sessions.iter().filter(|p| p.is_dir()).collect();
+        let count = session_dirs.len();
+        let bytes: u64 = session_dirs.iter().map(|d| fsutil::tree_size(d)).sum();
+        if sweep.apply {
+            for path in &sessions {
+                if let Err(e) = fsutil::remove(path) {
+                    eprintln!(
+                        "warning: cargo-steward: failed to remove {}: {e}",
+                        path.display()
+                    );
+                }
+            }
+        }
+        out.actions.push(Action {
+            kind: Kind::OldSessions,
+            path: profile.path.join("incremental"),
+            files: 0,
+            bytes,
+            note: format!("{count} sessions"),
+        });
     }
     out
 }
@@ -1019,6 +1047,28 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    #[test]
+    fn removes_superseded_incremental_sessions_and_keeps_the_live_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = build_dir(tmp.path(), "target");
+        let cache = root.join("debug/incremental/app-1a2b");
+        make(&root.join("debug/.fingerprint/app-0123456789abcdef/bin-app"));
+        make(&cache.join("s-h1aaaa-xyz1-3abc/dep-graph.bin"));
+        make(&cache.join("s-h1aaaa-xyz1.lock"));
+        make(&cache.join("s-h2bbbb-xyz2-4def/dep-graph.bin"));
+        make(&cache.join("s-h2bbbb-xyz2.lock"));
+        age(&cache.join("s-h1aaaa-xyz1-3abc"), Duration::from_secs(3600));
+
+        let dirs = vec![BuildDir::inspect(&root, None)];
+        let actions = run_clean(&dirs, true);
+        let kinds: Vec<Kind> = actions.iter().map(|a| a.kind).collect();
+        assert_eq!(kinds, [Kind::OldSessions]);
+        assert!(!cache.join("s-h1aaaa-xyz1-3abc").exists());
+        assert!(!cache.join("s-h1aaaa-xyz1.lock").exists());
+        assert!(cache.join("s-h2bbbb-xyz2-4def/dep-graph.bin").exists());
+        assert!(cache.join("s-h2bbbb-xyz2.lock").exists());
     }
 
     #[test]

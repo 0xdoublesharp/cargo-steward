@@ -242,6 +242,47 @@ pub fn incremental_dirs(profile: &Path) -> Vec<Dated> {
         .collect()
 }
 
+/// Finalized incremental sessions that a newer finalized session of the same
+/// cache has replaced, with their `.lock` files.
+///
+/// rustc only ever loads a cache's newest finalized session
+/// (`s-<time>-<random>-<hash>/`), and deletes the older ones itself the next
+/// time that crate compiles; until then they are dead weight, often as big
+/// as the live session. Each is removed whole, as rustc would. In-progress
+/// sessions (`...-working`) are never included.
+pub fn superseded_sessions(cache: &Path) -> Vec<PathBuf> {
+    let mut finalized: Vec<(SystemTime, String, PathBuf)> = entries(cache)
+        .filter(|(name, path)| {
+            name.starts_with("s-") && !name.ends_with("-working") && path.is_dir()
+        })
+        .filter_map(|(name, path)| {
+            let modified = fs::metadata(&path).and_then(|m| m.modified()).ok()?;
+            Some((modified, name, path))
+        })
+        .collect();
+    if finalized.len() < 2 {
+        return Vec::new();
+    }
+    finalized.sort();
+    let newest = finalized.last().map(|(t, _, _)| *t);
+    let mut out = Vec::new();
+    for (modified, name, path) in finalized {
+        if Some(modified) == newest {
+            continue;
+        }
+        // `s-<time>-<random>-<hash>` locks as `s-<time>-<random>.lock`.
+        let parts: Vec<&str> = name.splitn(4, '-').collect();
+        if let [s, time, random, _] = parts.as_slice() {
+            let lock = cache.join(format!("{s}-{time}-{random}.lock"));
+            if lock.is_file() {
+                out.push(lock);
+            }
+        }
+        out.push(path);
+    }
+    out
+}
+
 /// When an old-layout build last used this profile.
 pub fn legacy_last_used(profile: &Path) -> Option<SystemTime> {
     let mut newest = None;
@@ -1189,6 +1230,36 @@ mod tests {
         );
         assert!(!is_cargo_root(&registry));
         assert!(discover(&[tmp.path().to_path_buf()], 8).is_empty());
+    }
+
+    #[test]
+    fn only_superseded_finalized_sessions_are_returned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("app-1a2b3c");
+        let old = "s-h1aaaa-xyz1-3abc";
+        let new = "s-h2bbbb-xyz2-4def";
+        let working = "s-h3cccc-xyz3-working";
+        for name in [old, new, working] {
+            write(&cache.join(name).join("dep-graph.bin"), b"g");
+        }
+        for lock in [
+            "s-h1aaaa-xyz1.lock",
+            "s-h2bbbb-xyz2.lock",
+            "s-h3cccc-xyz3.lock",
+        ] {
+            write(&cache.join(lock), b"");
+        }
+        let past = SystemTime::now() - Duration::from_secs(3600);
+        File::open(cache.join(old))
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(past))
+            .unwrap();
+        let mut found = superseded_sessions(&cache);
+        found.sort();
+        assert_eq!(found, [cache.join(old), cache.join("s-h1aaaa-xyz1.lock")]);
+        // A single finalized session is the live one.
+        fs::remove_dir_all(cache.join(new)).unwrap();
+        assert!(superseded_sessions(&cache).is_empty());
     }
 
     #[test]
