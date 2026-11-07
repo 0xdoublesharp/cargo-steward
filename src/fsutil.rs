@@ -472,6 +472,14 @@ mod tests {
         fs::write(tmp.path().join("a"), vec![1u8; 256 * 1024]).unwrap();
         fs::create_dir(tmp.path().join("sub")).unwrap();
         fs::write(tmp.path().join("sub/b"), vec![2u8; 64 * 1024]).unwrap();
+        // Flush so the blocks are allocated before either measurement; APFS
+        // can allocate delayed writes between them.
+        for f in ["a", "sub/b"] {
+            fs::File::open(tmp.path().join(f))
+                .unwrap()
+                .sync_all()
+                .unwrap();
+        }
         let usage = tree_usage(tmp.path());
         assert_eq!(usage.allocated, tree_size(tmp.path()));
         if let Some(private) = usage.private {
@@ -492,5 +500,88 @@ mod tests {
     fn formats_sizes() {
         assert_eq!(human(512), "512 B");
         assert_eq!(human(3 << 29), "1.5 GiB");
+    }
+
+    #[cfg(unix)]
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn usage_counts_symlinks_as_private() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("a"), vec![1u8; 64 * 1024]).unwrap();
+        std::os::unix::fs::symlink("a", tmp.path().join("link")).unwrap();
+        let usage = tree_usage(tmp.path());
+        assert_eq!(usage.allocated, tree_size(tmp.path()));
+        assert!(
+            usage.private.is_none_or(|p| p == usage.allocated),
+            "{usage:?}"
+        );
+        assert_eq!(tree_private_size(tmp.path()), usage.private);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walks_past_entries_it_cannot_look_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hidden = tmp.path().join("hidden");
+        fs::create_dir(&hidden).unwrap();
+        fs::write(hidden.join("a"), vec![1u8; 64 * 1024]).unwrap();
+        // Listable, but its entries can't be looked up.
+        set_mode(&hidden, 0o444);
+        let mut visited = Vec::new();
+        walk_files(tmp.path(), |p, _| visited.push(p.to_path_buf()));
+        set_mode(&hidden, 0o755);
+        assert!(visited.is_empty(), "{visited:?}");
+    }
+
+    #[test]
+    fn a_profile_whose_lock_files_cannot_be_made_is_not_busy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("missing");
+        assert!(matches!(lock_profile(&missing), Lock::Held(held) if held.is_empty()));
+    }
+
+    #[test]
+    fn remove_reports_a_path_it_cannot_look_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("file");
+        fs::write(&file, "x").unwrap();
+        // A path through a file isn't missing, it's an error.
+        let err = remove(&file.join("below")).unwrap_err();
+        assert_ne!(err.kind(), io::ErrorKind::NotFound);
+        assert!(file.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_empties_a_directory_it_cannot_rename_aside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("parent");
+        let dir = parent.join("victim");
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        fs::write(dir.join("sub/file"), "x").unwrap();
+        set_mode(&parent, 0o555);
+        let result = remove(&dir);
+        set_mode(&parent, 0o755);
+        // Deleted in place as far as the read-only parent allows.
+        assert!(result.is_err());
+        assert_eq!(entries(&dir).count(), 0);
+        assert_eq!(entries(&parent).count(), 1, "no trash left behind");
+    }
+
+    #[test]
+    fn sweep_trash_finishes_interrupted_removals_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let trash = tmp.path().join(format!("{TRASH_PREFIX}old-1-0"));
+        fs::create_dir_all(trash.join("deep")).unwrap();
+        fs::write(trash.join("deep/file"), "x").unwrap();
+        fs::create_dir(tmp.path().join("kept")).unwrap();
+        sweep_trash(tmp.path());
+        assert!(!trash.exists());
+        assert!(tmp.path().join("kept").exists());
     }
 }
