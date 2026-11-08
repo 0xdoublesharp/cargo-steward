@@ -116,7 +116,16 @@ mod tests {
         assert!(taken(0) && taken(1));
         assert_eq!(holder(&dir, 0), Some(std::process::id()));
         drop(first);
-        assert!(!taken(0) && taken(1));
+        // A process another test thread forks at that moment can hold a copy
+        // of the descriptor until it execs: allow a moment.
+        let released = (0..50).any(|_| {
+            let free = !taken(0);
+            if !free {
+                thread::sleep(Duration::from_millis(20));
+            }
+            free
+        });
+        assert!(released && taken(1));
         let _again = acquire(&dir, 2).unwrap();
         assert!(taken(0));
         drop(second);
