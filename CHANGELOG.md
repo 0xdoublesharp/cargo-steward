@@ -90,6 +90,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   out `orphan-grace`, with the TMPDIRs the proxy routed for them. It takes
   cargo's locks and keeps directories a program runs from, as `remove` does;
   pinned ones need `--force`.
+- Cleanup removes TMPDIRs the proxy routed (`<tmp-root>/<repo>/<worktree>`,
+  under each configured `tmp-root`) whose build directory is gone, once
+  nothing in them has changed for `orphan-grace`, such as those of worktrees
+  deleted before cleanup removed them along with the build directory.
 - `link-target` setting for the `cargo` proxy: when it routes a workspace's
   build output, it also points a missing `<workspace>/target` at the routed
   directory (only where git ignores `target`), so `./target` paths and builds

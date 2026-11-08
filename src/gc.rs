@@ -58,6 +58,8 @@ pub enum Kind {
     /// The TMPDIR the `cargo` proxy routed for a build directory removed
     /// whole.
     RoutedTmp,
+    /// A TMPDIR the `cargo` proxy routed for a build directory that is gone.
+    LeftoverTmp,
 }
 
 impl Kind {
@@ -73,6 +75,7 @@ impl Kind {
             Kind::LowSpace => "build dirs removed for free space",
             Kind::Requested => "build dirs removed on request",
             Kind::RoutedTmp => "temporary dirs the proxy routed for them",
+            Kind::LeftoverTmp => "temporary dirs of build dirs already gone",
         }
     }
 }
@@ -313,15 +316,13 @@ pub fn run(options: Options) -> Result<()> {
     } else {
         Vec::new()
     };
-    let mut cleanup = clean(
-        &dirs,
-        Sweep {
-            policy: &policy,
-            running: &running,
-            now: SystemTime::now(),
-            apply: options.apply,
-        },
-    );
+    let sweep = Sweep {
+        policy: &policy,
+        running: &running,
+        now: SystemTime::now(),
+        apply: options.apply,
+    };
+    let mut cleanup = clean(&dirs, sweep);
     let freed: Vec<(PathBuf, i128)> = volumes
         .iter()
         .filter(|v| {
@@ -335,6 +336,7 @@ pub fn run(options: Options) -> Result<()> {
 
     let tmp = remove_routed_tmp_dirs(&config, &cleanup.actions, options.apply);
     cleanup.actions.extend(tmp);
+    cleanup.absorb(remove_leftover_tmp_dirs(&config, sweep));
     for action in cleanup.actions.iter().filter(|a| a.kind >= Kind::Orphaned) {
         registry.roots.remove(&action.path);
     }
@@ -778,35 +780,41 @@ fn remove_build_dir(
     if !sweep.apply {
         return remove_dir(kind, &dir.root, note, bytes, trash, sweep, out);
     }
-    // The profiles seen when the directory was inspected, and any a build
-    // has started since (`--release`, another `--target`): list again after
-    // locking until no new one turns up.
+    let Some(locks) = lock_build_dir(&dir.root, &dir.profiles) else {
+        return Removal::Busy;
+    };
+    let removal = remove_dir(kind, &dir.root, note, bytes, trash, sweep, out);
+    drop(locks);
+    removal
+}
+
+/// Takes cargo's locks on every profile of the build directory at `root`:
+/// those in `known` (seen when it was inspected), and any a build has started
+/// since (`--release`, another `--target`), listing again after locking
+/// until no new one turns up. `None` when a build holds one.
+fn lock_build_dir(root: &Path, known: &[Profile]) -> Option<Vec<Lock>> {
     let mut locks = Vec::new();
     let mut locked: BTreeSet<PathBuf> = BTreeSet::new();
     loop {
         // A set: a second lock on the same file conflicts with the first,
         // even in one process.
-        let listed: BTreeSet<PathBuf> = dir
-            .profiles
+        let listed: BTreeSet<PathBuf> = known
             .iter()
             .map(|p| p.path.clone())
-            .chain(scan::profiles(&dir.root).into_iter().map(|p| p.path))
+            .chain(scan::profiles(root).into_iter().map(|p| p.path))
             .filter(|p| !locked.contains(p))
             .collect();
         if listed.is_empty() {
-            break;
+            return Some(locks);
         }
         for profile in listed {
             match fsutil::lock_profile(&profile) {
-                Lock::Busy => return Removal::Busy,
+                Lock::Busy => return None,
                 held => locks.push(held),
             }
             locked.insert(profile);
         }
     }
-    let removal = remove_dir(kind, &dir.root, note, bytes, trash, sweep, out);
-    drop(locks);
-    removal
 }
 
 /// Removes the TMPDIRs the `cargo` proxy routed for build directories that
@@ -844,6 +852,113 @@ fn remove_routed_tmp_dirs(config: &config::Config, actions: &[Action], apply: bo
         });
     }
     out
+}
+
+/// Removes the TMPDIRs the `cargo` proxy routed for build directories that
+/// are gone some other way (deleted by hand, or before cleanup removed
+/// routed TMPDIRs with their build directories) once nothing in them has
+/// been modified for `orphan-grace` ([`crate::proxy::orphaned_tmp_dirs`]). A
+/// cargo build directory inside one (a test's) is locked like any other
+/// before it goes.
+fn remove_leftover_tmp_dirs(config: &config::Config, sweep: Sweep) -> Cleanup {
+    let mut out = Cleanup::default();
+    let cutoff = sweep
+        .now
+        .checked_sub(sweep.policy.orphan_grace)
+        .unwrap_or(UNIX_EPOCH);
+    for (tmp, build) in crate::proxy::orphaned_tmp_dirs(config) {
+        let Some(contents) = TmpContents::read(&tmp, cutoff) else {
+            continue;
+        };
+        if let Some(process) = sweep.running.inside(&tmp) {
+            out.skipped.push(Skipped {
+                kind: Kind::LeftoverTmp,
+                path: tmp,
+                reason: format!(
+                    "{} is running from it (pid {})",
+                    process.exe.display(),
+                    process.pid
+                ),
+            });
+            continue;
+        }
+        let mut locks = Vec::new();
+        if sweep.apply {
+            let mut busy = false;
+            for root in &contents.build_dirs {
+                match lock_build_dir(root, &[]) {
+                    Some(held) => locks.extend(held),
+                    None => busy = true,
+                }
+            }
+            if busy {
+                continue;
+            }
+            if let Err(e) = fsutil::remove(&tmp) {
+                eprintln!(
+                    "warning: cargo-steward: failed to remove {}: {e}",
+                    tmp.display()
+                );
+                continue;
+            }
+        }
+        drop(locks);
+        out.actions.push(Action {
+            kind: Kind::LeftoverTmp,
+            path: tmp,
+            files: 0,
+            bytes: contents.bytes,
+            note: format!(
+                "unmodified for {}; {} is gone",
+                fsutil::ago(contents.modified),
+                build.display()
+            ),
+        });
+    }
+    out
+}
+
+/// What a leftover TMPDIR holds.
+struct TmpContents {
+    /// The newest modification time in it, its own included.
+    modified: SystemTime,
+    bytes: u64,
+    /// Cargo build directories inside it.
+    build_dirs: Vec<PathBuf>,
+}
+
+impl TmpContents {
+    /// Reads `dir`'s tree, without following symlinks. `None` if anything in
+    /// it was modified after `cutoff`, or it can't be read.
+    fn read(dir: &Path, cutoff: SystemTime) -> Option<TmpContents> {
+        let meta = fs::symlink_metadata(dir).ok()?;
+        let mut contents = TmpContents {
+            modified: meta.modified().ok()?,
+            bytes: 0,
+            build_dirs: Vec::new(),
+        };
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(current) = stack.pop() {
+            for entry in fs::read_dir(&current).ok()?.flatten() {
+                let meta = entry.metadata().ok()?;
+                contents.modified = contents.modified.max(meta.modified().ok()?);
+                if contents.modified > cutoff {
+                    return None;
+                }
+                contents.bytes += fsutil::allocated(&meta);
+                let name = entry.file_name();
+                if meta.is_dir() {
+                    stack.push(entry.path());
+                } else if ((name == ".rustc_info.json" || name == ".rustc-info.json")
+                    || (name == "CACHEDIR.TAG" && scan::is_cargo_root(&current)))
+                    && !contents.build_dirs.contains(&current)
+                {
+                    contents.build_dirs.push(current.clone());
+                }
+            }
+        }
+        (contents.modified <= cutoff).then_some(contents)
+    }
 }
 
 /// Removes whole build directories on request (`cargo steward remove`), the
@@ -1887,9 +2002,64 @@ mod tests {
             Kind::Idle,
             Kind::LowSpace,
             Kind::Requested,
+            Kind::RoutedTmp,
+            Kind::LeftoverTmp,
         ];
         let described: BTreeSet<&str> = kinds.iter().map(|k| k.describe()).collect();
         assert_eq!(described.len(), kinds.len());
+    }
+
+    #[test]
+    fn removes_routed_tmp_dirs_left_without_their_build_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let config = config::Config {
+            target_root: Some(base.join("{label}/cargo")),
+            tmp_root: Some(base.join("{label}/tmp")),
+            ..config::Config::default()
+        };
+        let repo = "proj-0123456789";
+        let tmp_of = |key: &str| base.join("proj/tmp").join(repo).join(key);
+        fs::create_dir_all(base.join("proj/cargo").join(repo).join("live")).unwrap();
+        for key in ["live", "old", "recent", "built", "busy"] {
+            make(&tmp_of(key).join("t/file"));
+        }
+        // Tests' cargo build directories inside two of them, one of which a
+        // build holds.
+        for key in ["built", "busy"] {
+            let inner = tmp_of(key).join("case/target");
+            make(&inner.join(".rustc_info.json"));
+            make(&inner.join("debug/.cargo-lock"));
+        }
+        let held = fsutil::lock_profile(&tmp_of("busy").join("case/target/debug"));
+        assert!(matches!(held, Lock::Held(_)));
+        for key in ["live", "old", "built", "busy"] {
+            age(&tmp_of(key), 3 * DAY);
+        }
+        let policy = policy();
+        let running = Running::default();
+        let listed = |cleanup: &Cleanup| {
+            let mut paths: Vec<PathBuf> = cleanup.actions.iter().map(|a| a.path.clone()).collect();
+            paths.sort();
+            paths
+        };
+
+        let preview = remove_leftover_tmp_dirs(&config, sweep(&policy, &running, false));
+        assert_eq!(
+            listed(&preview),
+            [tmp_of("built"), tmp_of("busy"), tmp_of("old")]
+        );
+        assert!(preview.actions[0].note.contains(" is gone"));
+        assert!(tmp_of("old").exists());
+
+        let applied = remove_leftover_tmp_dirs(&config, sweep(&policy, &running, true));
+        assert_eq!(listed(&applied), [tmp_of("built"), tmp_of("old")]);
+        assert!(!tmp_of("old").exists() && !tmp_of("built").exists());
+        // Its build dir exists, it changed lately, or a build holds what's
+        // inside it: kept.
+        assert!(tmp_of("live").exists() && tmp_of("recent").exists());
+        assert!(tmp_of("busy").exists());
+        drop(held);
     }
 
     #[test]

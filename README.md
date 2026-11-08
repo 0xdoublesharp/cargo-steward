@@ -113,6 +113,7 @@ Cheapest-to-rebuild first. Every threshold is a setting.
 | A crate's incremental cache | Unused for `incremental-idle` (7 days) | That crate compiles from scratch once |
 | A build unit (new layout) | Unused for `unit-idle` (14 days), and no unit used since was built from it (cargo's fingerprints link them) | That unit rebuilds if needed again |
 | A whole build directory | Every workspace that built there is deleted: at once when each was a linked worktree that git has removed (`git worktree remove`, `prune`), else after `orphan-grace` (2 days); or unused for `dir-idle` (21 days) | Full rebuild |
+| A worktree's TMPDIR the proxy routed (`tmp-root`) | With its build directory; or, when that build directory is gone, once nothing in it has changed for `orphan-grace` | None |
 | Whole build directories, cheapest to rebuild first (idle time × unshared size ÷ recorded compile time) | The disk has under `min-free` (50 GiB) free; until it has `target-free` (100 GiB), or until removals stop raising free space (local snapshots or clones holding it). Never one used within `recent-guard` (1 day) | Full rebuild |
 
 Safety:

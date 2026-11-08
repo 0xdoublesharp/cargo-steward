@@ -397,6 +397,126 @@ pub fn routed_tmp_dir(config: &Config, build_dir: &Path) -> Option<PathBuf> {
     None
 }
 
+/// The TMPDIRs the proxy routed whose build directories are gone, each with
+/// that build directory's path: every `<tmp-root>/<repo>/<key>` under a
+/// configured `tmp-root` (top-level and per route, `{label}` matched against
+/// what's there) whose `<target-root>/<repo>/<key>` doesn't exist. Only
+/// directories named as the proxy names them, and only where that
+/// `target-root` exists (not on a volume that isn't mounted).
+pub fn orphaned_tmp_dirs(config: &Config) -> Vec<(PathBuf, PathBuf)> {
+    let pairs = std::iter::once((&config.target_root, &config.tmp_root))
+        .chain(config.routes.iter().map(|r| (&r.target_root, &r.tmp_root)));
+    let mut found: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for (target_root, tmp_root) in pairs {
+        let (Some(target_root), Some(tmp_root)) = (target_root, tmp_root) else {
+            continue;
+        };
+        for (label, tmp_root) in label_roots(tmp_root) {
+            for repo in fs::read_dir(&tmp_root).into_iter().flatten().flatten() {
+                let name = repo.file_name().to_string_lossy().into_owned();
+                let Some(repo_label) = proxy_repo_label(&name) else {
+                    continue;
+                };
+                if !repo.file_type().is_ok_and(|t| t.is_dir())
+                    || label.as_deref().is_some_and(|l| l != repo_label)
+                {
+                    continue;
+                }
+                let expanded = target_root.to_string_lossy().replace("{label}", repo_label);
+                let Ok(target_root) = root(Path::new(&expanded)) else {
+                    continue;
+                };
+                if !target_root.is_dir() {
+                    continue;
+                }
+                for key in crate::fsutil::subdirs(&repo.path()) {
+                    let Some(key_name) = key.file_name() else {
+                        continue;
+                    };
+                    if key_name
+                        .to_string_lossy()
+                        .starts_with(crate::fsutil::TRASH_PREFIX)
+                    {
+                        continue;
+                    }
+                    let build = target_root.join(&name).join(key_name);
+                    let gone = fs::symlink_metadata(&build)
+                        .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+                    if gone
+                        && !build.starts_with(&key)
+                        && !key.starts_with(&target_root)
+                        && !found.iter().any(|(t, _)| *t == key)
+                    {
+                        found.push((key, build));
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
+/// The label of a repository directory the proxy names, `<label>-<10 hex
+/// digits>` ([`route::repo_name`]).
+fn proxy_repo_label(name: &str) -> Option<&str> {
+    let (label, hash) = name.rsplit_once('-')?;
+    let named = hash.len() == 10
+        && hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    named.then_some(label)
+}
+
+/// The directories a root setting names: itself, or with `{label}` in it,
+/// each existing directory that matches, with its label.
+fn label_roots(setting: &Path) -> Vec<(Option<String>, PathBuf)> {
+    let Ok(full) = root(setting) else {
+        return Vec::new();
+    };
+    let text = full.to_string_lossy().into_owned();
+    if !text.contains("{label}") {
+        return vec![(None, full)];
+    }
+    let parts: Vec<&std::ffi::OsStr> = full.iter().collect();
+    let Some(at) = parts
+        .iter()
+        .position(|p| p.to_string_lossy().contains("{label}"))
+    else {
+        return Vec::new();
+    };
+    let parent: PathBuf = parts[..at].iter().collect();
+    let pattern = parts[at].to_string_lossy().into_owned();
+    let Some((prefix, suffix)) = pattern.split_once("{label}") else {
+        return Vec::new();
+    };
+    let mut roots = Vec::new();
+    for name in crate::fsutil::subdirs(&parent)
+        .filter_map(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()))
+    {
+        let Some(label) = name
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix(suffix))
+        else {
+            continue;
+        };
+        if label.is_empty()
+            || !label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            continue;
+        }
+        let expanded = PathBuf::from(text.replace("{label}", label));
+        if expanded.is_dir() {
+            roots.push((Some(label.to_owned()), expanded));
+        }
+    }
+    roots
+}
+
 /// Works out the routing, creates the directories, seeds a new worktree's
 /// target directory, and returns the variables to set. Nothing (and no
 /// subprocess) when no root is set or a target directory is already chosen.
@@ -1021,6 +1141,65 @@ mod tests {
         fs::write(target.join("keep"), "").unwrap();
         vars_of(&config, None, Ok(wt), &build, Some(&me));
         assert_eq!(fs::read_to_string(&log).unwrap().lines().count(), 1);
+    }
+
+    #[test]
+    fn finds_routed_tmpdirs_whose_build_dirs_are_gone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let config = Config {
+            target_root: Some(base.join("{label}/cargo")),
+            tmp_root: Some(base.join("{label}/tmp")),
+            routes: vec![config::Route {
+                path: "/w/big".into(),
+                target_root: Some(base.join("big/cargo")),
+                tmp_root: Some(base.join("big/tmp")),
+                max_builds: None,
+                force: false,
+            }],
+            ..Config::default()
+        };
+        let dirs = [
+            "a/cargo/a-0123456789/main",
+            "a/tmp/a-0123456789/main",
+            "a/tmp/a-0123456789/gone",
+            // Labelled for another root than the one it's in.
+            "a/tmp/b-0123456789/gone",
+            // Not named as the proxy names repositories.
+            "a/tmp/a-xyz/gone",
+            "a/tmp/a-0123456789/.steward-trash-x",
+            "big/cargo/big-fedcba9876/wt",
+            "big/tmp/big-fedcba9876/gone",
+            // Its target root doesn't exist (a volume that isn't mounted).
+            "c/tmp/c-0123456789/gone",
+        ];
+        for dir in dirs {
+            fs::create_dir_all(base.join(dir)).unwrap();
+        }
+        let mut found = orphaned_tmp_dirs(&config);
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                (
+                    base.join("a/tmp/a-0123456789/gone"),
+                    base.join("a/cargo/a-0123456789/gone")
+                ),
+                (
+                    base.join("big/tmp/big-fedcba9876/gone"),
+                    base.join("big/cargo/big-fedcba9876/gone")
+                ),
+            ]
+        );
+        // Without a tmp-root, or with the TMPDIR inside the build dir's root,
+        // nothing.
+        let same = Config {
+            target_root: Some(base.join("a/tmp")),
+            tmp_root: Some(base.join("a/tmp")),
+            ..Config::default()
+        };
+        assert_eq!(orphaned_tmp_dirs(&same), []);
+        assert_eq!(orphaned_tmp_dirs(&Config::default()), []);
     }
 
     #[test]
