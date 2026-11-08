@@ -403,11 +403,9 @@ fn remove_takes_only_build_dirs_and_previews_first() {
 
 /// Two worktrees' builds started at once through the wrapper, sharing one
 /// cargo-steward home whose settings add `settings`. The inner wrapper is a
-/// script that marks each compile as running while it runs, and records an
-/// overlap when one starts while another runs. With `wait_for_peer`, each
-/// compile waits (up to a few seconds) for the other to start. Returns the
-/// steward home and the recorded log directory.
-fn concurrent_builds(settings: &str, wait_for_peer: bool) -> (tempfile::TempDir, PathBuf) {
+/// script that marks each compile as started, then waits for this process to
+/// release it. Returns whether both compiles reached the barrier together.
+fn concurrent_builds(settings: &str) -> (tempfile::TempDir, PathBuf, bool) {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
     let home = root.join("steward-home");
@@ -415,26 +413,20 @@ fn concurrent_builds(settings: &str, wait_for_peer: bool) -> (tempfile::TempDir,
     fs::create_dir_all(&home).unwrap();
     fs::create_dir_all(&log).unwrap();
     fs::write(home.join("config.toml"), settings).unwrap();
-    let pause = if wait_for_peer {
-        "i=0; while [ \"$(ls \"$log\" | grep -c '^started')\" -lt 2 ] && [ $i -lt 100 ]; do \
-         sleep 0.1; i=$((i+1)); done"
-    } else {
-        "sleep 1"
-    };
     let script = root.join("inner.sh");
     fs::write(
         &script,
         format!(
             "#!/bin/sh\n\
-             set -x\n\
              case \" $* \" in *\" --out-dir \"*) ;; *) exec \"$@\" ;; esac\n\
              log={log:?}\n\
-             mkdir \"$log/busy\" 2>/dev/null || echo overlap >> \"$log/overlaps\"\n\
              : > \"$log/started.$$\"\n\
-             {pause}\n\
-             \"$@\"; status=$?\n\
-             rmdir \"$log/busy\" 2>/dev/null\n\
-             exit $status\n",
+             i=0\n\
+             while [ ! -f \"$log/release\" ] && [ $i -lt 300 ]; do\n\
+               sleep 0.1; i=$((i+1))\n\
+             done\n\
+             [ -f \"$log/release\" ] || exit 1\n\
+             exec \"$@\"\n",
             log = log.display().to_string()
         ),
     )
@@ -444,7 +436,7 @@ fn concurrent_builds(settings: &str, wait_for_peer: bool) -> (tempfile::TempDir,
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
     }
     let cargo = std::env::var_os("STEWARD_TEST_CARGO").unwrap_or_else(|| env!("CARGO").into());
-    let builds: Vec<_> = ["one", "two"]
+    let mut builds: Vec<_> = ["one", "two"]
         .iter()
         .map(|name| {
             let project = root.join(name);
@@ -471,10 +463,31 @@ fn concurrent_builds(settings: &str, wait_for_peer: bool) -> (tempfile::TempDir,
                 .unwrap()
         })
         .collect();
+    let started = || {
+        fs::read_dir(&log)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("started."))
+            .count()
+    };
+    // Keep each compiler inside the wrapper until the parent has observed
+    // both. A fast compiler cannot finish before its peer is scheduled.
+    let overlapped = (0..100).any(|_| {
+        if started() == 2 {
+            return builds
+                .iter_mut()
+                .all(|build| build.try_wait().unwrap().is_none());
+        }
+        sleep(Duration::from_millis(50));
+        false
+    });
+    // Release even after a timeout: with one slot the second compile is
+    // expected to be blocked, and must still get a chance to finish.
+    fs::write(log.join("release"), "").unwrap();
     for build in builds {
         let out = build.wait_with_output().unwrap();
         // The harness shows successful child output only if the enclosing
-        // test fails, so concurrency failures retain the shell's timeline.
+        // test fails, so concurrency failures retain Cargo's diagnostics.
         eprintln!("{}", String::from_utf8_lossy(&out.stderr));
         assert!(
             out.status.success(),
@@ -482,21 +495,15 @@ fn concurrent_builds(settings: &str, wait_for_peer: bool) -> (tempfile::TempDir,
             String::from_utf8_lossy(&out.stderr)
         );
     }
-    let started = fs::read_dir(&log)
-        .unwrap()
-        .flatten()
-        .filter(|e| e.file_name().to_string_lossy().starts_with("started"))
-        .count();
-    assert_eq!(started, 2, "each build compiles once");
-    (tmp, home)
+    assert_eq!(started(), 2, "each build compiles once");
+    (tmp, home, overlapped)
 }
 
 #[test]
 fn max_compiles_runs_one_compile_at_a_time_across_builds() {
-    let (tmp, home) = concurrent_builds("max-compiles = 1\n", false);
-    let log = tmp.path().canonicalize().unwrap().join("log");
+    let (_tmp, home, overlapped) = concurrent_builds("max-compiles = 1\n");
     assert!(
-        !log.join("overlaps").exists(),
+        !overlapped,
         "two compiles ran at once despite max-compiles = 1"
     );
     // One slot, released: nothing holds it now.
@@ -507,11 +514,7 @@ fn max_compiles_runs_one_compile_at_a_time_across_builds() {
 
 #[test]
 fn without_max_compiles_compiles_run_at_once() {
-    let (tmp, home) = concurrent_builds("", true);
-    let log = tmp.path().canonicalize().unwrap().join("log");
-    assert!(
-        log.join("overlaps").exists(),
-        "the compiles should have run at the same time"
-    );
+    let (_tmp, home, overlapped) = concurrent_builds("");
+    assert!(overlapped, "the compiles should have run at the same time");
     assert!(!home.join("compile-slots").exists());
 }

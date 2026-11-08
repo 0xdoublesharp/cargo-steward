@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Compile-limit integration tests use a parent-controlled start/release
+  barrier instead of a shared busy-directory marker, so fast compiler
+  processes cannot make the overlap assertion depend on scheduling.
 - Release builds use the supported macOS 15 Apple Silicon runner. A manual
   workflow run can rebuild binaries from an existing release tag without
   republishing the crate.
