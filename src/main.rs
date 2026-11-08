@@ -10,6 +10,7 @@ mod dedup;
 mod doctor;
 mod fsutil;
 mod gc;
+mod json;
 mod ledger;
 mod proxy;
 mod scan;
@@ -56,6 +57,9 @@ enum Cmd {
         /// Measure each directory's size (slower)
         #[arg(long)]
         sizes: bool,
+        /// Print one JSON document instead of text
+        #[arg(long)]
+        json: bool,
     },
     /// Show what a cleanup would remove; with --apply, remove it
     Gc {
@@ -151,10 +155,11 @@ fn main() -> ExitCode {
     }
 
     let cli = Cli::parse_from(args);
+    let json = cli.command.json();
     let result = match cli.command {
         Cmd::Setup(args) => setup::run(&args),
         Cmd::Doctor => doctor::run(),
-        Cmd::Status { sizes } => status::run(sizes),
+        Cmd::Status { sizes, json } => status::run(sizes, json),
         Cmd::Gc {
             apply,
             verbose,
@@ -188,8 +193,25 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("error: {e:#}");
+            let message = format!("{e:#}");
+            eprintln!("error: {message}");
+            if json {
+                let _ = json::print(&json::Failure {
+                    version: json::VERSION,
+                    error: &message,
+                });
+            }
             ExitCode::FAILURE
+        }
+    }
+}
+
+impl Cmd {
+    /// Whether the command was asked for a JSON document.
+    fn json(&self) -> bool {
+        match self {
+            Cmd::Status { json, .. } => *json,
+            _ => false,
         }
     }
 }
