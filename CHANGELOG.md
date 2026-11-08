@@ -131,3 +131,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   until that crate's next compile.
 - `scripts/install.sh` for new machines (from source, git, or a release
   binary) and a release workflow building macOS and Linux binaries.
+
+### Changed
+
+- `object-grace` keeps replaced object files only while a program started
+  from their unit's binary or test executable (or the copy cargo uplifts)
+  runs, for up to that long; otherwise a rebuild keeps only the newest
+  generation, so an edit-test loop no longer keeps every generation from the
+  last 10 minutes. The wrapper and cleanup look for running programs only
+  when there are replaced objects within the grace. With
+  `process-guard = false`, the grace applies to every replaced object as
+  before.

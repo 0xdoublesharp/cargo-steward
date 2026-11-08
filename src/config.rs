@@ -134,11 +134,13 @@ pub struct Config {
     /// none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub previous_build_dir: Option<String>,
-    /// Keep replaced object files this long, so binaries that are still
-    /// running keep readable backtraces.
+    /// Keep replaced object files at most this long while a program
+    /// started from their unit's executable runs, so it keeps readable
+    /// backtraces.
     pub object_grace: String,
     /// Before removing a whole build directory, check that no running
-    /// process was started from it.
+    /// process was started from it; and keep replaced object files within
+    /// `object-grace` only for running programs (when off, for all of it).
     pub process_guard: bool,
     /// Run at most this many compiles at once, machine-wide. Unset or 0 for
     /// no limit.

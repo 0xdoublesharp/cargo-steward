@@ -356,7 +356,15 @@ impl Project {
             .unwrap();
             main.push_str(&format!("mod m{m};\n"));
         }
-        main.push_str("fn main() { println!(\"{}\", m1::f(1) + m2::f(1) + m3::f(1)); }\n");
+        // Keeps running when asked to, as a server or a slow test would.
+        main.push_str(
+            "fn main() {\n\
+             if std::env::var_os(\"GRACED_SLEEP\").is_some() {\n\
+             std::thread::sleep(std::time::Duration::from_secs(120));\n\
+             }\n\
+             println!(\"{}\", m1::f(1) + m2::f(1) + m3::f(1));\n\
+             }\n",
+        );
         fs::write(dir.join("src/main.rs"), main).unwrap();
         Project {
             target: fx.root.join("target"),
@@ -385,6 +393,31 @@ impl Project {
         assert!(out.status.success(), "{}", text(&out));
     }
 
+    /// Builds without the wrapper, so replaced objects stay for cleanup.
+    fn build_unwrapped(&self, fx: &Fixture) {
+        let out = self
+            .cargo(fx)
+            .env("RUSTC_WRAPPER", "")
+            .arg("build")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", text(&out));
+    }
+
+    /// Starts the built binary from the copy cargo uplifted into the
+    /// profile directory, kept running until dropped.
+    fn run(&self) -> Running {
+        let child = Command::new(self.target.join("debug/graced"))
+            .env("GRACED_SLEEP", "1")
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut running = Running(child);
+        sleep(Duration::from_millis(200));
+        assert!(running.0.try_wait().unwrap().is_none(), "it didn't start");
+        running
+    }
+
     fn edit(&self, n: u32) {
         let file = self.dir.join(format!("src/m{}.rs", n % 3 + 1));
         let mut source = fs::read_to_string(&file).unwrap();
@@ -411,9 +444,22 @@ impl Project {
     }
 }
 
+/// Whether the cargo under test leaves replaced objects behind: Cargo 1.101
+/// clears each unit's outputs before compiling it (rust-lang/cargo#17675),
+/// so nothing is left to keep.
+fn leaks(fx: &Fixture, project: &Project, generation: usize) -> bool {
+    sleep(Duration::from_millis(2200));
+    project.edit(100);
+    project.build_unwrapped(fx);
+    let leaked = project.objects() > generation;
+    project.build(fx);
+    leaked
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
-fn the_wrapper_keeps_replaced_objects_for_the_grace() {
-    let fx = Fixture::new("object-grace = \"3s\"\n");
+fn the_wrapper_keeps_replaced_objects_while_the_binary_runs() {
+    let fx = Fixture::new("");
     let project = Project::new(&fx);
     project.build(&fx);
     let generation = project.objects();
@@ -422,24 +468,55 @@ fn the_wrapper_keeps_replaced_objects_for_the_grace() {
     sleep(Duration::from_millis(2200));
     project.edit(0);
     project.build(&fx);
-    let after_quick_rebuild = project.objects();
-    if after_quick_rebuild == generation {
-        // This cargo clears each unit's outputs before compiling it
-        // (rust-lang/cargo#17675), so nothing is left to keep.
+    assert_eq!(
+        project.objects(),
+        generation,
+        "with nothing running, a rebuild within the grace keeps only the current objects"
+    );
+
+    let program = project.run();
+    sleep(Duration::from_millis(2200));
+    project.edit(1);
+    project.build(&fx);
+    let while_running = project.objects();
+    if while_running == generation && !leaks(&fx, &project, generation) {
         return;
     }
     assert_eq!(
-        after_quick_rebuild,
+        while_running,
         2 * generation,
-        "a rebuild within the grace keeps the previous objects"
+        "a rebuild while the binary runs keeps the objects it was linked from"
     );
 
-    sleep(Duration::from_secs(4));
-    project.edit(1);
+    drop(program);
+    sleep(Duration::from_millis(2200));
+    project.edit(2);
     project.build(&fx);
     assert_eq!(
         project.objects(),
         generation,
-        "past the grace, only the current objects stay"
+        "once it stops, only the current objects stay"
     );
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn gc_keeps_replaced_objects_while_the_binary_runs() {
+    let fx = Fixture::new("");
+    let project = Project::new(&fx);
+    project.build_unwrapped(&fx);
+    let generation = project.objects();
+    let program = project.run();
+    project.edit(0);
+    project.build_unwrapped(&fx);
+    if project.objects() == generation {
+        return; // This cargo leaves nothing behind.
+    }
+    // The program runs the previous build, from a copy cargo replaced.
+    let applied = fx.steward(&["gc", "--apply"]);
+    assert_eq!(project.objects(), 2 * generation, "{applied}");
+
+    drop(program);
+    let applied = fx.steward(&["gc", "--apply"]);
+    assert_eq!(project.objects(), generation, "{applied}");
 }

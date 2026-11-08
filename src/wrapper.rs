@@ -77,7 +77,7 @@ pub fn run(argv: Vec<OsString>) -> ! {
     };
     if status.success() {
         if let Some(fix) = fix {
-            fix.finish(object_grace(&config));
+            fix.finish(object_grace(&config), config.process_guard);
         }
         if let Some(paths) = &paths {
             after_compile(paths, &config, &out_dir, started.elapsed());
@@ -121,8 +121,8 @@ fn limit_from(var: Option<&OsStr>, setting: Option<u32>) -> Option<u32> {
     value.filter(|&n| n > 0)
 }
 
-/// How long replaced objects are kept for binaries that may still be
-/// running (`object-grace`).
+/// How long, at most, replaced objects are kept for a binary built from
+/// them that is still running (`object-grace`).
 fn object_grace(config: &Config) -> Duration {
     humantime::parse_duration(config.object_grace.trim()).unwrap_or(DEFAULT_OBJECT_GRACE)
 }
@@ -287,17 +287,21 @@ struct LeakFix {
     dir: PathBuf,
     before: Vec<OsString>,
     started: SystemTime,
+    /// The unit's executable before the compile replaced it, which a
+    /// program still running may have been started from (or from a copy).
+    exe: gc::UnitExe,
 }
 
 impl LeakFix {
     fn prepare(args: &RustcArgs, out_dir: &Path) -> Option<LeakFix> {
         // Legacy-layout units share `deps/`, so match `<crate><-hash>.`; in
         // the new layout the directory is the unit's own.
-        let prefix = format!(
-            "{}{}.",
+        let unit = format!(
+            "{}{}",
             args.crate_name.as_deref()?,
             args.extra_filename.as_deref().unwrap_or_default()
         );
+        let prefix = format!("{unit}.");
         let before: Vec<OsString> = fs::read_dir(out_dir)
             .ok()?
             .flatten()
@@ -307,10 +311,14 @@ impl LeakFix {
                     .is_some_and(|n| n.starts_with(&prefix) && scan::is_object(n))
             })
             .collect();
-        (!before.is_empty()).then(|| LeakFix {
+        if before.is_empty() {
+            return None;
+        }
+        Some(LeakFix {
             dir: out_dir.to_path_buf(),
             before,
             started: SystemTime::now(),
+            exe: gc::UnitExe::new(out_dir, &unit),
         })
     }
 
@@ -318,10 +326,13 @@ impl LeakFix {
     /// objects under new names (reused ones included), or rewrites them in
     /// place, so what keeps an old name and an old time is stale.
     ///
-    /// Objects modified within `grace` are kept anyway: a binary linked from
-    /// them may still be running, and its backtraces need them. A later
-    /// compile of the unit, or cleanup, removes them once they're older.
-    fn finish(self, grace: Duration) -> usize {
+    /// Objects modified within `grace` are kept while a program started
+    /// from the unit's executable runs: it may have been linked from them,
+    /// and its backtraces need them. Running programs are looked for only
+    /// when there are such objects; with `guard` off (`process-guard`), the
+    /// objects are kept for the whole grace. A later compile of the unit, or
+    /// cleanup, removes them once they're older.
+    fn finish(mut self, grace: Duration, guard: bool) -> usize {
         let before_compile = self
             .started
             .checked_sub(TIMESTAMP_SLACK)
@@ -329,18 +340,35 @@ impl LeakFix {
         let before_grace = SystemTime::now()
             .checked_sub(grace)
             .unwrap_or(SystemTime::UNIX_EPOCH);
-        let cutoff = before_compile.min(before_grace);
-        let mut removed = 0;
+        let mut stale: Vec<PathBuf> = Vec::new();
+        let mut recent: Vec<PathBuf> = Vec::new();
         for name in &self.before {
             let path = self.dir.join(name);
-            let stale = fs::symlink_metadata(&path)
-                .and_then(|m| m.modified())
-                .is_ok_and(|modified| modified < cutoff);
-            if stale && fs::remove_file(&path).is_ok() {
-                removed += 1;
+            let Ok(modified) = fs::symlink_metadata(&path).and_then(|m| m.modified()) else {
+                continue;
+            };
+            if modified < before_compile.min(before_grace) {
+                stale.push(path);
+            } else if modified < before_compile {
+                recent.push(path);
             }
         }
-        removed
+        if !recent.is_empty() && guard && !self.running() {
+            stale.append(&mut recent);
+        }
+        stale.iter().filter(|p| fs::remove_file(p).is_ok()).count()
+    }
+
+    /// Whether a program started from the unit's executable (as it was
+    /// before or after the compile, or a copy cargo uplifted) is running.
+    /// When that can't be told, as though one were.
+    fn running(&mut self) -> bool {
+        self.exe.look();
+        if !self.exe.exists() {
+            return false;
+        }
+        let running = gc::Running::collect_for(&self.exe);
+        !running.listed() || running.started_from(&self.exe).is_some()
     }
 }
 
@@ -492,8 +520,9 @@ mod tests {
         assert_eq!(probe.out_dir, None);
     }
 
-    #[test]
-    fn keeps_replaced_objects_within_the_grace() {
+    /// A unit with objects replaced 5 minutes and an hour ago, compiled
+    /// again, with `grace` and `guard`; returns the objects left.
+    fn compile_after_replacements(executable: bool, grace: Duration, guard: bool) -> Vec<String> {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         let now = SystemTime::now();
@@ -507,7 +536,6 @@ mod tests {
                 .set_modified(now - age)
                 .unwrap();
         };
-        // Replaced 5 minutes ago (its binary may still run) and an hour ago.
         made(
             "app-0123456789abcdef.x.0five.rcgu.o",
             Duration::from_secs(300),
@@ -516,6 +544,9 @@ mod tests {
             "app-0123456789abcdef.x.0hour.rcgu.o",
             Duration::from_secs(3600),
         );
+        if executable {
+            made("app-0123456789abcdef", Duration::from_secs(300));
+        }
         let parsed = RustcArgs::parse(&args(&[
             "--crate-name",
             "app",
@@ -526,15 +557,159 @@ mod tests {
         ]));
         let fix = LeakFix::prepare(&parsed, dir).unwrap();
         fs::write(dir.join("app-0123456789abcdef.x.0new.rcgu.o"), "new").unwrap();
-        assert_eq!(fix.finish(Duration::from_secs(600)), 1);
-        let mut left: Vec<String> = crate::fsutil::entries(dir).map(|(n, _)| n).collect();
+        fix.finish(grace, guard);
+        let mut left: Vec<String> = crate::fsutil::entries(dir)
+            .map(|(n, _)| n)
+            .filter(|n| scan::is_object(n))
+            .collect();
         left.sort();
+        left
+    }
+
+    /// Set for a copy of this test binary started as [`sleeper`]'s program.
+    const SLEEP_VAR: &str = "CARGO_STEWARD_TEST_WRAPPER_SLEEP";
+
+    /// Does nothing in a normal run. Started with [`SLEEP_VAR`] set, it is a
+    /// program that keeps running until killed.
+    #[test]
+    fn sleeper() {
+        if env::var_os(SLEEP_VAR).is_some() {
+            std::thread::sleep(Duration::from_secs(120));
+        }
+    }
+
+    /// Kills the child when dropped.
+    struct Child(std::process::Child);
+
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// Starts a copy of this test binary at `exe`, as a program run from a
+    /// build directory.
+    fn run_copy_at(exe: &Path) -> Child {
+        fs::copy(env::current_exe().unwrap(), exe).unwrap();
+        let child = Command::new(exe)
+            .args(["--exact", "wrapper::tests::sleeper", "-q"])
+            .env(SLEEP_VAR, "1")
+            .stdout(process::Stdio::null())
+            .stderr(process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut child = Child(child);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "the copy didn't start"
+        );
+        child
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn keeps_replaced_objects_while_a_program_from_the_unit_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = tmp.path().canonicalize().unwrap();
+        let deps = profile.join("deps");
+        fs::create_dir_all(&deps).unwrap();
+        let unit = "app-0123456789abcdef";
+        let five_minutes_ago = SystemTime::now() - Duration::from_secs(300);
+        let parsed = RustcArgs::parse(&args(&[
+            "--crate-name",
+            "app",
+            "-C",
+            "extra-filename=-0123456789abcdef",
+            "--out-dir",
+            deps.to_str().unwrap(),
+        ]));
+        let compile = |n: u32| {
+            let fix = LeakFix::prepare(&parsed, &deps).unwrap();
+            // The compile writes new objects and replaces the executable.
+            fs::write(deps.join(format!("{unit}.x.0gen{n}.rcgu.o")), "new").unwrap();
+            fs::remove_file(deps.join(unit)).ok();
+            fs::write(deps.join(unit), format!("binary {n}")).unwrap();
+            fix.finish(Duration::from_secs(600), true);
+            let mut left: Vec<String> = crate::fsutil::entries(&deps)
+                .map(|(n, _)| n)
+                .filter(|n| scan::is_object(n))
+                .collect();
+            left.sort();
+            left
+        };
+        let replaced = |n: u32| {
+            let path = deps.join(format!("{unit}.x.0gen{n}.rcgu.o"));
+            fs::write(&path, "o").unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(five_minutes_ago)
+                .unwrap();
+        };
+
+        // A test binary running from the output directory.
+        replaced(0);
+        let program = run_copy_at(&deps.join(unit));
         assert_eq!(
-            left,
+            compile(1),
             [
-                "app-0123456789abcdef.x.0five.rcgu.o",
-                "app-0123456789abcdef.x.0new.rcgu.o",
+                format!("{unit}.x.0gen0.rcgu.o"),
+                format!("{unit}.x.0gen1.rcgu.o")
             ]
+        );
+        drop(program);
+
+        // A binary running from the copy cargo uplifted, which is of the
+        // executable this compile replaces.
+        for name in ["0gen0", "0gen1"] {
+            fs::remove_file(deps.join(format!("{unit}.x.{name}.rcgu.o"))).unwrap();
+        }
+        replaced(2);
+        fs::remove_file(deps.join(unit)).unwrap();
+        let program = run_copy_at(&profile.join("app"));
+        fs::copy(profile.join("app"), deps.join(unit)).unwrap();
+        assert_eq!(
+            compile(3),
+            [
+                format!("{unit}.x.0gen2.rcgu.o"),
+                format!("{unit}.x.0gen3.rcgu.o")
+            ]
+        );
+        drop(program);
+
+        // Nothing runs any more: the replaced generation goes.
+        fs::File::options()
+            .write(true)
+            .open(deps.join(format!("{unit}.x.0gen3.rcgu.o")))
+            .unwrap()
+            .set_modified(five_minutes_ago)
+            .unwrap();
+        assert_eq!(compile(4), [format!("{unit}.x.0gen4.rcgu.o")]);
+    }
+
+    #[test]
+    fn keeps_replaced_objects_within_the_grace_only_for_running_programs() {
+        let ten_minutes = Duration::from_secs(600);
+        let newest = ["app-0123456789abcdef.x.0new.rcgu.o"];
+        let with_recent = [
+            "app-0123456789abcdef.x.0five.rcgu.o",
+            "app-0123456789abcdef.x.0new.rcgu.o",
+        ];
+        // Nothing runs from the unit's executable (a library has none): only
+        // the newest generation stays, however recent the others.
+        assert_eq!(compile_after_replacements(false, ten_minutes, true), newest);
+        assert_eq!(compile_after_replacements(true, ten_minutes, true), newest);
+        // With the process guard off, the grace alone decides.
+        assert_eq!(
+            compile_after_replacements(true, ten_minutes, false),
+            with_recent
+        );
+        assert_eq!(
+            compile_after_replacements(false, Duration::ZERO, false),
+            newest
         );
     }
 
@@ -598,7 +773,7 @@ mod tests {
         // The compile rewrites one numbered object in place and adds new ones.
         fs::write(dir.join("app-0123456789abcdef.app.12-cgu.0.rcgu.o"), "new").unwrap();
         fs::write(dir.join("app-0123456789abcdef.x.0new.rcgu.o"), "new").unwrap();
-        assert_eq!(fix.finish(Duration::ZERO), 1);
+        assert_eq!(fix.finish(Duration::ZERO, true), 1);
 
         let mut left: Vec<String> = crate::fsutil::entries(dir).map(|(n, _)| n).collect();
         left.sort();

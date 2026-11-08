@@ -446,13 +446,20 @@ pub fn object_dirs(profile: &Profile) -> Vec<PathBuf> {
 /// debug map lists its objects; an rlib holds them as members) and returns
 /// the rest. When no output names any, the newest invocation is kept.
 ///
-/// An invocation whose newest object was modified at or after `keep_after`
-/// is always kept: a binary linked from it may still be running, and needs
-/// it for symbolized backtraces (`object-grace`).
+/// An older invocation whose newest object was modified at or after
+/// `keep_after` (within `object-grace`) is kept while a binary linked from
+/// it may still be running, which needs it for symbolized backtraces:
+/// while `running(unit)` says a process was started from the unit's
+/// executable, asked only when there is such an invocation. Without
+/// `running` (the process guard is off), it is always kept.
 ///
 /// Non-incremental objects (`...-cgu.<n>.rcgu.o`) are overwritten in place by
 /// each compile and are left alone.
-pub fn stale_objects_in(dir: &Path, keep_after: SystemTime) -> Vec<StaleObjects> {
+pub fn stale_objects_in(
+    dir: &Path,
+    keep_after: SystemTime,
+    running: Option<&dyn Fn(&str) -> bool>,
+) -> Vec<StaleObjects> {
     struct Object {
         name: String,
         path: PathBuf,
@@ -514,7 +521,7 @@ pub fn stale_objects_in(dir: &Path, keep_after: SystemTime) -> Vec<StaleObjects>
             .filter(|(_, objects)| newest(objects).is_some_and(|t| t >= keep_after))
             .map(|(invocation, _)| invocation.as_str())
             .collect();
-        if recent.len() == invocations.len() {
+        if running.is_none() && recent.len() == invocations.len() {
             // Nothing old enough to remove: no need to read the outputs.
             continue;
         }
@@ -548,7 +555,11 @@ pub fn stale_objects_in(dir: &Path, keep_after: SystemTime) -> Vec<StaleObjects>
                 .map(|(invocation, _)| invocation.as_str())
                 .collect();
         }
-        keep.extend(recent);
+        if recent.iter().any(|invocation| !keep.contains(invocation))
+            && running.is_none_or(|running| running(&unit))
+        {
+            keep.extend(recent);
+        }
         let files: Vec<PathBuf> = invocations
             .iter()
             .filter(|(invocation, _)| !keep.contains(invocation.as_str()))
@@ -970,7 +981,7 @@ mod tests {
         write(&deps.join(obj("once-ffeeddccbbaa0099", "x", "0ggg")), b"o");
 
         assert_eq!(
-            names(&stale_objects_in(&deps, no_grace())),
+            names(&stale_objects_in(&deps, no_grace(), None)),
             [
                 (bin.to_owned(), vec![obj(bin, "main", "0cccccc")]),
                 (
@@ -999,7 +1010,7 @@ mod tests {
         }
         write(&out.join("app"), b"no names here");
         assert_eq!(
-            names(&stale_objects_in(&out, no_grace())),
+            names(&stale_objects_in(&out, no_grace(), None)),
             [("app".to_owned(), vec![obj("app", "x", "0old")])]
         );
     }
@@ -1031,7 +1042,7 @@ mod tests {
 
         let ten_minutes = minutes(10);
         assert_eq!(
-            names(&stale_objects_in(&out, ten_minutes)),
+            names(&stale_objects_in(&out, ten_minutes, None)),
             [(
                 "app".to_owned(),
                 vec![obj("app", "x", "0hour"), obj("app", "y", "0hour")]
@@ -1039,7 +1050,7 @@ mod tests {
         );
         // Without the grace, only the newest compile stays.
         assert_eq!(
-            names(&stale_objects_in(&out, no_grace())),
+            names(&stale_objects_in(&out, no_grace(), None)),
             [
                 (
                     "app".to_owned(),
@@ -1055,6 +1066,72 @@ mod tests {
                     vec![obj("lib", "x", "0old"), obj("lib", "y", "0old")]
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn keeps_invocations_within_the_grace_only_for_running_programs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out");
+        let now = SystemTime::now();
+        let minutes = |m: u64| now - Duration::from_secs(60 * m);
+        for (invocation, time) in [("0hour", minutes(60)), ("0five", minutes(5)), ("0now", now)] {
+            let path = out.join(obj("app", "x", invocation));
+            write(&path, b"o");
+            set_modified(&path, time);
+        }
+        // Compiled twice within the grace: nothing older to remove.
+        for (invocation, time) in [("0two", minutes(2)), ("0one", minutes(1))] {
+            let path = out.join(obj("lib", "x", invocation));
+            write(&path, b"o");
+            set_modified(&path, time);
+        }
+        let asked = std::cell::RefCell::new(Vec::new());
+        let ten_minutes = minutes(10);
+        let stale = |answer: bool| {
+            asked.borrow_mut().clear();
+            let running = |unit: &str| {
+                asked.borrow_mut().push(unit.to_owned());
+                answer
+            };
+            names(&stale_objects_in(&out, ten_minutes, Some(&running)))
+        };
+
+        // A program from the unit runs: the grace holds.
+        assert_eq!(
+            stale(true),
+            [("app".to_owned(), vec![obj("app", "x", "0hour")])]
+        );
+        // None does: only the newest compile stays, in both units.
+        assert_eq!(
+            stale(false),
+            [
+                (
+                    "app".to_owned(),
+                    vec![obj("app", "x", "0five"), obj("app", "x", "0hour")]
+                ),
+                ("lib".to_owned(), vec![obj("lib", "x", "0two")]),
+            ]
+        );
+        // Asked once per unit with a replaced compile inside the grace.
+        assert_eq!(*asked.borrow(), ["app", "lib"]);
+    }
+
+    #[test]
+    fn asks_about_running_programs_only_for_replaced_compiles_within_the_grace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out");
+        let now = SystemTime::now();
+        for (invocation, time) in [("0hour", now - Duration::from_secs(3600)), ("0now", now)] {
+            let path = out.join(obj("app", "x", invocation));
+            write(&path, b"o");
+            set_modified(&path, time);
+        }
+        let running = |_: &str| -> bool { panic!("nothing to ask about") };
+        let ten_minutes = now - Duration::from_secs(600);
+        assert_eq!(
+            names(&stale_objects_in(&out, ten_minutes, Some(&running))),
+            [("app".to_owned(), vec![obj("app", "x", "0hour")])]
         );
     }
 
@@ -1076,7 +1153,7 @@ mod tests {
             &gnu_archive("", &[(&format!("{member}/"), b"code")]),
         );
         assert_eq!(
-            names(&stale_objects_in(&deps, no_grace())),
+            names(&stale_objects_in(&deps, no_grace(), None)),
             [(lib.to_owned(), vec![format!("{lib}.c1.0aaa.rcgu.dwo")])]
         );
     }
@@ -1515,7 +1592,7 @@ mod tests {
     fn object_names_without_an_invocation_are_ignored() {
         let tmp = tempfile::tempdir().unwrap();
         write(&tmp.path().join("plain.rcgu.o"), b"o");
-        assert!(stale_objects_in(tmp.path(), no_grace()).is_empty());
+        assert!(stale_objects_in(tmp.path(), no_grace(), None).is_empty());
     }
 
     #[cfg(unix)]
@@ -1529,7 +1606,7 @@ mod tests {
         }
         // Listable, but its entries can't be looked up.
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o444)).unwrap();
-        let stale = stale_objects_in(&dir, no_grace());
+        let stale = stale_objects_in(&dir, no_grace(), None);
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
         assert!(stale.is_empty(), "{}", stale.len());
     }
