@@ -486,9 +486,14 @@ mod tests {
         let unit = UnitExe::new(dir, name);
         let running = Running::collect_for(&unit);
         assert!(running.listed());
-        assert_eq!(
-            running.started_from(&unit).map(|p| p.pid),
-            Some(std::process::id())
+        assert!(running.started_from(&unit).is_some());
+        // This process among them; other tests may run copies of this binary
+        // at the same time, which count too.
+        assert!(
+            running
+                .processes()
+                .iter()
+                .any(|p| p.pid == std::process::id() && unit.started(p))
         );
         // Others are left out by name, so the list is short.
         assert!(running.processes().len() < Running::collect().processes().len());
