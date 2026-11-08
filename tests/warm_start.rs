@@ -2,11 +2,17 @@
 //! worktree's by the post-checkout hook, and cargo finds its dependencies
 //! fresh there.
 
-use std::fs;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 const BIN: &str = env!("CARGO_BIN_EXE_cargo-steward");
+
+/// The cargo running the tests, or `STEWARD_TEST_CARGO` (with `RUSTC` set
+/// to its rustc) to check other versions and layouts.
+fn test_cargo() -> String {
+    std::env::var("STEWARD_TEST_CARGO").unwrap_or_else(|_| env!("CARGO").to_owned())
+}
 
 struct Fixture {
     _tmp: tempfile::TempDir,
@@ -85,7 +91,7 @@ impl Fixture {
     fn env(&self, cmd: &mut Command) {
         cmd.env("CARGO_STEWARD_HOME", &self.home)
             .env("CARGO_HOME", &self.cargo_home)
-            .env("CARGO", env!("CARGO"))
+            .env("CARGO", test_cargo())
             .env("RUSTC_WRAPPER", "")
             .env("CARGO_TERM_COLOR", "never")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -125,7 +131,7 @@ impl Fixture {
     }
 
     fn cargo(&self, dir: &Path, args: &[&str]) -> String {
-        self.ok(env!("CARGO"), dir, args)
+        self.ok(&test_cargo(), dir, args)
     }
 
     fn steward(&self, dir: &Path, args: &[&str]) -> String {
@@ -233,4 +239,65 @@ fn seed_with_explicit_dirs_and_nothing_to_do() {
     );
     assert!(off.contains("turned off"), "{off}");
     assert!(!fx.root.join("other-target").exists());
+}
+
+/// Agents often build only in worktrees. A new worktree is seeded from
+/// another worktree's build when the main checkout has none, or when a
+/// build is using the main checkout's; `seed` says which it used.
+#[test]
+fn a_new_worktree_starts_from_another_worktrees_build() {
+    let fx = Fixture::new();
+    let a = fx.root.join("wt-a");
+    fx.git(&fx.repo, &["worktree", "add", "-q", a.to_str().unwrap()]);
+    fx.cargo(&a, &["build"]);
+    fx.steward(&fx.repo, &["hooks", "install"]);
+
+    // The main checkout has never built: the hook seeds from wt-a.
+    let b = fx.root.join("wt-b");
+    fx.git(&fx.repo, &["worktree", "add", "-q", b.to_str().unwrap()]);
+    if !b.join("target").exists() {
+        if cfg!(target_os = "macos") {
+            panic!("APFS can clone: expected a seed");
+        }
+        let said = fx.steward(&b, &["seed"]);
+        assert!(said.contains("can't clone"), "{said}");
+        return;
+    }
+    let build = fx.cargo(&b, &["build", "-v"]);
+    assert!(build.contains("Fresh helper"), "{build}");
+    fx.steward(&fx.repo, &["hooks", "uninstall"]);
+
+    // The main checkout has built, but a build is using it: the most
+    // recently used other worktree's build (wt-b's) is used instead.
+    fx.cargo(&fx.repo, &["build"]);
+    let lock = File::create(fx.repo.join("target/debug/.cargo-lock")).unwrap();
+    lock.lock().unwrap();
+    let c = fx.root.join("wt-c");
+    fx.git(&fx.repo, &["worktree", "add", "-q", c.to_str().unwrap()]);
+    let said = fx.steward(&c, &["seed"]);
+    assert!(
+        said.starts_with(&format!(
+            "Seeded {} from {} (worktree wt-b, last used ",
+            c.join("target").display(),
+            b.join("target").display()
+        )),
+        "{said}"
+    );
+    assert!(said.contains("; busy: the main checkout; "), "{said}");
+    let build = fx.cargo(&c, &["build", "-v"]);
+    assert!(build.contains("Fresh helper"), "{build}");
+
+    // Once no build is using it, the main checkout's is preferred again.
+    drop(lock);
+    let d = fx.root.join("wt-d");
+    fx.git(&fx.repo, &["worktree", "add", "-q", d.to_str().unwrap()]);
+    let said = fx.steward(&d, &["seed"]);
+    assert!(
+        said.starts_with(&format!(
+            "Seeded {} from {} (the main checkout; ",
+            d.join("target").display(),
+            fx.repo.join("target").display()
+        )),
+        "{said}"
+    );
 }

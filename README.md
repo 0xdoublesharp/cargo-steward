@@ -95,7 +95,7 @@ Warm starts, CI and the cargo proxy:
 
 | Command | What it does | Docs |
 |---|---|---|
-| `cargo steward seed` | Starts a new worktree's build directory as a copy-on-write clone of its main one | [warm-start.md](docs/warm-start.md) |
+| `cargo steward seed` | Starts a new worktree's build directory as a copy-on-write clone of the main checkout's, or of the most recently used idle worktree's | [warm-start.md](docs/warm-start.md) |
 | `cargo steward hooks` | Installs or removes the git hooks that seed new worktrees | [warm-start.md](docs/warm-start.md) |
 | `cargo steward dedup` | Replaces identical files across build directories with clones | [warm-start.md](docs/warm-start.md) |
 | `cargo steward ci` | Trims build output to what a CI job used, within a budget | [ci.md](docs/ci.md) |

@@ -4,8 +4,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- Seeding starts a new worktree from the best build the repository has, not
+  only the main checkout's: the main checkout's when it holds a build no
+  build is using, else the most recently used other worktree's, trying each
+  for half a second and all of them for up to 5 s before building cold.
+  `seed` finds the other worktrees' build directories from the layout they
+  share, the `cargo` proxy's `target-root` and the wrapper's records,
+  without running cargo in each, and prints which one it used and why.
+- `seed --from` can be given more than once; the first is preferred, then
+  the most recently used.
+
 ### Fixed
 
+- The `cargo` proxy seeds from target directories it created itself. Cargo
+  doesn't tag a directory it didn't create, and without its rustc cache file
+  such a directory wasn't recognized as a build to clone, so the new worktree
+  built cold.
 - Cleanup no longer removes Cargo 1.100-layout build units that builds still
   use. Reading a unit doesn't move its times (APFS, `noatime`), so every
   dependency looked idle `unit-idle` after its last rebuild; units are now

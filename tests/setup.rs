@@ -353,7 +353,10 @@ fn seed_reports_what_it_did() {
     ]);
     assert!(out.contains("it exists and isn't empty"), "{out}");
     let out = fx.run(&["seed", "--target-dir", b, "--from", b]);
-    assert!(out.contains("is the main build directory"), "{out}");
+    assert!(
+        out.contains("is the build directory it would be seeded from"),
+        "{out}"
+    );
     let missing = fx.root.join("nothing");
     let out = fx.run(&[
         "seed",
@@ -366,7 +369,7 @@ fn seed_reports_what_it_did() {
     let quiet = fx.run(&["seed", "--target-dir", b, "--from", b, "--quiet"]);
     assert!(quiet.is_empty(), "{quiet}");
 
-    // Outside a git repository there's no main worktree to seed from.
+    // Outside a cargo workspace there's nothing to seed.
     let out = fx.run(&["seed", "--worktree", fx.home.to_str().unwrap()]);
     assert!(out.contains("Nothing to seed"), "{out}");
 

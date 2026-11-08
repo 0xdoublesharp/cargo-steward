@@ -11,7 +11,7 @@
 mod gate;
 mod hold;
 mod real;
-mod route;
+pub(crate) mod route;
 mod shim;
 
 use std::env;
