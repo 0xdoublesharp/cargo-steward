@@ -70,8 +70,11 @@ enum Cmd {
         #[arg(short, long)]
         verbose: bool,
         /// Run as the wrapper's background cleanup: apply, quietly, at low priority
-        #[arg(long, hide = true)]
+        #[arg(long, hide = true, conflicts_with = "json")]
         auto: bool,
+        /// Print one JSON document instead of text
+        #[arg(long)]
+        json: bool,
     },
     /// Protect a build directory from cleanup (stale object files are still removed)
     Pin { dir: PathBuf },
@@ -109,6 +112,9 @@ enum Cmd {
         /// Also remove pinned directories
         #[arg(long)]
         force: bool,
+        /// Print one JSON document instead of text
+        #[arg(long)]
+        json: bool,
     },
     /// Install or remove the agent skill that teaches AI agents to use cargo-steward
     Skill(skill::Args),
@@ -164,6 +170,7 @@ fn main() -> ExitCode {
             apply,
             verbose,
             auto,
+            json,
         } => {
             if auto {
                 gc::become_background();
@@ -173,6 +180,7 @@ fn main() -> ExitCode {
                 auto,
                 verbose,
                 command: "gc",
+                json,
             })
         }
         Cmd::Pin { dir } => pin(&dir, true),
@@ -187,7 +195,8 @@ fn main() -> ExitCode {
             worktree,
             apply,
             force,
-        } => remove(build_dirs, &worktree, apply, force),
+            json,
+        } => remove(build_dirs, &worktree, apply, force, json),
         Cmd::Skill(args) => skill::run(&args),
     };
     match result {
@@ -210,7 +219,7 @@ impl Cmd {
     /// Whether the command was asked for a JSON document.
     fn json(&self) -> bool {
         match self {
-            Cmd::Status { json, .. } => *json,
+            Cmd::Status { json, .. } | Cmd::Gc { json, .. } | Cmd::Remove { json, .. } => *json,
             _ => false,
         }
     }
@@ -231,19 +240,43 @@ fn is_wrapper_call(first: &OsString) -> bool {
         || env::var_os("CARGO").is_some()
 }
 
-fn remove(mut dirs: Vec<PathBuf>, worktrees: &[PathBuf], apply: bool, force: bool) -> Result<()> {
+fn remove(
+    mut dirs: Vec<PathBuf>,
+    worktrees: &[PathBuf],
+    apply: bool,
+    force: bool,
+    as_json: bool,
+) -> Result<()> {
+    let mut found = Vec::new();
     for worktree in worktrees {
         let dir = gc::build_dir_of(worktree)?;
-        println!("{} builds into {}", worktree.display(), dir.display());
+        if !as_json {
+            println!("{} builds into {}", worktree.display(), dir.display());
+        }
+        found.push(gc::document::Worktree {
+            worktree: json::path(worktree),
+            build_dir: json::path(&dir),
+            exists: dir.exists(),
+        });
         if dir.exists() {
             dirs.push(dir);
         }
     }
-    if dirs.is_empty() {
-        println!("Nothing to remove.");
-        return Ok(());
+    let requested = if dirs.is_empty() {
+        if !as_json {
+            println!("Nothing to remove.");
+            return Ok(());
+        }
+        gc::Requested::default()
+    } else {
+        gc::remove_requested(&dirs, apply, force)?
+    };
+    if as_json {
+        json::print(&gc::Document::removal(&requested, found, apply))
+    } else {
+        gc::report_requested(&requested, apply);
+        Ok(())
     }
-    gc::remove_requested(&dirs, apply, force)
 }
 
 fn pin(dir: &Path, on: bool) -> Result<()> {

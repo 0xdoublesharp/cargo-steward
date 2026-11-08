@@ -15,6 +15,7 @@
 //! program was started from is removed ([`guard`]). Build directories are
 //! worked on in parallel, each by one thread.
 
+pub mod document;
 mod guard;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -27,6 +28,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 
+pub use document::Document;
 pub use guard::Running;
 
 use crate::config::{self, Paths, Policy};
@@ -73,6 +75,22 @@ impl Kind {
             Kind::LowSpace => "build dirs removed for free space",
             Kind::Requested => "build dirs removed on request",
             Kind::RoutedTmp => "temporary dirs the proxy routed for them",
+        }
+    }
+
+    /// A stable name for `--json`.
+    pub fn id(self) -> &'static str {
+        match self {
+            Kind::StaleObjects => "stale_objects",
+            Kind::OldSessions => "old_sessions",
+            Kind::LegacyLayout => "legacy_layout",
+            Kind::IdleIncremental => "idle_incremental",
+            Kind::IdleUnit => "idle_unit",
+            Kind::Orphaned => "orphaned",
+            Kind::Idle => "idle",
+            Kind::LowSpace => "low_space",
+            Kind::Requested => "requested",
+            Kind::RoutedTmp => "routed_tmp",
         }
     }
 }
@@ -259,6 +277,8 @@ pub struct Options {
     pub verbose: bool,
     /// The command that produced the report, for its closing hint.
     pub command: &'static str,
+    /// Print one JSON document instead of text.
+    pub json: bool,
 }
 
 pub fn run(options: Options) -> Result<()> {
@@ -276,6 +296,11 @@ pub fn run(options: Options) -> Result<()> {
             None => {
                 if !options.auto {
                     eprintln!("another cleanup is already running");
+                }
+                if options.json {
+                    let mut doc = Document::new(&Cleanup::default(), &[], options);
+                    doc.busy = true;
+                    crate::json::print(&doc)?;
                 }
                 return Ok(());
             }
@@ -326,7 +351,10 @@ pub fn run(options: Options) -> Result<()> {
     if options.apply {
         ledger::save(&paths, &registry)?;
     }
-    report(&cleanup, &freed, options);
+    if !options.json {
+        report(&cleanup, &freed, options);
+    }
+    let mut shared = None;
 
     // Share identical files across what's left. Only where the filesystem
     // can tell files that already share blocks apart (APFS clone IDs), so
@@ -344,6 +372,7 @@ pub fn run(options: Options) -> Result<()> {
             .cloned()
             .collect();
         match crate::dedup::dedup(&remaining, true) {
+            Ok(summary) if options.json => shared = Some(summary),
             Ok(summary) if summary.files > 0 => println!(
                 "{:>12} {:>10}  identical files now shared across build dirs ({} files)",
                 "Shared",
@@ -353,6 +382,14 @@ pub fn run(options: Options) -> Result<()> {
             Ok(_) => {}
             Err(e) => eprintln!("warning: cargo-steward: dedup: {e:#}"),
         }
+    }
+    if options.json {
+        let mut doc = Document::new(&cleanup, &freed, options);
+        doc.shared = shared.map(|s| document::Shared {
+            files: s.files,
+            bytes: s.bytes,
+        });
+        crate::json::print(&doc)?;
     }
     Ok(())
 }
@@ -823,11 +860,19 @@ fn remove_routed_tmp_dirs(config: &config::Config, actions: &[Action], apply: bo
     out
 }
 
+/// What [`remove_requested`] removed (or would), kept, and refused.
+#[derive(Debug, Default)]
+pub struct Requested {
+    pub cleanup: Cleanup,
+    /// Paths that aren't cargo build directories, and why.
+    pub refused: Vec<(PathBuf, String)>,
+}
+
 /// Removes whole build directories on request (`cargo steward remove`), the
 /// way cleanup removes them: while holding cargo's locks, not while a running
 /// program was started from inside, and renamed aside first. Anything that
 /// isn't a cargo build directory is refused, and pinned ones need `force`.
-pub fn remove_requested(roots: &[PathBuf], apply: bool, force: bool) -> Result<()> {
+pub fn remove_requested(roots: &[PathBuf], apply: bool, force: bool) -> Result<Requested> {
     let paths = Paths::resolve().context("cannot locate the home directory")?;
     let config = config::load_warning(&paths);
     let policy = config.policy()?;
@@ -899,17 +944,24 @@ pub fn remove_requested(roots: &[PathBuf], apply: bool, force: bool) -> Result<(
     if refused.len() == roots.len() {
         anyhow::bail!("nothing to remove");
     }
+    Ok(Requested {
+        cleanup: out,
+        refused,
+    })
+}
+
+/// Prints what `cargo steward remove` removed (or would) as text.
+pub fn report_requested(requested: &Requested, apply: bool) {
     report(
-        &out,
+        &requested.cleanup,
         &[],
         Options {
             apply,
-            auto: false,
             verbose: true,
             command: "remove",
+            ..Options::default()
         },
     );
-    Ok(())
 }
 
 /// The build directory a worktree builds into: where the `cargo` proxy routes

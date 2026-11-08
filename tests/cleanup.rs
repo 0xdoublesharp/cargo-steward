@@ -81,6 +81,8 @@ impl Fixture {
             .arg("--json")
             .env("CARGO_STEWARD_HOME", &self.home)
             .env_remove("CARGO")
+            .env_remove("CARGO_TARGET_DIR")
+            .env_remove("CARGO_BUILD_TARGET_DIR")
             .output()
             .unwrap();
         assert!(
@@ -446,11 +448,145 @@ fn status_json_with_sizes_measures_each_dir() {
 fn json_stays_alone_on_stdout_when_there_are_warnings() {
     let fx = Fixture::new("unit-idle = \"soon\"\n");
     fx.build_dir("target", 60 * DAY);
-    for args in [&["status"][..], &["status", "--sizes"]] {
+    for args in [&["status"][..], &["status", "--sizes"], &["gc"]] {
         let (_, stderr) = fx.steward_json(args);
         assert!(
             stderr.contains("warning: cargo-steward: settings"),
             "{stderr}"
         );
     }
+}
+
+#[test]
+fn gc_json_lists_removals_kept_dirs_and_the_space_freed() {
+    let fx = Fixture::new("dedup = false\n");
+    let idle = fx.build_dir("idle", 60 * DAY);
+    // A program running from a build dir keeps it.
+    let busy = fx.build_dir("busy", 60 * DAY);
+    let program = busy.join("debug/sleeper");
+    fs::copy("/bin/sleep", &program).unwrap();
+    age(&busy, 60 * DAY);
+    let mut child = Command::new(&program).arg("60").spawn().unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+
+    let (preview, _) = fx.steward_json(&["gc"]);
+    let (applied, _) = fx.steward_json(&["gc", "--apply"]);
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert_eq!(preview["command"], "gc", "{preview}");
+    assert_eq!(preview["applied"], false, "{preview}");
+    let action = &preview["actions"][0];
+    assert_eq!(action["kind"], "idle", "{preview}");
+    assert_eq!(action["description"], "idle build dirs", "{preview}");
+    assert_eq!(action["path"], idle.display().to_string(), "{preview}");
+    assert!(action["bytes"].as_u64().unwrap() >= 1 << 20, "{preview}");
+    assert_eq!(preview["actions"].as_array().unwrap().len(), 1, "{preview}");
+    assert_eq!(preview["totals"][0]["kind"], "idle", "{preview}");
+    assert_eq!(preview["totals"][0]["count"], 1, "{preview}");
+    assert_eq!(preview["total_bytes"], action["bytes"], "{preview}");
+    let kept = &preview["skipped"][0];
+    assert_eq!(kept["kind"], "idle", "{preview}");
+    assert_eq!(kept["path"], busy.display().to_string(), "{preview}");
+    assert!(
+        kept["reason"].as_str().unwrap().contains("running from it"),
+        "{preview}"
+    );
+    assert_eq!(preview["freed_on_disk"], serde_json::json!([]), "{preview}");
+
+    assert_eq!(applied["applied"], true, "{applied}");
+    assert_eq!(applied["busy"], false, "{applied}");
+    assert_eq!(applied["actions"][0]["path"], idle.display().to_string());
+    assert!(!idle.exists(), "{applied}");
+    assert!(busy.exists(), "{applied}");
+    let freed = applied["freed_on_disk"].as_array().unwrap();
+    assert_eq!(freed.len(), 1, "{applied}");
+    assert!(freed[0]["path"].is_string(), "{applied}");
+    assert!(freed[0]["bytes"].is_i64(), "{applied}");
+    assert_eq!(applied["shared"], serde_json::Value::Null, "{applied}");
+}
+
+#[test]
+fn gc_json_says_when_another_cleanup_runs() {
+    let fx = Fixture::new("");
+    let dir = fx.build_dir("target", 60 * DAY);
+    let lock = File::create(fx.home.join("gc.lock")).unwrap();
+    lock.lock().unwrap();
+    let (doc, stderr) = fx.steward_json(&["gc", "--apply"]);
+    assert_eq!(doc["busy"], true, "{doc}");
+    assert_eq!(doc["actions"], serde_json::json!([]), "{doc}");
+    assert!(stderr.contains("another cleanup is already running"));
+    assert!(dir.exists());
+}
+
+#[test]
+fn remove_json_lists_removed_kept_and_refused_paths() {
+    let fx = Fixture::new("");
+    let old = fx.build_dir("old", DAY);
+    let pinned = fx.build_dir("pinned", DAY);
+    fs::write(pinned.join(".cargo-steward-keep"), "").unwrap();
+    let plain = fx.root.join("plain");
+    fs::create_dir_all(&plain).unwrap();
+    let paths = [&old, &pinned, &plain].map(|p| p.to_str().unwrap().to_owned());
+    let mut args = vec!["remove"];
+    args.extend(paths.iter().map(String::as_str));
+    let (doc, stderr) = fx.steward_json(&args);
+    assert!(stderr.contains("refusing to remove"), "{stderr}");
+    assert_eq!(doc["command"], "remove", "{doc}");
+    assert_eq!(doc["applied"], false, "{doc}");
+    assert_eq!(doc["actions"][0]["kind"], "requested", "{doc}");
+    assert_eq!(doc["actions"][0]["path"], paths[0], "{doc}");
+    assert_eq!(doc["skipped"][0]["path"], paths[1], "{doc}");
+    assert!(
+        doc["skipped"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("pinned"),
+        "{doc}"
+    );
+    assert_eq!(doc["refused"][0]["path"], paths[2], "{doc}");
+    assert!(old.exists() && pinned.exists());
+
+    args.insert(1, "--apply");
+    let (doc, _) = fx.steward_json(&args);
+    assert_eq!(doc["applied"], true, "{doc}");
+    assert!(!old.exists() && pinned.exists(), "{doc}");
+}
+
+#[test]
+fn remove_worktree_json_reports_where_it_builds() {
+    let fx = Fixture::new("process-guard = false\ntarget-root = \"ROUTED\"\n");
+    let routed = fx.root.join("routed");
+    let config = fx.home.join("config.toml");
+    let settings = fs::read_to_string(&config).unwrap();
+    fs::write(
+        &config,
+        settings.replace("ROUTED", routed.to_str().unwrap()),
+    )
+    .unwrap();
+    let worktree = fx.root.join("wt");
+    fs::create_dir_all(&worktree).unwrap();
+    let (doc, _) = fx.steward_json(&["remove", "--worktree", worktree.to_str().unwrap()]);
+    let entry = &doc["worktrees"][0];
+    assert_eq!(entry["worktree"], worktree.display().to_string(), "{doc}");
+    let build_dir = entry["build_dir"].as_str().unwrap();
+    assert!(build_dir.starts_with(routed.to_str().unwrap()), "{doc}");
+    assert_eq!(entry["exists"], false, "{doc}");
+    assert_eq!(doc["actions"], serde_json::json!([]), "{doc}");
+}
+
+#[test]
+fn a_failure_with_json_prints_an_error_document() {
+    let fx = Fixture::new("");
+    let plain = fx.root.join("plain");
+    fs::create_dir_all(&plain).unwrap();
+    let out = Command::new(BIN)
+        .args(["remove", "--json", plain.to_str().unwrap()])
+        .env("CARGO_STEWARD_HOME", &fx.home)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let doc = json_document(&out.stdout);
+    assert_eq!(doc["error"], "nothing to remove", "{doc}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("error: nothing to remove"));
 }
