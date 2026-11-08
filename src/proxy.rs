@@ -374,6 +374,41 @@ fn root(path: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// The directories the proxy routes target directories under: each
+/// `target-root` (top-level and per route) that exists, with `{label}`
+/// standing for every directory at its place. Cleanup searches them, so a
+/// worktree's build directory is found even before the wrapper records a
+/// compile in it (a seeded one that hasn't built yet).
+pub fn target_roots(config: &Config) -> Vec<PathBuf> {
+    let configured = std::iter::once(&config.target_root)
+        .chain(config.routes.iter().map(|r| &r.target_root))
+        .flatten();
+    let mut found = Vec::new();
+    for setting in configured {
+        let Ok(path) = root(setting) else {
+            continue;
+        };
+        let text = path.to_string_lossy().into_owned();
+        match text.split_once("{label}") {
+            None => found.push(path),
+            Some((before, after)) => {
+                let after = after.trim_start_matches('/');
+                for label in crate::fsutil::subdirs(Path::new(before)) {
+                    found.push(if after.is_empty() {
+                        label
+                    } else {
+                        label.join(after)
+                    });
+                }
+            }
+        }
+    }
+    found.retain(|p| p.is_dir());
+    found.sort();
+    found.dedup();
+    found
+}
+
 /// The TMPDIR the proxy gives builds whose target directory is `build_dir`,
 /// when it routed `build_dir`: `<target-root>/<repo>-<hash>/<key>` under a
 /// route's (or the top-level) `target-root` maps to the same place under
@@ -1254,5 +1289,43 @@ mod tests {
             routed_tmp_dir(&no_tmp, Path::new("/s/cargo/r-0123456789/main")),
             None
         );
+    }
+
+    #[test]
+    fn lists_the_target_roots_cleanup_searches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        for dir in ["s/one/cargo", "s/two/cargo", "s/three/tmp", "big/cargo"] {
+            std::fs::create_dir_all(base.join(dir)).unwrap();
+        }
+        let config = Config {
+            target_root: Some(base.join("s/{label}/cargo")),
+            routes: vec![
+                config::Route {
+                    path: "/w/big".into(),
+                    target_root: Some(base.join("big/cargo")),
+                    tmp_root: None,
+                    max_builds: None,
+                    force: false,
+                },
+                config::Route {
+                    path: "/w/gone".into(),
+                    target_root: Some(base.join("missing")),
+                    tmp_root: None,
+                    max_builds: None,
+                    force: false,
+                },
+            ],
+            ..Config::default()
+        };
+        assert_eq!(
+            target_roots(&config),
+            [
+                base.join("big/cargo"),
+                base.join("s/one/cargo"),
+                base.join("s/two/cargo")
+            ]
+        );
+        assert!(target_roots(&Config::default()).is_empty());
     }
 }

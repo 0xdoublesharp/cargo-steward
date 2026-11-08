@@ -574,6 +574,10 @@ fn remove_json_lists_removed_kept_and_refused_paths() {
     let (doc, _) = fx.steward_json(&args);
     assert_eq!(doc["applied"], true, "{doc}");
     assert!(!old.exists() && pinned.exists(), "{doc}");
+    // The change in free space is measured, as for `gc --apply`.
+    let freed = doc["freed_on_disk"].as_array().unwrap();
+    assert_eq!(freed.len(), 1, "{doc}");
+    assert!(freed[0]["bytes"].is_i64(), "{doc}");
 }
 
 #[test]

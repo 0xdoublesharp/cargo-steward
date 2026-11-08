@@ -1132,3 +1132,92 @@ fn a_deleted_main_checkout_keeps_the_grace() {
     let out = env.ok(&mut env.cmd(&env.root, &["gc", "--apply"]));
     assert!(target.exists(), "{out}");
 }
+
+#[test]
+fn explain_names_the_checkout_and_whether_the_proxy_is_in_use() {
+    let env = Env::new();
+    let repo = env.root.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    // Nothing routed: the checkout is still found.
+    let doc = env.explain_json(&repo, &[]);
+    assert_eq!(doc["checkout"]["in_git"], true, "{doc}");
+    assert_eq!(doc["namespace"]["key"], "main", "{doc}");
+
+    env.config(&format!(
+        "target-root = {:?}\n",
+        env.root.join("targets").display().to_string()
+    ));
+    let bin = env.root.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    let explain = |json: bool| {
+        let mut args = vec!["shim", "explain"];
+        if json {
+            args.push("--json");
+        }
+        let mut cmd = env.cmd(&repo, &args);
+        cmd.env("PATH", &path);
+        env.ok(&mut cmd)
+    };
+    // The real cargo first on PATH: what's planned doesn't happen.
+    script(&bin.join("cargo"), "exit 0");
+    let doc: serde_json::Value = serde_json::from_str(&explain(true)).unwrap();
+    assert_eq!(doc["proxy"]["active"], false, "{doc}");
+    assert_eq!(
+        doc["proxy"]["first_cargo"],
+        bin.join("cargo").display().to_string()
+    );
+    let out = explain(false);
+    assert!(out.contains("proxy:        not in use here"), "{out}");
+
+    // The proxy first.
+    fs::remove_file(bin.join("cargo")).unwrap();
+    symlink(BIN, bin.join("cargo")).unwrap();
+    let doc: serde_json::Value = serde_json::from_str(&explain(true)).unwrap();
+    assert_eq!(doc["proxy"]["active"], true, "{doc}");
+    assert!(!explain(false).contains("not in use here"));
+}
+
+#[test]
+fn remove_worktree_names_a_relative_worktree_in_full() {
+    let env = Env::new();
+    let repo = env.root.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    env.config(&format!(
+        "target-root = {:?}\n",
+        env.root.join("targets").display().to_string()
+    ));
+    let out = env.ok(&mut env.cmd(&repo, &["remove", "--worktree", ".", "--json"]));
+    let doc: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        doc["worktrees"][0]["worktree"],
+        repo.display().to_string(),
+        "{doc}"
+    );
+}
+
+#[test]
+fn finds_build_dirs_under_the_proxys_target_roots() {
+    let env = Env::new();
+    let targets = env.root.join("s");
+    env.config(&format!(
+        "target-root = {:?}\n",
+        targets.join("{label}/cargo").display().to_string()
+    ));
+    // A worktree's build dir, seeded but never compiled in, so nothing has
+    // recorded it, and no scan root covers it.
+    let dir = targets.join("app/cargo/app-0123456789/wt");
+    fs::create_dir_all(dir.join("debug/.fingerprint/a-0123456789abcdef")).unwrap();
+    fs::write(dir.join(".rustc_info.json"), "{}").unwrap();
+    let out = env.ok(&mut env.cmd(&env.root, &["status", "--json"]));
+    let doc: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let found: Vec<&str> = doc["build_dirs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(found, [dir.display().to_string()], "{doc}");
+}
