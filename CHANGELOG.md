@@ -86,6 +86,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   units builds still need only when some unit is idle enough to go. On 40
   build directories, a cleanup that removes nothing takes about a third of
   the time it did.
+- The deduplication after each automatic cleanup looks only at files
+  created or replaced since its last pass (recorded in `dedup.stamp` in the
+  steward home) and at the files at the same path in the other build
+  directories, instead of reading every build directory again;
+  `cargo steward dedup` still looks at every file, and reads build
+  directories in parallel.
 
 ### Added
 

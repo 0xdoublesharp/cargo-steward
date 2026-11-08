@@ -290,6 +290,20 @@ fn gc_apply_shares_duplicates_across_the_dirs_it_keeps() {
         "{out}"
     );
     assert!(a.exists() && b.exists(), "{out}");
+    assert!(fx.home.join("dedup.stamp").exists());
+
+    // Nothing new: nothing to share. A new worktree's build of the same
+    // dependency: shared with the copies already there.
+    let out = fx.steward(&["gc", "--apply"]);
+    assert!(!out.contains("identical files"), "{out}");
+    let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    let c = fx.build_dir("c", Duration::ZERO);
+    fs::write(c.join("debug/deps/libdup-0123456789abcdef.rlib"), &data).unwrap();
+    let out = fx.steward(&["gc", "--apply"]);
+    assert!(
+        out.contains("identical files now shared across build dirs (2 files)"),
+        "{out}"
+    );
 }
 
 #[test]

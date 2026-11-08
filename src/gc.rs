@@ -400,7 +400,7 @@ pub fn run(options: Options) -> Result<()> {
             .filter(|d| !removed.contains(&d.root))
             .cloned()
             .collect();
-        match crate::dedup::dedup(&remaining, true) {
+        match crate::dedup::after_cleanup(&paths, &remaining) {
             Ok(summary) if summary.files > 0 => println!(
                 "{:>12} {:>10}  identical files now shared across build dirs ({} files)",
                 "Shared",

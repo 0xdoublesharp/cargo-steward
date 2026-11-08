@@ -52,6 +52,12 @@ impl Paths {
         self.home.join("gc.lock")
     }
 
+    /// When the last applied deduplication started: the next one after a
+    /// cleanup only looks at what changed since.
+    pub fn dedup_stamp(&self) -> PathBuf {
+        self.home.join("dedup.stamp")
+    }
+
     /// Output of automatic cleanups.
     pub fn log(&self) -> PathBuf {
         self.home.join("gc.log")
