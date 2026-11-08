@@ -1,6 +1,8 @@
 //! End to end: the `cargo` proxy in front of real cargo builds, in a git
 //! repository and its worktrees.
 
+mod common;
+
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader};
@@ -30,7 +32,7 @@ struct Fixture {
 }
 
 fn git(dir: &Path, args: &[&str]) {
-    let out = Command::new("git")
+    let out = common::isolate_from_git(&mut Command::new("git"))
         .args([
             "-c",
             "user.name=t",

@@ -462,7 +462,7 @@ fn workspace_root(dir: &Path) -> Option<PathBuf> {
 
 /// Whether git ignores `name` in `dir`.
 fn git_ignores(dir: &Path, name: &str) -> bool {
-    Command::new("git")
+    crate::seed::git_command()
         .args(["check-ignore", "-q", name])
         .current_dir(dir)
         .stdin(Stdio::null())
@@ -601,7 +601,7 @@ mod tests {
         let base = tmp.path().canonicalize().unwrap();
         let git_init = |dir: &Path| {
             std::fs::create_dir_all(dir).unwrap();
-            let status = Command::new("git")
+            let status = crate::seed::git_command()
                 .args(["init", "-q"])
                 .current_dir(dir)
                 .status()
@@ -683,7 +683,7 @@ mod tests {
         let base = tmp.path().canonicalize().unwrap();
         let repo = base.join("proj");
         std::fs::create_dir_all(repo.join(".cargo")).unwrap();
-        let status = Command::new("git")
+        let status = crate::seed::git_command()
             .args(["init", "-q"])
             .current_dir(&repo)
             .status()
@@ -731,7 +731,7 @@ mod tests {
             )
             .unwrap();
             std::fs::write(dir.join("src/lib.rs"), "").unwrap();
-            let status = Command::new("git")
+            let status = crate::seed::git_command()
                 .args(["init", "-q"])
                 .current_dir(dir)
                 .status()
@@ -784,7 +784,7 @@ mod tests {
     }
 
     fn git(dir: &Path, args: &[&str]) {
-        let status = Command::new("git")
+        let status = crate::seed::git_command()
             .args([
                 "-c",
                 "user.name=t",

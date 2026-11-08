@@ -2,6 +2,8 @@
 //! worktree's by the post-checkout hook, and cargo finds its dependencies
 //! fresh there.
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -100,6 +102,8 @@ impl Fixture {
         ] {
             cmd.env_remove(var);
         }
+        // Commands here, cargo-steward included, run git.
+        common::isolate_from_git(cmd);
     }
 
     fn run(&self, program: &str, dir: &Path, args: &[&str]) -> Output {

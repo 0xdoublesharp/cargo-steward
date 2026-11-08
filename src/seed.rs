@@ -251,19 +251,39 @@ fn main_worktree(dir: &Path) -> Option<PathBuf> {
     Some(main.join(below))
 }
 
+/// Variables with which git picks a repository other than the one its
+/// working directory is in. Git sets them for the hooks and `rebase --exec`
+/// commands it runs, so anything those start would otherwise act on the
+/// repository that ran them.
+pub(crate) const GIT_REPO_VARS: [&str; 8] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_PREFIX",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+];
+
+/// `git`, finding its repository from the directory it runs in alone
+/// ([`GIT_REPO_VARS`] removed).
+pub(crate) fn git_command() -> Command {
+    let mut command = Command::new("git");
+    for var in GIT_REPO_VARS {
+        command.env_remove(var);
+    }
+    command
+}
+
 /// Runs git in `dir` and returns its output without the final newline, or
 /// `None` if it fails or prints nothing. Variables a hook inherits from git
 /// are cleared, so `dir` alone decides which repository this is.
 pub(crate) fn git(dir: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(dir)
         .args(args)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_COMMON_DIR")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_PREFIX")
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
@@ -547,7 +567,7 @@ mod tests {
 
     /// Runs git with no user or system config, so tests see plain defaults.
     fn git_ok(dir: &Path, args: &[&str]) {
-        let out = Command::new("git")
+        let out = git_command()
             .arg("-C")
             .arg(dir)
             .args(args)
@@ -844,5 +864,28 @@ mod tests {
         assert_eq!(pairs[0], (wt.join("bdir"), repo.join("bdir")));
         // The target dirs, unless CARGO_TARGET_DIR puts both elsewhere.
         assert_eq!(pairs[1].0, dirs.target);
+    }
+
+    #[test]
+    fn git_finds_its_repository_from_its_directory_alone() {
+        // As in a hook or `git rebase --exec`, where git exports where its
+        // own repository is.
+        let command = git_command();
+        let removed: Vec<&std::ffi::OsStr> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| name)
+            .collect();
+        for var in GIT_REPO_VARS {
+            assert!(removed.contains(&std::ffi::OsStr::new(var)), "{var}");
+        }
+        // And it works: in a fresh repository, git sees that one.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().canonicalize().unwrap();
+        git_ok(&repo, &["init", "-q"]);
+        assert_eq!(
+            git(&repo, &["rev-parse", "--show-toplevel"]).map(PathBuf::from),
+            Some(repo)
+        );
     }
 }

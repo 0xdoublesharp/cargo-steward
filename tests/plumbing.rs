@@ -3,6 +3,8 @@
 //! inner wrapper and ledger. Every test runs with its own home directories;
 //! nothing touches the real shell profiles.
 
+mod common;
+
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
@@ -101,7 +103,7 @@ fn path_with(first: &Path) -> OsString {
 }
 
 fn git(dir: &Path, args: &[&str]) {
-    let status = Command::new("git")
+    let status = common::isolate_from_git(&mut Command::new("git"))
         .args([
             "-c",
             "user.name=t",
@@ -861,4 +863,18 @@ fn the_wrapper_records_workspace_compiles_in_the_ledger() {
         .cmd(&env.root, &loose_args)
         .env("CARGO_PRIMARY_PACKAGE", "1"));
     assert_eq!(fs::read_to_string(&ledger).unwrap().lines().count(), 1);
+}
+
+#[test]
+fn test_commands_find_their_repository_from_their_directory_alone() {
+    let mut command = Command::new("git");
+    common::isolate_from_git(&mut command);
+    let removed: Vec<_> = command
+        .get_envs()
+        .filter(|(_, v)| v.is_none())
+        .map(|(k, _)| k)
+        .collect();
+    for var in common::GIT_REPO_VARS {
+        assert!(removed.contains(&std::ffi::OsStr::new(var)), "{var}");
+    }
 }

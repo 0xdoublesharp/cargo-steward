@@ -1,6 +1,8 @@
 //! End to end: `setup`, `skill`, `hooks`, `seed`, `pin`/`unpin` and
 //! `remove --worktree` as a user runs them, against temporary homes.
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -85,7 +87,7 @@ fn assert_ok(out: &Output, args: &[&str]) {
 }
 
 fn git(dir: &Path, args: &[&str]) {
-    let out = Command::new("git")
+    let out = common::isolate_from_git(&mut Command::new("git"))
         .arg("-C")
         .arg(dir)
         .args(args)

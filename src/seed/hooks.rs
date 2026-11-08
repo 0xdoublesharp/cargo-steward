@@ -234,7 +234,7 @@ mod tests {
     use std::process::Command;
 
     fn git_ok(dir: &Path, args: &[&str]) {
-        let out = Command::new("git")
+        let out = crate::seed::git_command()
             .arg("-C")
             .arg(dir)
             .args(args)
@@ -308,7 +308,7 @@ mod tests {
         assert!(status(&dir).starts_with("Installed"), "{}", status(&dir));
 
         let wt = root.join("wt");
-        let out = Command::new("git")
+        let out = crate::seed::git_command()
             .arg("-C")
             .arg(&repo)
             .args(["worktree", "add", "-q"])
@@ -330,7 +330,7 @@ mod tests {
 
         // A plain checkout doesn't seed (and still reports the chained
         // hook's status).
-        let out = Command::new("git")
+        let out = crate::seed::git_command()
             .arg("-C")
             .arg(&wt)
             .args(["checkout", "-q", "-b", "other"])
