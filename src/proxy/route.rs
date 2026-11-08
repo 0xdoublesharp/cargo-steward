@@ -349,18 +349,15 @@ mod tests {
     /// `hashlib.sha256(str(common).encode()).hexdigest()[:10]`.
     #[test]
     fn names_match_the_reference_shim() {
-        let common = Path::new("/Users/justin/Workspaces/0xdiesis/diesis-core/diesis/.git");
+        let common = Path::new("/home/me/src/app/.git");
         assert_eq!(
             names(common, common),
-            ("diesis-ae0deba9a3".to_string(), "main".to_string())
+            ("app-9e7f92a27e".to_string(), "main".to_string())
         );
-        let checkout = common.join("worktrees/tps-harness-20261105");
+        let checkout = common.join("worktrees/fix-login");
         assert_eq!(
             names(common, &checkout),
-            (
-                "diesis-ae0deba9a3".to_string(),
-                "tps-harness-20261105".to_string()
-            )
+            ("app-9e7f92a27e".to_string(), "fix-login".to_string())
         );
         // Every non-matching character, including non-ASCII, becomes one `-`.
         let odd = Path::new("/srv/my.repo v2\u{e9}/.git");

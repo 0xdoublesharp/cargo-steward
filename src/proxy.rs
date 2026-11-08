@@ -938,8 +938,8 @@ mod tests {
 
     #[test]
     fn routes_round_trip_through_the_settings_file() {
-        let text = "target-root = \"/s/{label}/cargo\"\n\n[[routes]]\npath = \"/w/diesis\"\n\
-                    target-root = \"/s/0xdiesis/cargo\"\nmax-builds = 3\n";
+        let text = "target-root = \"/s/{label}/cargo\"\n\n[[routes]]\npath = \"/w/big\"\n\
+                    target-root = \"/s/big/cargo\"\nmax-builds = 3\n";
         let config: Config = toml::from_str(text).unwrap();
         assert_eq!(config.routes.len(), 1);
         assert_eq!(config.routes[0].max_builds, Some(3));
