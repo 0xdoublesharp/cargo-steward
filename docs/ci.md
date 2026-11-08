@@ -61,12 +61,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2           # restores here, saves in its post step
-      - uses: doublesharp/cargo-steward@v0.1.0
+      - uses: 0xdoublesharp/cargo-steward@v0.1.0
         with:
           mode: start                          # after the restore, before any build
       - run: cargo build --all-targets
       - run: cargo test
-      - uses: doublesharp/cargo-steward@v0.1.0
+      - uses: 0xdoublesharp/cargo-steward@v0.1.0
         with:
           mode: trim                           # last step: runs before rust-cache saves
           budget: 6GiB

@@ -55,7 +55,7 @@ agents to use it.
 On macOS or Linux, from a checkout (needs Rust 1.89 or newer):
 
 ```sh
-git clone <repository URL> cargo-steward
+git clone https://github.com/0xdoublesharp/cargo-steward cargo-steward
 cargo-steward/scripts/install.sh
 ```
 

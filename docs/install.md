@@ -15,7 +15,7 @@ after `--` when they could be mistaken for the script's own.
 **From a checkout** (needs Rust 1.89 or newer):
 
 ```sh
-git clone <repository URL> cargo-steward
+git clone https://github.com/0xdoublesharp/cargo-steward cargo-steward
 cargo-steward/scripts/install.sh
 cargo-steward/scripts/install.sh --scan-root /Volumes/Scratch   # passing an option to setup
 ```
@@ -26,15 +26,15 @@ This runs `cargo install --locked --path` on the checkout the script is in.
 **From git**, without a checkout:
 
 ```sh
-scripts/install.sh --git <repository URL> [--rev <commit>]
+scripts/install.sh --git https://github.com/0xdoublesharp/cargo-steward [--rev <commit>]
 # or by hand, then run `cargo steward setup`:
-cargo install --locked --git <repository URL> cargo-steward
+cargo install --locked --git https://github.com/0xdoublesharp/cargo-steward cargo-steward
 ```
 
 **A prebuilt binary** (no Rust toolchain needed):
 
 ```sh
-scripts/install.sh --release 0.1.0 --repo OWNER/cargo-steward   # or --release latest
+scripts/install.sh --release 0.1.0 --repo 0xdoublesharp/cargo-steward   # or --release latest
 ```
 
 This downloads `cargo-steward-<target>.tar.gz` for this machine
@@ -122,7 +122,7 @@ skill:
 
 ```sh
 scripts/install.sh --no-setup                                   # from an updated checkout
-scripts/install.sh --release latest --repo OWNER/cargo-steward --no-setup
+scripts/install.sh --release latest --repo 0xdoublesharp/cargo-steward --no-setup
 cargo steward skill install
 ```
 
