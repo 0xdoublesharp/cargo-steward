@@ -104,7 +104,7 @@ fields that only one of them fills are empty in the other's.
 | `skipped` | array | due for removal but kept: `{kind, description, path, reason}`, such as a running program, a build holding the locks, or a pin; a `low_space` entry whose path is a disk's directory says why removing for space stopped |
 | `totals` | array | per kind with actions: `{kind, description, count, bytes}` |
 | `total_bytes` | integer | sum over `actions` |
-| `freed_on_disk` | array | `gc --apply`: `{path, bytes}` per disk it removed from, the measured change in free space (an integer that other writes meanwhile also move, so it can be negative) |
+| `freed_on_disk` | array | `--apply`: `{path, bytes}` per disk it removed from, the measured change in free space (an integer that other writes meanwhile also move, so it can be negative) |
 | `shared` | object or null | `gc --apply` where it shares identical files afterwards (macOS, `dedup = true`): `{files, bytes}` |
 
 Kind ids, cheapest to rebuild first (the README's
@@ -254,6 +254,7 @@ directory. Put `--json` before the cargo arguments:
 | `route` | string or null | the `[[routes]]` path that applies |
 | `real_cargo` | string or null | the cargo the proxy runs; null when it can't find one |
 | `build_slot` | object | `{status, limit, dir, message}`, below |
+| `proxy` | object | `{first_cargo, active}`: the first `cargo` on PATH, and whether it is the proxy (only then do builds here go as described) |
 
 `seed.status` is one of `will_seed` (`from` is the build directory it clones),
 `all_busy` (builds hold every build it could clone; seeding waits for one),
@@ -297,6 +298,7 @@ directory. Put `--json` before the cargo arguments:
     "limit": 4,
     "dir": "/Users/me/.cargo/steward/slots",
     "message": "takes one of 4 (in /Users/me/.cargo/steward/slots)"
-  }
+  },
+  "proxy": { "first_cargo": "/Users/me/.cargo/steward/bin/cargo", "active": true }
 }
 ```

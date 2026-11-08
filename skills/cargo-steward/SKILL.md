@@ -27,7 +27,8 @@ rustc-wrapper is cargo-steward. Otherwise follow the project's own rules.
 - **Routing** (when `cargo` on PATH is the proxy): each worktree builds into
   its own directory under a central root, with its own TMPDIR.
 - **Warm starts:** a new worktree's first build starts as a copy-on-write
-  clone of the main checkout's.
+  clone of the best build among the repository's checkouts (the main
+  checkout's when no build holds it, else the most recently used).
 - **Build slots:** at most `max-builds` cargo builds and `max-compiles`
   rustc processes run at once, machine-wide.
 
@@ -39,8 +40,9 @@ rustc-wrapper is cargo-steward. Otherwise follow the project's own rules.
 2. **Never set `RUSTC_WRAPPER`**; it bypasses cargo-steward. To run rustc
    through another wrapper, set `CARGO_STEWARD_INNER=<program>`.
 3. **Target directory:** if `cargo steward shim explain --json` shows
-   `target_dir.routed: true`, don't set `CARGO_TARGET_DIR` or
-   `--target-dir`. Otherwise follow the project's policy.
+   `target_dir.routed: true` and `proxy.active: true`, don't set
+   `CARGO_TARGET_DIR` or `--target-dir`. Otherwise follow the project's
+   policy.
 4. **Create worktrees where the project's worktrees live** (its docs, or
    beside those in `git worktree list`). One outside the project tree misses
    its `.cargo/config.toml` and builds cold.
@@ -60,8 +62,8 @@ rustc-wrapper is cargo-steward. Otherwise follow the project's own rules.
    test): `cargo steward pin <build-dir>`, then `unpin`.
 7. **Report real numbers.** Sizes count like `du`, so clones count in every
    copy. Report space recovered from `freed_on_disk[].bytes` (`gc --apply
-   --json`), or `df` before and after a `remove`; report a directory's real
-   cost as `unshared_bytes` (`status --sizes --json`).
+   --json` or `remove --apply --json`); report a directory's real cost as
+   `unshared_bytes` (`status --sizes --json`).
 
 ## Machine output
 
@@ -77,7 +79,8 @@ one document on stdout, sizes in bytes. Failure prints
   `worktrees[]` (`build_dir`, `exists`).
 - `dedup`: `files`, `bytes`, `freed_on_disk_bytes`.
 - `shim explain`: `target_dir` (`routed`, `path`, `free_bytes`), `seed`
-  (`status`, `message`), `build_slot`. Put `--json` before cargo arguments:
+  (`status`, `from`, `message`), `build_slot`, `proxy` (`active`: `cargo` on
+  PATH is the proxy). Put `--json` before cargo arguments:
   `cargo steward shim explain --json -- test -p foo`.
 
 **Before a large build**, check `target_dir.free_bytes` from `shim explain
@@ -114,7 +117,8 @@ Change settings (`~/.cargo/steward/config.toml`) only when the user asks.
 
 - **Cold build in a new worktree:** run `cargo steward shim explain --json`
   there. `seed.status`: `will_seed` is good; `source_missing`: no other
-  checkout has built yet; `target_not_empty`: it already has output;
+  checkout has built yet; `all_busy`: builds hold every source, so seeding
+  waits; `target_not_empty`: it already has output;
   `nothing_routed`: run `cargo steward seed --worktree <dir>` before the
   first build. Check rule 4.
 - **Build fails mentioning cargo-steward:** rerun once. If it fails again,

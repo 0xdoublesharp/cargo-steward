@@ -1,12 +1,13 @@
 //! The build gate: at most `max-builds` cargo builds at once, machine-wide.
 //!
-//! Each build holds an exclusive `flock` on one of N slot files. The
-//! descriptor is left open and inheritable across `exec`, so the slot is
-//! held for exactly as long as the cargo process (and anything it leaves
-//! running with the descriptor) lives, and released by the kernel however
-//! it ends. Cargo run from a build script inherits the descriptor and the
-//! environment variables naming it, and reuses the slot instead of waiting
-//! for a second one (which could deadlock at `max-builds = 1`).
+//! Each build holds an exclusive `flock` on one of N slot files, on a
+//! descriptor nothing it starts inherits; the kernel releases it however the
+//! holder ends. The proxy that takes a slot stays as cargo's parent and holds
+//! it while cargo builds ([`super::hold`]). A cargo run inside that build (by
+//! a build script or a `cargo-*` subcommand) finds the holder through
+//! [`HOLDER_VAR`] and reuses the slot instead of waiting for a second one,
+//! which could deadlock at `max-builds = 1`. A slot file names its holder,
+//! for the message a waiting build prints.
 
 use std::ffi::OsString;
 use std::fs::File;
