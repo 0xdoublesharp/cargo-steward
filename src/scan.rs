@@ -218,16 +218,20 @@ pub fn v2_units(profile: &Path) -> Vec<Dated> {
             if !is_v2_unit(&unit) {
                 continue;
             }
-            let dir_time = fs::metadata(&unit).map_or(SystemTime::UNIX_EPOCH, |m| touched(&m));
-            let last_used =
-                newest_in(&unit.join("fingerprint")).map_or(dir_time, |t| t.max(dir_time));
             units.push(Dated {
+                last_used: unit_last_used(&unit).unwrap_or(SystemTime::UNIX_EPOCH),
                 path: unit,
-                last_used,
             });
         }
     }
     units
+}
+
+/// When a build last read or wrote a new-layout unit's fingerprint; `None`
+/// once the unit is gone.
+pub fn unit_last_used(unit: &Path) -> Option<SystemTime> {
+    let dir_time = touched(&fs::metadata(unit).ok()?);
+    Some(newest_in(&unit.join("fingerprint")).map_or(dir_time, |t| t.max(dir_time)))
 }
 
 /// A new-layout unit and what its fingerprints say about it: the hashes
@@ -306,22 +310,26 @@ fn fingerprint_deps(path: &Path) -> Option<Vec<u64>> {
 /// removing part of a session can crash rustc.
 pub fn incremental_dirs(profile: &Path) -> Vec<Dated> {
     subdirs(&profile.join("incremental"))
-        .map(|dir| {
-            let mut last_used = fs::metadata(&dir).map_or(SystemTime::UNIX_EPOCH, |m| touched(&m));
-            for session in subdirs(&dir) {
-                if let Ok(meta) = fs::metadata(&session) {
-                    last_used = last_used.max(touched(&meta));
-                }
-                if let Some(t) = newest_in(&session) {
-                    last_used = last_used.max(t);
-                }
-            }
-            Dated {
-                path: dir,
-                last_used,
-            }
+        .map(|dir| Dated {
+            last_used: cache_last_used(&dir).unwrap_or(SystemTime::UNIX_EPOCH),
+            path: dir,
         })
         .collect()
+}
+
+/// When a build last used an incremental cache: the newest time of the
+/// cache, its sessions and what they hold. `None` once it's gone.
+pub fn cache_last_used(dir: &Path) -> Option<SystemTime> {
+    let mut last_used = touched(&fs::metadata(dir).ok()?);
+    for session in subdirs(dir) {
+        if let Ok(meta) = fs::metadata(&session) {
+            last_used = last_used.max(touched(&meta));
+        }
+        if let Some(t) = newest_in(&session) {
+            last_used = last_used.max(t);
+        }
+    }
+    Some(last_used)
 }
 
 /// Finalized incremental sessions that a newer finalized session of the same
@@ -418,12 +426,7 @@ pub struct StaleObjects {
 
 /// Directories of a profile that hold codegen-unit object files.
 pub fn object_dirs(profile: &Profile) -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if profile.legacy {
-        dirs.push(profile.path.join("deps"));
-        dirs.push(profile.path.join("examples"));
-        dirs.extend(subdirs(&profile.path.join("build")).filter(|d| is_legacy_unit_dir(d)));
-    }
+    let mut dirs = legacy_object_dirs(profile);
     if profile.v2 {
         for pkg in subdirs(&profile.path.join("build")) {
             dirs.extend(
@@ -432,6 +435,26 @@ pub fn object_dirs(profile: &Profile) -> Vec<PathBuf> {
                     .map(|u| u.join("out")),
             );
         }
+    }
+    dirs
+}
+
+/// [`object_dirs`], with the profile's new-layout units already listed
+/// ([`v2_units`]).
+pub fn object_dirs_of(profile: &Profile, units: &[Dated]) -> Vec<PathBuf> {
+    let mut dirs = legacy_object_dirs(profile);
+    if profile.v2 {
+        dirs.extend(units.iter().map(|u| u.path.join("out")));
+    }
+    dirs
+}
+
+fn legacy_object_dirs(profile: &Profile) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if profile.legacy {
+        dirs.push(profile.path.join("deps"));
+        dirs.push(profile.path.join("examples"));
+        dirs.extend(subdirs(&profile.path.join("build")).filter(|d| is_legacy_unit_dir(d)));
     }
     dirs
 }

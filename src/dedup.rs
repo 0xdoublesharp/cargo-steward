@@ -564,6 +564,7 @@ mod tests {
             device: fsutil::device(root),
             compile_ms: 0,
             linked: Default::default(),
+            scans: Vec::new(),
         }
     }
 

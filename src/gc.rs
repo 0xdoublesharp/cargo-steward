@@ -17,6 +17,7 @@
 
 mod guard;
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, OpenOptions};
@@ -128,30 +129,52 @@ pub struct BuildDir {
     pub compile_ms: u64,
     /// The linked git worktree each of `workspaces` was in, for those in one.
     pub linked: BTreeMap<PathBuf, Linked>,
+    /// What inspecting each of `profiles` found, in the same order: cleanup
+    /// works from these rather than listing every profile again.
+    pub scans: Vec<ProfileScan>,
+}
+
+/// One listing of a profile's units and incremental caches, with when builds
+/// last used each. Cleanup decides from it, and checks again, under cargo's
+/// locks, only what it is about to remove.
+#[derive(Debug, Clone, Default)]
+pub struct ProfileScan {
+    /// When an old-layout build last used the profile.
+    pub legacy_last_used: Option<SystemTime>,
+    /// New-layout units ([`scan::v2_units`]).
+    pub units: Vec<Dated>,
+    /// Incremental caches ([`scan::incremental_dirs`]).
+    pub incremental: Vec<Dated>,
+}
+
+impl ProfileScan {
+    pub fn read(profile: &Profile) -> ProfileScan {
+        ProfileScan {
+            legacy_last_used: scan::legacy_last_used(&profile.path),
+            units: scan::v2_units(&profile.path),
+            incremental: scan::incremental_dirs(&profile.path),
+        }
+    }
+
+    /// The latest use of anything in it.
+    fn last_used(&self) -> Option<SystemTime> {
+        self.legacy_last_used
+            .into_iter()
+            .chain(self.units.iter().map(|u| u.last_used))
+            .chain(self.incremental.iter().map(|d| d.last_used))
+            .max()
+    }
 }
 
 impl BuildDir {
     fn inspect(root: &Path, info: Option<&RootInfo>) -> BuildDir {
         let profiles = scan::profiles(root);
+        let scans: Vec<ProfileScan> = profiles.iter().map(ProfileScan::read).collect();
         let mut last_used = info.map_or(UNIX_EPOCH, |i| {
             UNIX_EPOCH + Duration::from_secs(i.last_used)
         });
-        for profile in &profiles {
-            let times = scan::legacy_last_used(&profile.path)
-                .into_iter()
-                .chain(
-                    scan::v2_units(&profile.path)
-                        .into_iter()
-                        .map(|u| u.last_used),
-                )
-                .chain(
-                    scan::incremental_dirs(&profile.path)
-                        .into_iter()
-                        .map(|d| d.last_used),
-                );
-            for t in times {
-                last_used = last_used.max(t);
-            }
+        for t in scans.iter().filter_map(ProfileScan::last_used) {
+            last_used = last_used.max(t);
         }
         // A CI job's start reset fingerprint access times here and saved them.
         if let Some(t) = crate::ci::saved_last_use(root).into_values().max() {
@@ -172,7 +195,24 @@ impl BuildDir {
             device: fsutil::device(root),
             compile_ms: info.map_or(0, |i| i.compile_ms),
             linked: info.map(|i| i.linked.clone()).unwrap_or_default(),
+            scans,
         }
+    }
+
+    /// Each profile with what inspecting it found, listing any it has no
+    /// scan for.
+    fn scanned(&self) -> Vec<(&Profile, Cow<'_, ProfileScan>)> {
+        self.profiles
+            .iter()
+            .enumerate()
+            .map(|(i, profile)| {
+                let scan = match self.scans.get(i) {
+                    Some(scan) => Cow::Borrowed(scan),
+                    None => Cow::Owned(ProfileScan::read(profile)),
+                };
+                (profile, scan)
+            })
+            .collect()
     }
 
     /// Every workspace that built here is gone. Directories never seen by the
@@ -496,14 +536,29 @@ fn clean_dir(dir: &BuildDir, sweep: Sweep) -> (Cleanup, bool) {
         }
     }
     let saved = crate::ci::saved_last_use(&dir.root);
+    let scanned = dir.scanned();
+    // Which units builds still need is only worth working out (it reads
+    // every fingerprint) when some unit is idle enough to go.
+    let idle_unit = scanned
+        .iter()
+        .flat_map(|(_, scan)| &scan.units)
+        .any(|unit| {
+            let last_used = saved
+                .get(&unit.path.join("fingerprint"))
+                .map_or(unit.last_used, |t| unit.last_used.max(*t));
+            sweep.now.duration_since(last_used).unwrap_or_default() >= sweep.policy.unit_idle
+        });
     let live = if dir.pinned {
         None
-    } else {
+    } else if idle_unit {
         live_units(&dir.profiles, &saved, sweep)
+    } else {
+        Some(BTreeSet::new())
     };
-    for profile in &dir.profiles {
+    for (profile, scan) in &scanned {
         out.absorb(clean_profile(
             profile,
+            scan,
             &dir.root,
             dir.pinned,
             live.as_ref(),
@@ -575,13 +630,16 @@ fn live_units(
     )
 }
 
-/// `live`: the new-layout units builds still need ([`live_units`]); `None`
-/// keeps every unit. `saved`: when units were last used before a CI job's
-/// start reset their fingerprints' access times
+/// `scan`: what inspecting the profile found. What it shows idle is checked
+/// again (under the locks, when applying) before it goes: a build may have
+/// used it since. `live`: the new-layout units builds still need
+/// ([`live_units`]); `None` keeps every unit. `saved`: when units were last
+/// used before a CI job's start reset their fingerprints' access times
 /// ([`crate::ci::saved_last_use`]). What's removed is renamed aside into
 /// `root`, the build directory, first.
 fn clean_profile(
     profile: &Profile,
+    scan: &ProfileScan,
     root: &Path,
     pinned: bool,
     live: Option<&BTreeSet<PathBuf>>,
@@ -602,7 +660,7 @@ fn clean_profile(
     let idle = |t: SystemTime, limit: Duration| now.duration_since(t).unwrap_or_default() >= limit;
     let keep_after = now.checked_sub(policy.object_grace).unwrap_or(UNIX_EPOCH);
 
-    for dir in scan::object_dirs(profile) {
+    for dir in scan::object_dirs_of(profile, &scan.units) {
         let stale = scan::stale_objects_in(&dir, keep_after);
         if stale.is_empty() {
             continue;
@@ -629,11 +687,15 @@ fn clean_profile(
 
     // Old-layout files, once the new layout is in use here and no old-layout
     // build (an older pinned toolchain) has run for a while.
-    if profile.legacy
-        && profile.v2
-        && scan::legacy_last_used(&profile.path)
+    let legacy_idle = |last_used: Option<SystemTime>| {
+        last_used
             .max(saved_under(saved, &profile.path.join(".fingerprint")))
             .is_none_or(|t| idle(t, policy.legacy_idle))
+    };
+    if profile.legacy
+        && profile.v2
+        && legacy_idle(scan.legacy_last_used)
+        && legacy_idle(scan::legacy_last_used(&profile.path))
     {
         for path in scan::legacy_paths(&profile.path) {
             remove_dir(
@@ -648,18 +710,39 @@ fn clean_profile(
         }
     }
     if let Some(live) = live {
-        for mut unit in scan::v2_units(&profile.path) {
-            if let Some(t) = saved.get(&unit.path.join("fingerprint")) {
-                unit.last_used = unit.last_used.max(*t);
+        for unit in &scan.units {
+            let saved = saved.get(&unit.path.join("fingerprint"));
+            let with_saved = |t: SystemTime| saved.map_or(t, |s| t.max(*s));
+            if !idle(with_saved(unit.last_used), policy.unit_idle) || live.contains(&unit.path) {
+                continue;
             }
-            if idle(unit.last_used, policy.unit_idle) && !live.contains(&unit.path) {
+            let Some(now_used) = scan::unit_last_used(&unit.path).map(with_saved) else {
+                continue;
+            };
+            if idle(now_used, policy.unit_idle) {
+                let unit = Dated {
+                    path: unit.path.clone(),
+                    last_used: now_used,
+                };
                 remove_dated(Kind::IdleUnit, &unit, root, sweep, &mut out);
             }
         }
     }
     let mut sessions: Vec<PathBuf> = Vec::new();
-    for cache in scan::incremental_dirs(&profile.path) {
-        if idle(cache.last_used, policy.incremental_idle) {
+    for cache in &scan.incremental {
+        let now_used = if idle(cache.last_used, policy.incremental_idle) {
+            match scan::cache_last_used(&cache.path) {
+                Some(t) => t,
+                None => continue,
+            }
+        } else {
+            cache.last_used
+        };
+        if idle(now_used, policy.incremental_idle) {
+            let cache = Dated {
+                path: cache.path.clone(),
+                last_used: now_used,
+            };
             remove_dated(Kind::IdleIncremental, &cache, root, sweep, &mut out);
         } else {
             sessions.extend(scan::superseded_sessions(&cache.path));
@@ -1532,6 +1615,48 @@ mod tests {
     }
 
     #[test]
+    fn keeps_what_a_build_used_after_inspection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = build_dir(tmp.path(), "target");
+        let debug = root.join("debug");
+        let unit = debug.join("build/old/0123456789abcdef");
+        make(&unit.join("fingerprint/lib-old"));
+        make(&debug.join("build/gone/fedcba9876543210/fingerprint/lib-gone"));
+        make(&debug.join("incremental/old-1a2b/s-abc/dep-graph.bin"));
+        make(&debug.join(".fingerprint/old-0123456789abcdef/lib-old"));
+        age(&root, 15 * DAY);
+        let dir = BuildDir::inspect(&root, None);
+        assert_eq!(run_clean(std::slice::from_ref(&dir), false).len(), 4);
+
+        // Builds since: one unit and the cache are used again, the
+        // old-layout files too, and the other unit is gone.
+        make(&unit.join("fingerprint/lib-old"));
+        make(&debug.join("incremental/old-1a2b/s-abc/dep-graph.bin"));
+        make(&debug.join(".fingerprint/old-0123456789abcdef/lib-old"));
+        fs::remove_dir_all(debug.join("build/gone")).unwrap();
+        let actions = run_clean(&[dir], true);
+        assert!(actions.is_empty(), "{actions:?}");
+        assert!(unit.exists() && debug.join("incremental/old-1a2b").exists());
+        assert!(debug.join(".fingerprint").exists());
+    }
+
+    #[test]
+    fn cleans_a_build_dir_inspected_without_scans() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = build_dir(tmp.path(), "target");
+        make(&root.join("debug/incremental/old-1a2b/s-abc/dep-graph.bin"));
+        make(&root.join("debug/build/new/fedcba9876543210/fingerprint/lib-new"));
+        age(&root.join("debug/incremental"), 30 * DAY);
+        let mut dir = BuildDir::inspect(&root, None);
+        dir.scans.clear();
+        let actions = run_clean(&[dir], true);
+        assert_eq!(
+            actions.iter().map(|a| a.kind).collect::<Vec<_>>(),
+            [Kind::IdleIncremental]
+        );
+    }
+
+    #[test]
     fn goes_by_the_access_times_a_ci_job_saved_until_they_are_back() {
         let tmp = tempfile::tempdir().unwrap();
         let root = build_dir(tmp.path(), "target");
@@ -1864,6 +1989,7 @@ mod tests {
             device: None,
             compile_ms,
             linked: Default::default(),
+            scans: Vec::new(),
         }
     }
 

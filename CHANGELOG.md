@@ -78,6 +78,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   last used: `gc` goes by the saved times, and the next `ci start` (or
   `ci trim`) puts them back.
 
+### Changed
+
+- Cleanup lists each profile's units, incremental caches and fingerprints
+  once, when it inspects the build directory, and checks again under cargo's
+  locks only what it is about to remove; it reads fingerprints to find the
+  units builds still need only when some unit is idle enough to go. On 40
+  build directories, a cleanup that removes nothing takes about a third of
+  the time it did.
+
 ### Added
 
 - Cleanup removes the build directory of a deleted worktree at once, without
