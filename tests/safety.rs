@@ -207,7 +207,7 @@ fn the_process_guard_can_be_turned_off() {
 fn status_shows_both_sizes() {
     let fx = Fixture::new("");
     let dir = fx.build_dir("target", Duration::ZERO);
-    let status = fx.steward(&["status", "--sizes"]);
+    let status = fx.steward(&["status", "--sizes", "--discover"]);
     let header = status.lines().next().unwrap_or_default();
     assert!(
         header.contains("SIZE") && header.contains("UNSHARED"),

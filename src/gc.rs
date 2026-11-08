@@ -189,8 +189,16 @@ impl ProfileScan {
 
 impl BuildDir {
     fn inspect(root: &Path, info: Option<&RootInfo>) -> BuildDir {
+        Self::inspect_with(root, info, true)
+    }
+
+    fn inspect_with(root: &Path, info: Option<&RootInfo>, detailed: bool) -> BuildDir {
         let profiles = scan::profiles(root);
-        let scans: Vec<ProfileScan> = profiles.iter().map(ProfileScan::read).collect();
+        let scans: Vec<ProfileScan> = if detailed {
+            profiles.iter().map(ProfileScan::read).collect()
+        } else {
+            Vec::new()
+        };
         let mut last_used = info.map_or(UNIX_EPOCH, |i| {
             UNIX_EPOCH + Duration::from_secs(i.last_used)
         });
@@ -300,6 +308,23 @@ pub fn inventory(
         BuildDir::inspect(root, registry.roots.get(root))
     });
     Ok((registry, dirs))
+}
+
+/// Cheap, read-only status of build directories the wrapper has recorded.
+/// Full discovery and precise artifact-use scans remain in `inventory`.
+pub fn recorded_inventory(paths: &Paths) -> Vec<BuildDir> {
+    let registry = resolve_registry(&ledger::peek(paths), MOUNT_CONTAINERS);
+    let roots = scan::outermost(
+        registry
+            .roots
+            .keys()
+            .filter(|p| p.exists())
+            .cloned()
+            .collect(),
+    );
+    fsutil::parallel_map(&roots, |root| {
+        BuildDir::inspect_with(root, registry.roots.get(root), false)
+    })
 }
 
 /// Where volumes are mounted: macOS's `/Volumes`, and Linux's `/media`,

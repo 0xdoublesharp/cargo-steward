@@ -111,7 +111,7 @@ git worktree remove ../app-fix-login
 |---|---|---|
 | `setup` | Makes cargo-steward Cargo's rustc-wrapper, turns on automatic cleanup and sets scan roots. `--build-dir` also sets `build.build-dir`; `--volume` creates a macOS build volume | [Installation](docs/install.md#first-time-setup) |
 | `doctor` | Checks the setup and says what to change | |
-| `status` | Lists the build directories it manages, most recently used first, with layout; `--sizes` measures them | |
+| `status` | Quickly lists recorded build directories and their last observed compile; `--discover` scans for others and checks artifact use; `--sizes` measures disk use | |
 | `gc` | Shows what a cleanup would remove, by kind (`-v`: every item); `--apply` removes it now | [Cleanup](#what-gets-removed) |
 | `pin`, `unpin` | Keeps a build directory (named by any path inside it) out of cleanup, except its stale object files | |
 | `remove` | Removes whole build directories: the paths given, the one each `--worktree` builds into, or all whose workspaces were deleted with `--orphaned`, without waiting out `orphan-grace`. Previews without `--apply`; pinned ones need `--force` | |
@@ -129,7 +129,7 @@ git worktree remove ../app-fix-login
 cargo steward setup [--inner PROGRAM] [--scan-root DIR]... [--build-dir DIR]
                     [--no-auto-gc] [--volume NAME] [--undo] [--dry-run]
 cargo steward doctor [--json]
-cargo steward status [--sizes] [--json]
+cargo steward status [--discover] [--sizes] [--json]
 cargo steward gc [--apply] [-v] [--json]
 cargo steward pin DIR
 cargo steward unpin DIR

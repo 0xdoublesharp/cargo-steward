@@ -37,11 +37,14 @@ prints this document in place of its own:
 
 ## `status --json`
 
-The build directories cargo-steward manages, most recently used first.
+Recorded build directories and their last observed compile, most recently
+used first. `--discover` also searches the configured roots and checks
+artifact-use times. Routine status does not walk the scan roots.
 
 | Field | Type | |
 |---|---|---|
 | `sizes_measured` | bool | `--sizes` was given |
+| `discovery_performed` | bool | `--discover` searched scan roots and artifact use |
 | `build_dirs` | array | one object per build directory, below |
 | `build_dirs[].path` | string | the build directory's root |
 | `build_dirs[].last_used` | string | RFC 3339 |
@@ -61,6 +64,7 @@ The build directories cargo-steward manages, most recently used first.
 ```json
 {
   "version": 1,
+  "discovery_performed": false,
   "sizes_measured": true,
   "build_dirs": [
     {

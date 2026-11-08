@@ -1211,7 +1211,7 @@ fn finds_build_dirs_under_the_proxys_target_roots() {
     let dir = targets.join("app/cargo/app-0123456789/wt");
     fs::create_dir_all(dir.join("debug/.fingerprint/a-0123456789abcdef")).unwrap();
     fs::write(dir.join(".rustc_info.json"), "{}").unwrap();
-    let out = env.ok(&mut env.cmd(&env.root, &["status", "--json"]));
+    let out = env.ok(&mut env.cmd(&env.root, &["status", "--discover", "--json"]));
     let doc: serde_json::Value = serde_json::from_str(&out).unwrap();
     let found: Vec<&str> = doc["build_dirs"]
         .as_array()

@@ -102,7 +102,7 @@ the line. If a holder is your own background build, finish or stop it.
 | Command | Use |
 | --- | --- |
 | `cargo steward doctor [--json]` | Check the setup |
-| `cargo steward status [--sizes] [--json]` | Build directories, last use, sizes |
+| `cargo steward status [--discover] [--sizes] [--json]` | Recorded build directories and last observed compile; `--discover` also scans for unrecorded directories; `--sizes` measures disk use |
 | `cargo steward gc [--apply] [-v] [--json]` | Preview, or run, a cleanup |
 | `cargo steward remove (--worktree DIR \| BUILD_DIR... \| --orphaned) [--apply] [--json]` | Remove whole build directories safely |
 | `cargo steward pin DIR` / `unpin DIR` | Protect a build directory from cleanup |

@@ -296,10 +296,10 @@ fn failed_compiles_pass_through_and_keep_their_objects() {
 fn status_lists_build_dirs_found_under_scan_roots() {
     let fx = Fixture::new();
     fx.build(false);
-    let status = fx.steward(&["status", "--sizes"]);
+    let status = fx.steward(&["status", "--sizes", "--discover"]);
     assert!(status.contains(&*fx.target.to_string_lossy()), "{status}");
     // Cargo's `cargo steward` form works too.
-    let via_cargo = fx.steward(&["steward", "status"]);
+    let via_cargo = fx.steward(&["steward", "status", "--discover"]);
     assert!(
         via_cargo.contains(&*fx.target.to_string_lossy()),
         "{via_cargo}"

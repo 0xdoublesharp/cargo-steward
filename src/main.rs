@@ -58,6 +58,9 @@ enum Cmd {
     },
     /// List the build directories cargo-steward manages
     Status {
+        /// Also search scan-roots for unrecorded build directories (slower)
+        #[arg(long)]
+        discover: bool,
         /// Measure each directory's size (slower)
         #[arg(long)]
         sizes: bool,
@@ -176,7 +179,11 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Cmd::Setup(args) => setup::run(&args),
         Cmd::Doctor { json } => doctor::run(json),
-        Cmd::Status { sizes, json } => status::run(sizes, json),
+        Cmd::Status {
+            sizes,
+            json,
+            discover,
+        } => status::run(sizes, json, discover),
         Cmd::Gc {
             apply,
             verbose,

@@ -165,6 +165,34 @@ fn duplicate_pair(fx: &Fixture) -> (PathBuf, PathBuf) {
 }
 
 #[test]
+fn status_uses_records_until_full_discovery_is_requested() {
+    let fx = Fixture::new("");
+    let recorded = fx.build_dir("recorded", DAY);
+    let unrecorded = fx.build_dir("unrecorded", DAY);
+    fs::write(fx.home.join("registry.json"), serde_json::to_vec(&serde_json::json!({
+        "roots": {recorded.display().to_string(): {"last_used": 1, "workspaces": [], "compile_ms": 0}}
+    })).unwrap()).unwrap();
+    let (quick, _) = fx.steward_json(&["status"]);
+    assert_eq!(quick["build_dirs"].as_array().unwrap().len(), 1, "{quick}");
+    assert_eq!(
+        quick["build_dirs"][0]["path"],
+        recorded.display().to_string()
+    );
+    assert_eq!(quick["build_dirs"][0]["last_used"], "1970-01-01T00:00:01Z");
+    assert_eq!(quick["discovery_performed"], false);
+    let (full, _) = fx.steward_json(&["status", "--discover"]);
+    assert_eq!(full["build_dirs"].as_array().unwrap().len(), 2, "{full}");
+    assert_eq!(full["discovery_performed"], true);
+    assert!(
+        full["build_dirs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["path"] == unrecorded.display().to_string())
+    );
+}
+
+#[test]
 fn status_with_nothing_found_says_where_dirs_come_from() {
     let fx = Fixture::new("");
     let out = fx.steward(&["status"]);
@@ -420,7 +448,7 @@ fn status_json_lists_each_dir_with_its_flags() {
         ),
     )
     .unwrap();
-    let (doc, _) = fx.steward_json(&["status"]);
+    let (doc, _) = fx.steward_json(&["status", "--discover"]);
     assert_eq!(doc["sizes_measured"], false, "{doc}");
     assert_eq!(doc["total_bytes"], serde_json::Value::Null, "{doc}");
     let entry = &doc["build_dirs"][0];
@@ -444,7 +472,7 @@ fn status_json_with_sizes_measures_each_dir() {
     let fx = Fixture::new("");
     fx.build_dir("a", DAY);
     fx.build_dir("b", 2 * DAY);
-    let (doc, _) = fx.steward_json(&["status", "--sizes"]);
+    let (doc, _) = fx.steward_json(&["status", "--sizes", "--discover"]);
     assert_eq!(doc["sizes_measured"], true, "{doc}");
     let dirs = doc["build_dirs"].as_array().unwrap();
     // Most recently used first; each holds a 1 MiB file.

@@ -21,6 +21,11 @@ pub struct Stats {
     pub local_dir: Option<PathBuf>,
     pub size: Option<String>,
     pub max_size: Option<String>,
+    pub hits: Option<u64>,
+    pub misses: Option<u64>,
+    pub non_cacheable: u64,
+    pub reasons: BTreeMap<String, u64>,
+    pub base_dirs: Option<String>,
 }
 
 /// Parses the text form of `sccache --show-stats`, whose lines are a label
@@ -33,12 +38,24 @@ pub struct Stats {
 /// ```
 pub fn parse_stats(text: &str) -> Stats {
     let mut stats = Stats::default();
+    let mut reasons = false;
     for line in text.lines() {
+        if line.trim() == "Non-cacheable reasons:" {
+            reasons = true;
+            continue;
+        }
         let Some((label, value)) = line.split_once("  ") else {
             continue;
         };
         let value = value.trim();
+        let count = value.replace(',', "").parse::<u64>().ok();
         match label.trim() {
+            "Cache hits" => stats.hits = count,
+            "Cache misses" => stats.misses = count,
+            "Non-cacheable calls" | "Non-cacheable compilations" => {
+                stats.non_cacheable = stats.non_cacheable.saturating_add(count.unwrap_or(0));
+            }
+            "Base directories" => stats.base_dirs = Some(value.to_owned()),
             "Cache location" => {
                 stats.local_dir = value
                     .strip_prefix("Local disk:")
@@ -47,7 +64,12 @@ pub fn parse_stats(text: &str) -> Stats {
             }
             "Cache size" => stats.size = Some(value.to_owned()),
             "Max cache size" => stats.max_size = Some(value.to_owned()),
-            _ => {}
+            _ if reasons && count.is_some() => {
+                stats
+                    .reasons
+                    .insert(label.trim().to_owned(), count.unwrap_or(0));
+            }
+            _ => reasons = false,
         }
     }
     stats
@@ -182,6 +204,7 @@ pub fn report(out: &mut Report, probe: &Probe, workspaces: &BTreeSet<PathBuf>) {
                         .unwrap_or("unset (sccache's default is 10 GiB)")
                 ),
             );
+            effectiveness(out, stats);
             if let (Some(server), Some(here)) = (
                 &stats.local_dir,
                 env::var_os("SCCACHE_DIR").filter(|v| !v.is_empty()),
@@ -251,9 +274,96 @@ pub fn report(out: &mut Report, probe: &Probe, workspaces: &BTreeSet<PathBuf>) {
     );
 }
 
+fn effectiveness(out: &mut Report, stats: &Stats) {
+    if let (Some(hits), Some(misses)) = (stats.hits, stats.misses) {
+        let total = hits.saturating_add(misses);
+        let summary = if total == 0 {
+            "no cacheable requests yet".to_owned()
+        } else {
+            format!(
+                "{hits} hits, {misses} misses ({:.1}% hit rate among cacheable requests)",
+                hits as f64 / total as f64 * 100.0
+            )
+        };
+        out.say(Level::Info, format!("Cache effectiveness: {summary}; {} non-cacheable calls.\nCounters belong to the shared sccache server, including other builds.", stats.non_cacheable));
+    }
+    let mut reasons: Vec<_> = stats.reasons.iter().collect();
+    reasons.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+    if !reasons.is_empty() {
+        out.say(
+            Level::Info,
+            format!(
+                "Non-cacheable reasons: {}",
+                reasons
+                    .into_iter()
+                    .take(5)
+                    .map(|(name, count)| format!("{name}: {count}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        );
+    }
+    if stats
+        .reasons
+        .keys()
+        .any(|r| r.to_ascii_lowercase().contains("incremental"))
+    {
+        out.say(Level::Info, "Incremental workspace compiles bypass sccache; dependency compiles can still hit.\nKeep incremental compilation for warm local edit/build cycles. For clean CI builds that do not retain incremental state, CARGO_INCREMENTAL=0 makes eligible compiles cacheable.");
+    }
+    if stats.misses.is_some_and(|n| n > 0) && stats.base_dirs.as_deref() == Some("(none)") {
+        out.say(Level::Info, "Cross-worktree cache misses can come from absolute checkout paths; no sccache base directories are configured.\nSCCACHE_BASEDIRS can normalize checkout roots, but cached debug paths and embedded CARGO_MANIFEST_DIR values then refer to the producer checkout. Check those semantics before enabling it.");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reports_cache_effectiveness_and_why_compiles_are_not_cached() {
+        let stats = parse_stats(
+            "Compile requests                    140\n\
+             Cache hits                           80\n\
+             Cache hits (Rust)                    80\n\
+             Cache misses                         20\n\
+             Cache misses (Rust)                  20\n\
+             Non-cacheable calls                  40\n\
+             \n\
+             Non-cacheable reasons:\n\
+             incremental                         30\n\
+             crate-type (bin)                     10\n\
+             \n\
+             Cache location                  Local disk: \"/cache\"\n",
+        );
+        let probe = Probe {
+            program: Some(PathBuf::from("sccache")),
+            stats: Some(stats),
+            measured: None,
+        };
+        let mut out = Report::default();
+        report(&mut out, &probe, &BTreeSet::new());
+        let text = out.text();
+        assert!(text.contains("80 hits, 20 misses (80.0%"), "{text}");
+        assert!(text.contains("40 non-cacheable calls"), "{text}");
+        assert!(text.contains("incremental: 30"), "{text}");
+        assert!(text.contains("crate-type (bin): 10"), "{text}");
+    }
+
+    #[test]
+    fn a_cache_without_requests_is_not_reported_as_a_zero_percent_hit_rate() {
+        let probe = Probe {
+            program: Some(PathBuf::from("sccache")),
+            stats: Some(parse_stats("Cache hits    0\nCache misses    0\n")),
+            measured: None,
+        };
+        let mut out = Report::default();
+        report(&mut out, &probe, &BTreeSet::new());
+        assert!(
+            out.text().contains("no cacheable requests yet"),
+            "{}",
+            out.text()
+        );
+    }
 
     #[test]
     fn parses_sccache_stats() {

@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Routine `status` no longer walks every scan root or every incremental
+  session. It reports recorded build directories; `--discover` performs the
+  full scan. Discovery uses directory-entry types instead of a metadata
+  syscall for every file, including compiler-cache blobs.
+- `doctor` reports sccache hit/miss counts, non-cacheable reasons and path
+  normalization guidance, distinguishing incremental local builds from
+  disposable CI builds.
 - Compile-limit integration tests use a parent-controlled start/release
   barrier instead of a shared busy-directory marker, so fast compiler
   processes cannot make the overlap assertion depend on scheduling.

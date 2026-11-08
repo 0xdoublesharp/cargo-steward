@@ -10,17 +10,21 @@ use crate::fsutil::{self, Usage, ago, human};
 use crate::gc::{self, BuildDir};
 use crate::json;
 
-pub fn run(sizes: bool, as_json: bool) -> Result<()> {
+pub fn run(sizes: bool, as_json: bool, discover: bool) -> Result<()> {
     let paths = Paths::resolve().context("cannot locate the home directory")?;
     let config = config::load_warning(&paths);
-    let (_, mut dirs) = gc::inventory(&paths, &gc::scan_roots(&config), false)?;
+    let mut dirs = if discover {
+        gc::inventory(&paths, &gc::scan_roots(&config), false)?.1
+    } else {
+        gc::recorded_inventory(&paths)
+    };
     if as_json {
-        return json::print(&document(dirs, sizes));
+        return json::print(&document(dirs, sizes, discover));
     }
     if dirs.is_empty() {
         println!("No build directories found yet.");
         println!(
-            "They are recorded as you build, and found under `scan-roots` in {}.",
+            "They are recorded as you build. Run `cargo steward status --discover` to search\nscan-roots in {}.",
             paths.config().display()
         );
         return Ok(());
@@ -95,6 +99,11 @@ pub fn run(sizes: bool, as_json: bool) -> Result<()> {
     if !sizes.iter().any(Option::is_some) {
         println!("Run with --sizes to measure each directory.");
     }
+    if !discover {
+        println!(
+            "Recorded builds and their last observed compile; --discover scans other directories and artifact use."
+        );
+    }
     Ok(())
 }
 
@@ -102,6 +111,7 @@ pub fn run(sizes: bool, as_json: bool) -> Result<()> {
 #[derive(Serialize)]
 struct Document {
     version: u32,
+    discovery_performed: bool,
     /// Whether sizes were measured (`--sizes`).
     sizes_measured: bool,
     /// Most recently used first.
@@ -137,7 +147,7 @@ struct Disk {
     free_bytes: u64,
 }
 
-fn document(mut dirs: Vec<BuildDir>, sizes: bool) -> Document {
+fn document(mut dirs: Vec<BuildDir>, sizes: bool, discover: bool) -> Document {
     dirs.sort_by_key(|d| std::cmp::Reverse(d.last_used));
     let usages: Vec<Option<Usage>> = if sizes {
         fsutil::parallel_map(&dirs, |d| Some(fsutil::tree_usage(&d.root)))
@@ -158,6 +168,7 @@ fn document(mut dirs: Vec<BuildDir>, sizes: bool) -> Document {
     let measured: Option<Vec<Usage>> = sizes.then(|| usages.iter().flatten().copied().collect());
     Document {
         version: json::VERSION,
+        discovery_performed: discover,
         sizes_measured: sizes,
         total_bytes: measured
             .as_ref()

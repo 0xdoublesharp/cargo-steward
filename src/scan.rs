@@ -121,13 +121,15 @@ pub fn discover(roots: &[PathBuf], max_depth: usize) -> Vec<PathBuf> {
         if depth >= max_depth || has_cargo_tag(&dir) {
             continue;
         }
-        for (name, path) in entries(&dir) {
-            if SKIP_DIRS.contains(&name.as_str()) || name.starts_with(crate::fsutil::TRASH_PREFIX) {
+        // read_dir already carries file types on APFS and common Linux
+        // filesystems. Asking lstat about every cache blob here makes a
+        // scan of a shared compiler cache cost millions of syscalls.
+        for path in subdirs(&dir) {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            if SKIP_DIRS.contains(&name.as_ref()) || name.starts_with(crate::fsutil::TRASH_PREFIX) {
                 continue;
             }
-            if fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
-                stack.push((path, depth + 1));
-            }
+            stack.push((path, depth + 1));
         }
     }
     outermost(found)
