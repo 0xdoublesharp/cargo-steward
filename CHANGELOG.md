@@ -80,6 +80,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `--json` for `status`, `gc`, `remove`, `dedup`, `doctor` and
+  `shim explain`: one JSON document on stdout, with sizes in bytes, RFC 3339
+  times and stable ids for kinds and statuses, so scripts and agents don't
+  parse text. `shim explain --json` includes the free space where the target
+  directory goes. [docs/json.md](docs/json.md) describes each document.
 - `link-target` setting for the `cargo` proxy: when it routes a workspace's
   build output, it also points a missing `<workspace>/target` at the routed
   directory (only where git ignores `target`), so `./target` paths and builds
