@@ -31,7 +31,7 @@ pub use guard::Running;
 
 use crate::config::{self, Paths, Policy};
 use crate::fsutil::{self, Lock, human};
-use crate::ledger::{self, Registry, RootInfo};
+use crate::ledger::{self, Linked, Registry, RootInfo};
 use crate::scan::{self, Dated, Profile};
 
 /// A file a pinned build directory carries: only stale objects are removed
@@ -123,6 +123,8 @@ pub struct BuildDir {
     /// Compile time the wrapper has recorded here, in milliseconds: a rough
     /// measure of what rebuilding it costs. 0 when none is recorded.
     pub compile_ms: u64,
+    /// The linked git worktree each of `workspaces` was in, for those in one.
+    pub linked: BTreeMap<PathBuf, Linked>,
 }
 
 impl BuildDir {
@@ -166,6 +168,7 @@ impl BuildDir {
             pinned: root.join(PIN_FILE).exists(),
             device: fsutil::device(root),
             compile_ms: info.map_or(0, |i| i.compile_ms),
+            linked: info.map(|i| i.linked.clone()).unwrap_or_default(),
         }
     }
 
@@ -173,6 +176,18 @@ impl BuildDir {
     /// wrapper have no recorded workspaces and are never orphans.
     pub fn orphaned(&self) -> bool {
         !self.workspaces.is_empty() && self.workspaces.iter().all(|w| !w.exists())
+    }
+
+    /// Orphaned, and git confirms it: every workspace was in a linked
+    /// worktree that git no longer has ([`crate::proxy::worktree_dropped`]).
+    /// Nothing will build here again, so there's no grace to wait out.
+    pub fn dropped_by_git(&self) -> bool {
+        self.orphaned()
+            && self.workspaces.iter().all(|w| {
+                self.linked
+                    .get(w)
+                    .is_some_and(|l| crate::proxy::worktree_dropped(&l.admin, &l.worktree))
+            })
     }
 
     fn idle_for(&self, now: SystemTime) -> Duration {
@@ -450,6 +465,14 @@ fn clean_dir(dir: &BuildDir, sweep: Sweep) -> (Cleanup, bool) {
                 Kind::Orphaned,
                 format!(
                     "workspaces deleted, unused for {}",
+                    fsutil::ago(dir.last_used)
+                ),
+            ))
+        } else if dir.dropped_by_git() {
+            Some((
+                Kind::Orphaned,
+                format!(
+                    "worktrees removed from git, unused for {}",
                     fsutil::ago(dir.last_used)
                 ),
             ))
@@ -1475,6 +1498,7 @@ mod tests {
             last_used: ledger::now_secs() - 3 * 86_400,
             workspaces: BTreeSet::from([tmp.path().join("deleted-worktree")]),
             compile_ms: 0,
+            linked: BTreeMap::new(),
         };
         let dirs = vec![
             BuildDir::inspect(&orphan, Some(&info)),
@@ -1497,6 +1521,61 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    #[test]
+    fn removes_at_once_a_build_dir_whose_worktrees_git_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let common = base.join("repo/.git");
+        for dir in ["objects", "refs", "worktrees/listed"] {
+            fs::create_dir_all(common.join(dir)).unwrap();
+        }
+        fs::write(common.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        // Deleted, and git still lists it: prunable, not certain.
+        fs::write(
+            common.join("worktrees/listed/gitdir"),
+            format!("{}\n", base.join("wts/listed/.git").display()),
+        )
+        .unwrap();
+        let linked = |name: &str| Linked {
+            admin: common.join("worktrees").join(name),
+            worktree: base.join("wts").join(name),
+        };
+        let info = |names: &[&str], unknown: bool| {
+            let mut info = RootInfo {
+                last_used: ledger::now_secs(),
+                ..RootInfo::default()
+            };
+            for name in names {
+                let workspace = base.join("wts").join(name).join("crate");
+                info.workspaces.insert(workspace.clone());
+                info.linked.insert(workspace, linked(name));
+            }
+            if unknown {
+                info.workspaces.insert(base.join("loose"));
+            }
+            info
+        };
+        let mut dirs = Vec::new();
+        for (name, info) in [
+            ("removed", info(&["a", "b"], false)),
+            ("mixed", info(&["c"], true)),
+            ("listed", info(&["listed"], false)),
+        ] {
+            let root = build_dir(&base, name);
+            make(&root.join("debug/.fingerprint/a-0123456789abcdef/lib-a"));
+            dirs.push(BuildDir::inspect(&root, Some(&info)));
+        }
+        assert!(dirs[0].dropped_by_git());
+        assert!(!dirs[1].dropped_by_git() && dirs[1].orphaned());
+        assert!(!dirs[2].dropped_by_git() && dirs[2].orphaned());
+        let actions = run_clean(&dirs, true);
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        assert_eq!(actions[0].kind, Kind::Orphaned);
+        assert!(actions[0].note.starts_with("worktrees removed from git"));
+        assert!(!base.join("removed").exists());
+        assert!(base.join("mixed").exists() && base.join("listed").exists());
     }
 
     #[test]
@@ -1643,6 +1722,7 @@ mod tests {
             pinned: false,
             device: None,
             compile_ms,
+            linked: Default::default(),
         }
     }
 
@@ -1736,6 +1816,7 @@ mod tests {
                     last_used: ledger::now_secs() - u64::from(idle_days) * 86_400,
                     workspaces: BTreeSet::new(),
                     compile_ms,
+                    linked: BTreeMap::new(),
                 },
             );
             dirs.push(BuildDir::inspect(&root, info.get(name)));
@@ -1818,6 +1899,7 @@ mod tests {
                 last_used: 5,
                 workspaces: [base.join("gone")].into(),
                 compile_ms: 7,
+                linked: BTreeMap::new(),
             },
         );
         recorded.roots.insert(
@@ -1826,6 +1908,7 @@ mod tests {
                 last_used: 9,
                 workspaces: Default::default(),
                 compile_ms: 1,
+                linked: BTreeMap::new(),
             },
         );
         // An entry whose directory is gone is dropped.
@@ -2251,6 +2334,7 @@ mod tests {
             last_used: 5,
             workspaces: [base.join("ws")].into(),
             compile_ms: 7,
+            linked: BTreeMap::new(),
         };
         let mut recorded = Registry::default();
         // Its volume isn't mounted: kept.

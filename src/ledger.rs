@@ -30,6 +30,19 @@ pub struct Record {
     /// How long the compile took.
     #[serde(default)]
     pub ms: u64,
+    /// The linked git worktree the package is in, if it is in one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linked: Option<Linked>,
+}
+
+/// Where git keeps a linked worktree (`git worktree add`): what cleanup asks
+/// git about once the worktree is gone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Linked {
+    /// Its admin directory, `<repository>/worktrees/<name>`.
+    pub admin: PathBuf,
+    /// The worktree: the directory holding its `.git` file.
+    pub worktree: PathBuf,
 }
 
 pub fn now_secs() -> u64 {
@@ -68,6 +81,9 @@ pub struct RootInfo {
     pub workspaces: BTreeSet<PathBuf>,
     /// Total compile time seen, a rough measure of what rebuilding costs.
     pub compile_ms: u64,
+    /// The linked worktree each of `workspaces` was in, for those in one.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub linked: BTreeMap<PathBuf, Linked>,
 }
 
 impl RootInfo {
@@ -76,6 +92,11 @@ impl RootInfo {
         self.last_used = self.last_used.max(other.last_used);
         self.compile_ms = self.compile_ms.saturating_add(other.compile_ms);
         self.workspaces.extend(other.workspaces.iter().cloned());
+        for (workspace, linked) in &other.linked {
+            self.linked
+                .entry(workspace.clone())
+                .or_insert_with(|| linked.clone());
+        }
     }
 }
 
@@ -85,6 +106,11 @@ impl Registry {
         info.last_used = info.last_used.max(record.ts);
         info.compile_ms = info.compile_ms.saturating_add(record.ms);
         if let Some(workspace) = record.workspace {
+            // The latest record says where the workspace is now.
+            match record.linked {
+                Some(linked) => info.linked.insert(workspace.clone(), linked),
+                None => info.linked.remove(&workspace),
+            };
             info.workspaces.insert(workspace);
         }
     }
@@ -177,6 +203,7 @@ mod tests {
                     root: root.clone(),
                     workspace: ws.map(PathBuf::from),
                     ms: 5,
+                    linked: None,
                 },
             );
         }
@@ -203,6 +230,7 @@ mod tests {
                 root: root.clone(),
                 workspace: None,
                 ms: 1,
+                linked: None,
             },
         );
         let registry = compact(&paths).unwrap();
@@ -211,16 +239,62 @@ mod tests {
     }
 
     #[test]
+    fn keeps_where_each_workspace_was_in_git_and_reads_older_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            home: tmp.path().to_path_buf(),
+        };
+        // A registry and a ledger line written before worktrees were recorded.
+        fs::write(
+            paths.registry(),
+            r#"{"roots":{"/b/old":{"last_used":5,"workspaces":["/w/old"],"compile_ms":1}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            paths.ledger(),
+            "{\"ts\":6,\"root\":\"/b/old\",\"workspace\":\"/w/old\",\"ms\":1}\n",
+        )
+        .unwrap();
+        let root = PathBuf::from("/b/target");
+        let linked = Linked {
+            admin: "/r/.git/worktrees/wt".into(),
+            worktree: "/w/wt".into(),
+        };
+        let record = |ts, linked: Option<Linked>| Record {
+            ts,
+            root: root.clone(),
+            workspace: Some("/w/wt/crate".into()),
+            ms: 1,
+            linked,
+        };
+        append(&paths, &record(10, Some(linked.clone())));
+        let registry = compact(&paths).unwrap();
+        assert_eq!(registry.roots[&PathBuf::from("/b/old")].last_used, 6);
+        assert!(registry.roots[&PathBuf::from("/b/old")].linked.is_empty());
+        assert_eq!(
+            registry.roots[&root].linked[&PathBuf::from("/w/wt/crate")],
+            linked
+        );
+        // The latest record decides: that path is no longer in a worktree.
+        append(&paths, &record(20, None));
+        let registry = compact(&paths).unwrap();
+        assert!(registry.roots[&root].linked.is_empty());
+        assert_eq!(load(&paths), registry);
+    }
+
+    #[test]
     fn absorb_keeps_the_latest_use_and_sums_compile_time() {
         let mut a = RootInfo {
             last_used: 10,
             workspaces: [PathBuf::from("/w/a")].into(),
             compile_ms: 5,
+            linked: BTreeMap::new(),
         };
         let b = RootInfo {
             last_used: 7,
             workspaces: [PathBuf::from("/w/b")].into(),
             compile_ms: u64::MAX,
+            linked: BTreeMap::new(),
         };
         a.absorb(&b);
         assert_eq!(a.last_used, 10);
@@ -243,6 +317,7 @@ mod tests {
                 root: PathBuf::from("/x"),
                 workspace: None,
                 ms: 0,
+                linked: None,
             },
         );
         assert_eq!(fs::metadata(paths.ledger()).unwrap().len(), MAX_LEDGER + 1);
@@ -263,6 +338,7 @@ mod tests {
                 root: PathBuf::from("/x"),
                 workspace: None,
                 ms: 0,
+                linked: None,
             },
         );
         let mode = |m| fs::set_permissions(&paths.home, fs::Permissions::from_mode(m)).unwrap();
@@ -288,6 +364,7 @@ mod tests {
             root: root.clone(),
             workspace: None,
             ms: 2,
+            linked: None,
         };
         append(&paths, &record(10));
         compact(&paths).unwrap();

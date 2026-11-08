@@ -111,7 +111,7 @@ Cheapest-to-rebuild first. Every threshold is a setting.
 | Old-layout files (`deps/`, `.fingerprint/`, `build/<pkg>-<hash>/`) | Once Cargo 1.100's layout is in use in that directory and no older toolchain has built there for `legacy-idle` (3 days) | None |
 | A crate's incremental cache | Unused for `incremental-idle` (7 days) | That crate compiles from scratch once |
 | A build unit (new layout) | Unused for `unit-idle` (14 days), and no unit used since was built from it (cargo's fingerprints link them) | That unit rebuilds if needed again |
-| A whole build directory | Every workspace that built there is deleted, for `orphan-grace` (2 days); or unused for `dir-idle` (21 days) | Full rebuild |
+| A whole build directory | Every workspace that built there is deleted: at once when each was a linked worktree that git has removed (`git worktree remove`, `prune`), else after `orphan-grace` (2 days); or unused for `dir-idle` (21 days) | Full rebuild |
 | Whole build directories, cheapest to rebuild first (idle time × unshared size ÷ recorded compile time) | The disk has under `min-free` (50 GiB) free; until it has `target-free` (100 GiB), or until removals stop raising free space (local snapshots or clones holding it). Never one used within `recent-guard` (1 day) | Full rebuild |
 
 Safety:
@@ -191,9 +191,12 @@ handed straight to rustc. Measured overhead is under a millisecond per
 compile, and about 4 ms on cargo's cached version probe.
 
 For workspace members, the wrapper also appends one line to a ledger: which
-build directory, which package, how long the compile took. Cleanup compacts it
+build directory, which package, which linked git worktree it's in (read from
+`.git`, without running git), how long the compile took. Cleanup compacts it
 into a registry. That's how cleanup knows when a directory was last used, and
-when every worktree that built into it is gone.
+when every worktree that built into it is gone. Once one is gone, cleanup
+asks its repository: a worktree whose admin directory
+(`.git/worktrees/<name>`) is gone was removed for good.
 
 When a cleanup is due, the wrapper starts `cargo-steward gc --auto` in its own
 session, at background CPU and I/O priority, with its output going to the log,

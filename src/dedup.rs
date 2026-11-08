@@ -563,6 +563,7 @@ mod tests {
             pinned: false,
             device: fsutil::device(root),
             compile_ms: 0,
+            linked: Default::default(),
         }
     }
 

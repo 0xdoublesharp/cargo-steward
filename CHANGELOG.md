@@ -80,6 +80,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Cleanup removes the build directory of a deleted worktree at once, without
+  waiting out `orphan-grace`, when git confirms it: every workspace that built
+  there was in a linked worktree whose admin directory git has removed. The
+  wrapper records each workspace's worktree in the ledger for this; older
+  ledgers and registries still read, and their directories keep the grace.
 - `link-target` setting for the `cargo` proxy: when it routes a workspace's
   build output, it also points a missing `<workspace>/target` at the routed
   directory (only where git ignores `target`), so `./target` paths and builds

@@ -25,6 +25,7 @@ use anyhow::{Result, bail};
 
 use crate::config::{self, Config, Paths};
 use route::Namespace;
+pub use route::{linked_worktree, worktree_dropped};
 
 /// `cargo steward shim`.
 #[derive(Debug, clap::Args)]

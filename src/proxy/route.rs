@@ -75,6 +75,52 @@ pub fn find_git(start: &Path) -> Option<GitDirs> {
     None
 }
 
+/// The linked worktree containing `start`, as `(admin directory, worktree)`,
+/// both resolved. `None` in a main checkout or outside git.
+pub fn linked_worktree(start: &Path) -> Option<(PathBuf, PathBuf)> {
+    let git = find_git(start)?;
+    if !git.linked() {
+        return None;
+    }
+    let worktree = git.worktree?.canonicalize().ok()?;
+    Some((git.checkout, worktree))
+}
+
+/// Whether git no longer has the linked worktree that was at `worktree`,
+/// with its admin directory at `admin`: the repository is still there, and
+/// the admin directory is gone (`git worktree remove`, `git worktree prune`),
+/// or now names another worktree that is gone too. Anything else, such as a
+/// repository that isn't there (moved, or on a volume that isn't mounted) or
+/// a name now used by a worktree that exists, isn't certain: `false`.
+pub fn worktree_dropped(admin: &Path, worktree: &Path) -> bool {
+    let Some(common) = admin
+        .parent()
+        .filter(|p| p.file_name() == Some(OsStr::new("worktrees")))
+        .and_then(Path::parent)
+    else {
+        return false;
+    };
+    if !is_git_dir(common) {
+        return false;
+    }
+    let listed = match fs::read_to_string(admin.join("gitdir")) {
+        Ok(text) => text.trim_end_matches(['\n', '\r']).to_owned(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return fs::symlink_metadata(admin)
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+        }
+        Err(_) => return false,
+    };
+    // `<worktree>/.git`, relative to the admin directory with
+    // `worktree.useRelativePaths`.
+    let listed = resolve(&admin.join(listed));
+    let Some(other) = listed.parent() else {
+        return false;
+    };
+    other != worktree
+        && fs::symlink_metadata(other).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+}
+
 /// Whether `dir` is a git directory: `HEAD`, and `objects` and `refs` or a
 /// `commondir` pointing at them.
 fn is_git_dir(dir: &Path) -> bool {
@@ -367,6 +413,58 @@ mod tests {
         let ns = Namespace::of(&wt);
         assert_eq!(ns.key, "feature-x");
         assert_eq!(ns.repo, repo_name("repo", common.as_os_str()));
+    }
+
+    #[test]
+    fn tells_when_git_no_longer_has_a_linked_worktree() {
+        let (_tmp, root) = tempdir();
+        let common = root.join("repo/.git");
+        git_dir(&common);
+        let admin = common.join("worktrees/wt");
+        let wt = root.join("wts/wt");
+        let link = |admin: &Path, wt: &Path, gitdir: &str| {
+            fs::create_dir_all(admin).unwrap();
+            fs::write(admin.join("HEAD"), "ref: refs/heads/x\n").unwrap();
+            fs::write(admin.join("commondir"), "../..\n").unwrap();
+            fs::write(admin.join("gitdir"), format!("{gitdir}\n")).unwrap();
+            fs::create_dir_all(wt.join("src")).unwrap();
+            fs::write(wt.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
+        };
+        link(&admin, &wt, &wt.join(".git").display().to_string());
+        assert_eq!(
+            linked_worktree(&wt.join("src")),
+            Some((admin.clone(), wt.clone()))
+        );
+        assert_eq!(linked_worktree(&root.join("repo")), None);
+        assert_eq!(linked_worktree(&root.join("wts")), None);
+
+        // Deleted, but git still lists it (prunable): not certain.
+        fs::remove_dir_all(&wt).unwrap();
+        assert!(!worktree_dropped(&admin, &wt));
+        // `git worktree remove` or `prune`: gone from git.
+        fs::remove_dir_all(&admin).unwrap();
+        assert!(worktree_dropped(&admin, &wt));
+        // The name now belongs to a worktree elsewhere that exists: the
+        // proxy routes that one to the same build directory, so not certain.
+        let other = root.join("elsewhere/wt");
+        link(&admin, &other, &other.join(".git").display().to_string());
+        assert!(!worktree_dropped(&admin, &wt));
+        // ...and once that one is deleted too, certain. A relative path
+        // (`worktree.useRelativePaths`) is relative to the admin directory.
+        fs::remove_dir_all(&other).unwrap();
+        assert!(worktree_dropped(&admin, &wt));
+        fs::write(admin.join("gitdir"), "../../../../wts/wt/.git\n").unwrap();
+        assert!(!worktree_dropped(&admin, &wt));
+        // An admin directory without its `gitdir` file: unknown.
+        fs::remove_file(admin.join("gitdir")).unwrap();
+        assert!(!worktree_dropped(&admin, &wt));
+        // The repository itself is gone (or unmounted): unknown.
+        fs::remove_dir_all(&admin).unwrap();
+        assert!(worktree_dropped(&admin, &wt));
+        fs::remove_dir_all(&common).unwrap();
+        assert!(!worktree_dropped(&admin, &wt));
+        // Not an admin directory at all.
+        assert!(!worktree_dropped(&root.join("x"), &wt));
     }
 
     #[test]

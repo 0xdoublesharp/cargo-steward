@@ -319,13 +319,21 @@ fn after_compile(paths: &Paths, config: &Config, out_dir: &Path, took: Duration)
     let Some(root) = scan::find_root(out_dir) else {
         return;
     };
+    let workspace = env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from);
+    // A few stat calls up to the worktree's `.git`: lets cleanup ask git
+    // whether the worktree was removed, once it's gone.
+    let linked = workspace
+        .as_deref()
+        .and_then(crate::proxy::linked_worktree)
+        .map(|(admin, worktree)| ledger::Linked { admin, worktree });
     ledger::append(
         paths,
         &ledger::Record {
             ts: ledger::now_secs(),
             root,
-            workspace: env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from),
+            workspace,
             ms: took.as_millis().try_into().unwrap_or(u64::MAX),
+            linked,
         },
     );
     if config.auto_gc && gc_due(paths, config, out_dir) {

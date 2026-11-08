@@ -67,8 +67,9 @@ If it isn't installed, none of this applies; follow the project's own rules.
    git worktree remove <path>
    ```
 
-   If the worktree is already gone, cleanup removes its build directory a
-   couple of days later on its own. Never remove build directories, or
+   If the worktree is already gone, cleanup removes its build directory on
+   its own: right away once `git worktree remove` (or `prune`) has removed
+   it, otherwise a couple of days later. Never remove build directories, or
    worktrees, that another task or person owns.
 5. **Protect a build directory a long run depends on** (a benchmark baseline,
    a node under test) with `cargo steward pin <build dir>`, and

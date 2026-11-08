@@ -295,6 +295,7 @@ mod tests {
             root: root.into(),
             workspace: None,
             ms: 0,
+            linked: None,
         };
         ledger::append(&paths, &record("/b/one"));
         ledger::compact(&paths).unwrap();

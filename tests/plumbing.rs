@@ -862,3 +862,94 @@ fn the_wrapper_records_workspace_compiles_in_the_ledger() {
         .env("CARGO_PRIMARY_PACKAGE", "1"));
     assert_eq!(fs::read_to_string(&ledger).unwrap().lines().count(), 1);
 }
+
+#[test]
+fn a_build_dir_goes_as_soon_as_git_removes_its_worktree() {
+    let env = Env::new();
+    env.config("auto-gc = false\ndedup = false\n");
+    let repo = env.root.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    fs::write(repo.join("README"), "x").unwrap();
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "init"]);
+    let wt = env.root.join("wts/feature");
+    git(&repo, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+    fs::create_dir_all(wt.join("crate")).unwrap();
+
+    // Built outside the worktree, as the cargo proxy routes it.
+    let target = env.root.join("build/feature");
+    let deps = target.join("debug/deps");
+    fs::create_dir_all(&deps).unwrap();
+    fs::write(target.join(".rustc_info.json"), "{}").unwrap();
+    let rustc = fake_rustc(&env.root, "exit 0");
+    let compile = |manifest: &Path| {
+        env.ok(env
+            .cmd(
+                &env.root,
+                &[
+                    rustc.to_str().unwrap(),
+                    "--crate-name",
+                    "app",
+                    "--out-dir",
+                    deps.to_str().unwrap(),
+                ],
+            )
+            .env("CARGO_PRIMARY_PACKAGE", "1")
+            .env("CARGO_MANIFEST_DIR", manifest));
+    };
+    compile(&wt.join("crate"));
+    let ledger = fs::read_to_string(env.home.join("ledger.jsonl")).unwrap();
+    assert!(
+        ledger.contains(&format!(
+            "\"worktree\":\"{}\"",
+            wt.canonicalize().unwrap().display()
+        )),
+        "{ledger}"
+    );
+    assert!(ledger.contains("worktrees/feature"), "{ledger}");
+
+    // While the worktree exists, nothing happens.
+    let out = env.ok(&mut env.cmd(&env.root, &["gc", "--apply"]));
+    assert!(target.exists(), "{out}");
+
+    git(
+        &repo,
+        &["worktree", "remove", "--force", wt.to_str().unwrap()],
+    );
+    let out = env.ok(&mut env.cmd(&env.root, &["gc", "--apply"]));
+    assert!(out.contains("worktrees removed from git"), "{out}");
+    assert!(!target.exists(), "{out}");
+}
+
+#[test]
+fn a_deleted_main_checkout_keeps_the_grace() {
+    let env = Env::new();
+    env.config("auto-gc = false\ndedup = false\n");
+    let repo = env.root.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    let target = env.root.join("build/main");
+    let deps = target.join("debug/deps");
+    fs::create_dir_all(&deps).unwrap();
+    fs::write(target.join(".rustc_info.json"), "{}").unwrap();
+    let rustc = fake_rustc(&env.root, "exit 0");
+    env.ok(env
+        .cmd(
+            &env.root,
+            &[
+                rustc.to_str().unwrap(),
+                "--crate-name",
+                "app",
+                "--out-dir",
+                deps.to_str().unwrap(),
+            ],
+        )
+        .env("CARGO_PRIMARY_PACKAGE", "1")
+        .env("CARGO_MANIFEST_DIR", &repo));
+    let ledger = fs::read_to_string(env.home.join("ledger.jsonl")).unwrap();
+    assert!(!ledger.contains("linked"), "{ledger}");
+    fs::remove_dir_all(&repo).unwrap();
+    let out = env.ok(&mut env.cmd(&env.root, &["gc", "--apply"]));
+    assert!(target.exists(), "{out}");
+}
