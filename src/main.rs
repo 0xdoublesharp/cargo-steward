@@ -99,6 +99,10 @@ enum Cmd {
         /// before deleting the worktree)
         #[arg(long, value_name = "DIR")]
         worktree: Vec<PathBuf>,
+        /// Remove every build directory whose recorded workspaces were all
+        /// deleted, without waiting out `orphan-grace`
+        #[arg(long)]
+        orphaned: bool,
         /// Remove them; otherwise only report
         #[arg(long)]
         apply: bool,
@@ -180,9 +184,10 @@ fn main() -> ExitCode {
         Cmd::Remove {
             build_dirs,
             worktree,
+            orphaned,
             apply,
             force,
-        } => remove(build_dirs, &worktree, apply, force),
+        } => remove(build_dirs, &worktree, orphaned, apply, force),
         Cmd::Skill(args) => skill::run(&args),
     };
     match result {
@@ -209,7 +214,13 @@ fn is_wrapper_call(first: &OsString) -> bool {
         || env::var_os("CARGO").is_some()
 }
 
-fn remove(mut dirs: Vec<PathBuf>, worktrees: &[PathBuf], apply: bool, force: bool) -> Result<()> {
+fn remove(
+    mut dirs: Vec<PathBuf>,
+    worktrees: &[PathBuf],
+    orphaned: bool,
+    apply: bool,
+    force: bool,
+) -> Result<()> {
     for worktree in worktrees {
         let dir = gc::build_dir_of(worktree)?;
         println!("{} builds into {}", worktree.display(), dir.display());
@@ -217,11 +228,11 @@ fn remove(mut dirs: Vec<PathBuf>, worktrees: &[PathBuf], apply: bool, force: boo
             dirs.push(dir);
         }
     }
-    if dirs.is_empty() {
+    if dirs.is_empty() && !orphaned {
         println!("Nothing to remove.");
         return Ok(());
     }
-    gc::remove_requested(&dirs, apply, force)
+    gc::remove_requested(&dirs, orphaned, apply, force)
 }
 
 fn pin(dir: &Path, on: bool) -> Result<()> {

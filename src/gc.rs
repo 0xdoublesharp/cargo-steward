@@ -850,7 +850,10 @@ fn remove_routed_tmp_dirs(config: &config::Config, actions: &[Action], apply: bo
 /// way cleanup removes them: while holding cargo's locks, not while a running
 /// program was started from inside, and renamed aside first. Anything that
 /// isn't a cargo build directory is refused, and pinned ones need `force`.
-pub fn remove_requested(roots: &[PathBuf], apply: bool, force: bool) -> Result<()> {
+///
+/// With `orphaned`, also every known build directory whose recorded
+/// workspaces are all gone, without waiting out `orphan-grace`.
+pub fn remove_requested(roots: &[PathBuf], orphaned: bool, apply: bool, force: bool) -> Result<()> {
     let paths = Paths::resolve().context("cannot locate the home directory")?;
     let config = config::load_warning(&paths);
     let policy = config.policy()?;
@@ -859,10 +862,18 @@ pub fn remove_requested(roots: &[PathBuf], apply: bool, force: bool) -> Result<(
     } else {
         Running::default()
     };
-    let mut registry = if apply {
-        ledger::compact(&paths)?
+    let (mut registry, mut targets) = if orphaned {
+        let (registry, dirs) = inventory(&paths, &config.scan_roots, apply)?;
+        let orphans = dirs
+            .into_iter()
+            .filter(BuildDir::orphaned)
+            .map(|dir| (Kind::Orphaned, dir))
+            .collect();
+        (registry, orphans)
+    } else if apply {
+        (ledger::compact(&paths)?, Vec::new())
     } else {
-        ledger::peek(&paths)
+        (ledger::peek(&paths), Vec::new())
     };
     let sweep = Sweep {
         policy: &policy,
@@ -889,24 +900,35 @@ pub fn remove_requested(roots: &[PathBuf], apply: bool, force: bool) -> Result<(
             ));
             continue;
         }
-        let dir = BuildDir::inspect(&root, registry.roots.get(&root));
+        if !targets.iter().any(|(_, d)| d.root == root) {
+            let dir = BuildDir::inspect(&root, registry.roots.get(&root));
+            targets.push((Kind::Requested, dir));
+        }
+    }
+    for (kind, dir) in &targets {
         if dir.pinned && !force {
             out.skipped.push(Skipped {
-                kind: Kind::Requested,
-                path: root,
+                kind: *kind,
+                path: dir.root.clone(),
                 reason: "pinned (use --force to remove it anyway)".into(),
             });
             continue;
         }
-        let note = format!("last used {} ago", fsutil::ago(dir.last_used));
-        match remove_build_dir(&dir, Kind::Requested, note, None, sweep, &mut out) {
+        let note = match kind {
+            Kind::Orphaned => format!(
+                "workspaces deleted, last used {} ago",
+                fsutil::ago(dir.last_used)
+            ),
+            _ => format!("last used {} ago", fsutil::ago(dir.last_used)),
+        };
+        match remove_build_dir(dir, *kind, note, None, sweep, &mut out) {
             Removal::Busy => out.skipped.push(Skipped {
-                kind: Kind::Requested,
-                path: root.clone(),
+                kind: *kind,
+                path: dir.root.clone(),
                 reason: "a cargo build is using it; try again when it finishes".into(),
             }),
             Removal::Done if apply => {
-                registry.roots.remove(&root);
+                registry.roots.remove(&dir.root);
             }
             _ => {}
         }
@@ -919,7 +941,7 @@ pub fn remove_requested(roots: &[PathBuf], apply: bool, force: bool) -> Result<(
     for (path, reason) in &refused {
         eprintln!("refusing to remove {}: {reason}", path.display());
     }
-    if refused.len() == roots.len() {
+    if !roots.is_empty() && refused.len() == roots.len() && !orphaned {
         anyhow::bail!("nothing to remove");
     }
     report(
@@ -929,7 +951,11 @@ pub fn remove_requested(roots: &[PathBuf], apply: bool, force: bool) -> Result<(
             apply,
             auto: false,
             verbose: true,
-            command: "remove",
+            command: if orphaned && roots.is_empty() {
+                "remove --orphaned"
+            } else {
+                "remove"
+            },
         },
     );
     Ok(())

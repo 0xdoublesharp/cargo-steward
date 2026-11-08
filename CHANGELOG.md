@@ -85,6 +85,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   there was in a linked worktree whose admin directory git has removed. The
   wrapper records each workspace's worktree in the ledger for this; older
   ledgers and registries still read, and their directories keep the grace.
+- `cargo steward remove --orphaned [--apply]` previews, then removes, every
+  build directory whose recorded workspaces were all deleted, without waiting
+  out `orphan-grace`, with the TMPDIRs the proxy routed for them. It takes
+  cargo's locks and keeps directories a program runs from, as `remove` does;
+  pinned ones need `--force`.
 - `link-target` setting for the `cargo` proxy: when it routes a workspace's
   build output, it also points a missing `<workspace>/target` at the routed
   directory (only where git ignores `target`), so `./target` paths and builds

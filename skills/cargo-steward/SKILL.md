@@ -114,7 +114,7 @@ first.
 | `cargo steward doctor` | Check the setup; says what to change |
 | `cargo steward status [--sizes]` | Build directories, last use, layout, size, unshared size |
 | `cargo steward gc [--apply] [-v]` | Preview, or run, a cleanup |
-| `cargo steward remove (--worktree DIR \| BUILD_DIR...) [--apply]` | Remove whole build directories safely |
+| `cargo steward remove (--worktree DIR \| BUILD_DIR... \| --orphaned) [--apply]` | Remove whole build directories safely; `--orphaned`: every one whose worktrees were deleted |
 | `cargo steward pin DIR` / `unpin DIR` | Keep, or stop keeping, a build directory |
 | `cargo steward dedup [--apply]` | Share identical files across build directories |
 | `cargo steward seed --worktree DIR` | Start a worktree's build directory from the main checkout's |
