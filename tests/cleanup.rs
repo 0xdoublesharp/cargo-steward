@@ -448,7 +448,7 @@ fn status_json_with_sizes_measures_each_dir() {
 fn json_stays_alone_on_stdout_when_there_are_warnings() {
     let fx = Fixture::new("unit-idle = \"soon\"\n");
     fx.build_dir("target", 60 * DAY);
-    for args in [&["status"][..], &["status", "--sizes"], &["gc"]] {
+    for args in [&["status"][..], &["status", "--sizes"], &["gc"], &["dedup"]] {
         let (_, stderr) = fx.steward_json(args);
         assert!(
             stderr.contains("warning: cargo-steward: settings"),
@@ -589,4 +589,48 @@ fn a_failure_with_json_prints_an_error_document() {
     let doc = json_document(&out.stdout);
     assert_eq!(doc["error"], "nothing to remove", "{doc}");
     assert!(String::from_utf8_lossy(&out.stderr).contains("error: nothing to remove"));
+}
+
+#[test]
+fn dedup_json_lists_each_group_of_identical_files() {
+    let fx = Fixture::new("");
+    let (doc, _) = fx.steward_json(&["dedup"]);
+    assert_eq!(doc["build_dirs"], 0, "{doc}");
+    assert_eq!(doc["files"], 0, "{doc}");
+
+    let (a, b) = duplicate_pair(&fx);
+    let (doc, _) = fx.steward_json(&["dedup"]);
+    assert_eq!(doc["build_dirs"], 2, "{doc}");
+    assert_eq!(doc["applied"], false, "{doc}");
+    assert_eq!(doc["freed_on_disk_bytes"], serde_json::Value::Null, "{doc}");
+    if doc["unsupported_volumes"] != 0 {
+        return; // The temp dir's filesystem can't clone files.
+    }
+    // Both dirs hold the same rlib and the same 1 MiB file.
+    assert_eq!(doc["files"], 2, "{doc}");
+    let groups = doc["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 2, "{doc}");
+    let dup = groups
+        .iter()
+        .find(|g| {
+            g["kept"]
+                .as_str()
+                .unwrap()
+                .ends_with("libdup-0123456789abcdef.rlib")
+        })
+        .unwrap();
+    assert_eq!(dup["size_bytes"], 200_000, "{doc}");
+    let pair = [
+        dup["kept"].as_str().unwrap(),
+        dup["replaced"][0].as_str().unwrap(),
+    ];
+    let name = "debug/deps/libdup-0123456789abcdef.rlib";
+    for path in [a.join(name), b.join(name)] {
+        assert!(pair.contains(&path.to_str().unwrap()), "{doc}");
+    }
+
+    let (doc, _) = fx.steward_json(&["dedup", "--apply"]);
+    assert_eq!(doc["applied"], true, "{doc}");
+    assert_eq!(doc["files"], 2, "{doc}");
+    assert!(doc["freed_on_disk_bytes"].is_i64(), "{doc}");
 }

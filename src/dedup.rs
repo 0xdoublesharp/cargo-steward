@@ -21,10 +21,12 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use serde::Serialize;
 
 use crate::config::{self, Paths};
 use crate::fsutil::{self, Lock, human};
 use crate::gc::{self, BuildDir};
+use crate::json;
 use crate::seed::clone::{self, Cloned};
 
 /// Smaller files aren't worth the bookkeeping.
@@ -65,17 +67,79 @@ pub struct Summary {
 }
 
 /// `cargo steward dedup`.
-pub fn run(apply: bool, verbose: bool) -> Result<()> {
+pub fn run(apply: bool, verbose: bool, as_json: bool) -> Result<()> {
     let paths = Paths::resolve().context("cannot locate the home directory")?;
     let config = config::load_warning(&paths);
     let (_, dirs) = gc::inventory(&paths, &config.scan_roots, apply)?;
-    if dirs.is_empty() {
+    if dirs.is_empty() && !as_json {
         println!("No build directories found yet.");
         return Ok(());
     }
-    let summary = dedup(&dirs, apply)?;
+    let summary = if dirs.is_empty() {
+        Summary::default()
+    } else {
+        dedup(&dirs, apply)?
+    };
+    if as_json {
+        return json::print(&Document::new(&summary, dirs.len(), apply));
+    }
     print!("{}", report(&summary, dirs.len(), apply, verbose));
     Ok(())
+}
+
+/// `dedup --json`.
+#[derive(Serialize)]
+struct Document {
+    version: u32,
+    applied: bool,
+    /// Build directories examined.
+    build_dirs: usize,
+    /// Duplicates replaced by clones (or that would be).
+    files: usize,
+    /// Their combined size: what sharing blocks gives back, at most.
+    bytes: u64,
+    groups: Vec<GroupDoc>,
+    /// Duplicates skipped because a build held their directory's locks.
+    busy: usize,
+    /// Duplicates that changed since comparing, or couldn't be replaced.
+    skipped: usize,
+    unsupported_volumes: usize,
+    /// With `--apply`: the measured change in free space, which other
+    /// activity on the disks moves too.
+    freed_on_disk_bytes: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct GroupDoc {
+    /// Each file's size.
+    size_bytes: u64,
+    kept: String,
+    replaced: Vec<String>,
+}
+
+impl Document {
+    fn new(summary: &Summary, dirs: usize, apply: bool) -> Document {
+        Document {
+            version: json::VERSION,
+            applied: apply,
+            build_dirs: dirs,
+            files: summary.files,
+            bytes: summary.bytes,
+            groups: summary
+                .groups
+                .iter()
+                .map(|g| GroupDoc {
+                    size_bytes: g.size,
+                    kept: json::path(&g.kept),
+                    replaced: g.replaced.iter().map(|p| json::path(p)).collect(),
+                })
+                .collect(),
+            busy: summary.busy,
+            skipped: summary.skipped,
+            unsupported_volumes: summary.unsupported_volumes,
+            freed_on_disk_bytes: summary.freed,
+        }
+    }
 }
 
 fn report(summary: &Summary, dirs: usize, apply: bool, verbose: bool) -> String {

@@ -92,6 +92,9 @@ enum Cmd {
         /// List every file group, not just the totals
         #[arg(short, long)]
         verbose: bool,
+        /// Print one JSON document instead of text
+        #[arg(long)]
+        json: bool,
     },
     /// CI support: trim build output to what a job used, within a budget
     Ci(ci::Args),
@@ -187,7 +190,11 @@ fn main() -> ExitCode {
         Cmd::Unpin { dir } => pin(&dir, false),
         Cmd::Seed(args) => seed::run_seed(&args),
         Cmd::Hooks(args) => seed::run_hooks(&args),
-        Cmd::Dedup { apply, verbose } => dedup::run(apply, verbose),
+        Cmd::Dedup {
+            apply,
+            verbose,
+            json,
+        } => dedup::run(apply, verbose, json),
         Cmd::Ci(args) => ci::run(&args),
         Cmd::Shim(args) => proxy::run_shim(&args),
         Cmd::Remove {
@@ -219,7 +226,10 @@ impl Cmd {
     /// Whether the command was asked for a JSON document.
     fn json(&self) -> bool {
         match self {
-            Cmd::Status { json, .. } | Cmd::Gc { json, .. } | Cmd::Remove { json, .. } => *json,
+            Cmd::Status { json, .. }
+            | Cmd::Gc { json, .. }
+            | Cmd::Dedup { json, .. }
+            | Cmd::Remove { json, .. } => *json,
             _ => false,
         }
     }
