@@ -4,7 +4,8 @@
 With it, a command prints exactly one JSON document on stdout and nothing
 else there; warnings stay on stderr, and the exit status is the same as
 without it. Scripts and AI agents should read these documents rather than
-the text, which is written for people and may change.
+the text, which is written for people and may change. Previews (without
+`--apply`) change nothing and work with a read-only steward home.
 
 ```sh
 cargo steward status --sizes --json | jq '.build_dirs[] | {path, size_bytes}'
@@ -13,7 +14,7 @@ cargo steward shim explain --json | jq '.target_dir.free_bytes'
 
 Conventions, in every document:
 
-- `version` (integer) is the format version, now `1`. Within a version,
+- `version` (integer) is the format version, `1`. Within a version,
   fields are only added, never renamed, removed or retyped.
 - Field names are snake_case.
 - Sizes are integers in bytes, in fields ending `_bytes` or named `bytes`.
@@ -47,14 +48,14 @@ The build directories cargo-steward manages, most recently used first.
 | `build_dirs[].last_used_secs_ago` | integer | |
 | `build_dirs[].layout` | string | `"legacy"`, `"v2"` (Cargo 1.100's layout), `"mixed"` or `"empty"` |
 | `build_dirs[].pinned` | bool | `cargo steward pin`ned |
-| `build_dirs[].orphaned` | bool | every workspace that built here has been deleted |
-| `build_dirs[].workspaces` | array of strings | the packages recorded building here |
+| `build_dirs[].orphaned` | bool | every package recorded building here has been deleted |
+| `build_dirs[].workspaces` | array of strings | the package directories the wrapper recorded building here |
 | `build_dirs[].size_bytes` | integer or null | with `--sizes`: as `du` counts it |
 | `build_dirs[].unshared_bytes` | integer or null | with `--sizes`: blocks no clone shares (what removing it alone frees); null where the filesystem can't tell |
 | `total_bytes` | integer or null | with `--sizes`: sum of `size_bytes` |
 | `total_unshared_bytes` | integer or null | with `--sizes`: sum of `unshared_bytes` |
 | `disks` | array | one per disk holding build directories |
-| `disks[].path` | string | a build directory on that disk |
+| `disks[].path` | string | the first build directory listed on that disk |
 | `disks[].free_bytes` | integer | free space on it |
 
 ```json
@@ -92,7 +93,7 @@ fields that only one of them fills are empty in the other's.
 | `applied` | bool | `--apply`: removed; otherwise a preview |
 | `busy` | bool | `gc --apply` found another cleanup running and did nothing |
 | `worktrees` | array | `remove --worktree`: `{worktree, build_dir, exists}` per worktree; a `build_dir` that doesn't exist has nothing to remove |
-| `refused` | array | `remove`: `{path, reason}` per path that isn't a cargo build directory |
+| `refused` | array | `remove`: `{path, reason}` per path given that doesn't exist or isn't the root of a cargo build directory |
 | `actions` | array | what was or would be removed, below |
 | `actions[].kind` | string | a kind id, below |
 | `actions[].description` | string | the kind, in words |
@@ -100,22 +101,23 @@ fields that only one of them fills are empty in the other's.
 | `actions[].files` | integer | files removed, for `stale_objects`; otherwise 0 |
 | `actions[].bytes` | integer | |
 | `actions[].note` | string | such as `unused for 30d` |
-| `skipped` | array | due for removal but kept: `{kind, description, path, reason}` |
+| `skipped` | array | due for removal but kept: `{kind, description, path, reason}`, such as a running program, a build holding the locks, or a pin; a `low_space` entry whose path is a disk's directory says why removing for space stopped |
 | `totals` | array | per kind with actions: `{kind, description, count, bytes}` |
 | `total_bytes` | integer | sum over `actions` |
 | `freed_on_disk` | array | `gc --apply`: `{path, bytes}` per disk it removed from, the measured change in free space (an integer that other writes meanwhile also move, so it can be negative) |
 | `shared` | object or null | `gc --apply` where it shares identical files afterwards (macOS, `dedup = true`): `{files, bytes}` |
 
-Kind ids, cheapest to rebuild first:
+Kind ids, cheapest to rebuild first (the README's
+[What gets removed](../README.md#what-gets-removed) gives the rules):
 
 | Kind | What |
 |---|---|
 | `stale_objects` | object files a later compile replaced |
 | `old_sessions` | superseded incremental sessions |
-| `legacy_layout` | old-layout files once Cargo 1.100's layout took over |
+| `legacy_layout` | old-layout files in a profile that also holds Cargo 1.100's layout |
 | `idle_incremental` | incremental caches unused for `incremental-idle` |
-| `idle_unit` | Cargo 1.100-layout build units unused for `unit-idle` |
-| `orphaned` | build directories whose workspaces were all deleted |
+| `idle_unit` | Cargo 1.100-layout build units unused for `unit-idle` that no unit in use was built from |
+| `orphaned` | build directories whose workspaces were all deleted (also `remove --orphaned`) |
 | `idle` | build directories unused for `dir-idle` |
 | `low_space` | build directories removed because a disk was low on space |
 | `requested` | build directories `remove` was asked to remove |
@@ -137,7 +139,7 @@ Kind ids, cheapest to rebuild first:
       "path": "/Volumes/Scratch/app/cargo/fix-login",
       "files": 0,
       "bytes": 4294967296,
-      "note": "unused for 3d"
+      "note": "workspaces deleted, unused for 3d"
     }
   ],
   "skipped": [
@@ -240,7 +242,7 @@ directory. Put `--json` before the cargo arguments:
 
 | Field | Type | |
 |---|---|---|
-| `settings` | object | `{path, exists, problems}`: the settings file (null without a home directory), whether it exists, and settings it can't use (each has its default) |
+| `settings` | object | `{path, exists, problems}`: the settings file (null without a home directory), whether it exists, and one message per setting it can't use (which then has its default) or key it doesn't know |
 | `command` | array of strings | the cargo arguments (`["build"]` when none are given) |
 | `routing_error` | string or null | why no plan could be made here; the plan's fields below are null then |
 | `directory` | string or null | the directory the command works in |

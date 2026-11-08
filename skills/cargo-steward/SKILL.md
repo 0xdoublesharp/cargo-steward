@@ -1,147 +1,124 @@
 ---
 name: cargo-steward
-description: Use when building, cleaning or maintaining Rust/Cargo workspaces on a machine with cargo-steward; when disk space is low or build output (target/, build dirs, incremental caches, *.rcgu.o) needs cleaning; when creating or retiring git worktrees of a Rust repository; when a Rust build is unexpectedly cold or slow; or before running `cargo clean`, deleting target directories, or setting RUSTC_WRAPPER, CARGO_TARGET_DIR or --target-dir.
+description: Use when building, cleaning or maintaining Rust/Cargo workspaces on a machine with cargo-steward; when disk space is low or build output (target/, build dirs, incremental caches, *.rcgu.o) needs cleaning; when creating or retiring git worktrees of a Rust repository; when a Rust build is cold, slow, or waiting for a build slot; or before running `cargo clean`, deleting target directories, or setting RUSTC_WRAPPER, CARGO_TARGET_DIR or --target-dir.
 ---
 
-# Maintaining Rust workspaces with cargo-steward
+# Working with cargo-steward
 
-cargo-steward keeps Cargo build output fast and bounded. On a machine where it
-is set up, most build-output housekeeping already happens without you: work
-with it rather than around it.
+cargo-steward runs every Rust compile here and keeps build output fast and
+bounded. Work with it, not around it.
 
-Check that it's present before relying on it:
+## Detect it
 
 ```sh
-command -v cargo-steward && cargo steward doctor
+command -v cargo-steward && cargo steward doctor --json
 ```
 
-If it isn't installed, none of this applies; follow the project's own rules.
+It is active when the `wrapper` section has an `ok` check saying Cargo's
+rustc-wrapper is cargo-steward. Otherwise follow the project's own rules.
 
-`doctor`, `status`, `gc`, `remove`, `dedup` and `shim explain` take `--json`
-and then print one JSON document on stdout, with sizes in bytes and stable
-ids for kinds and statuses. Read that instead of parsing the text.
+## What it already does
 
-## What already happens on its own
-
-- **Every compile runs through it** (Cargo's `rustc-wrapper`, with sccache or
-  any other wrapper behind it). It removes the debug object files (`*.rcgu.o`,
-  `*.rcgu.dwo`) that each incremental rebuild leaves behind on Rust 1.88 to
-  1.100 (rust-lang/rust#161824).
-- **Cleanup runs in the background after builds** (at most hourly) and
-  removes, cheapest to rebuild first:
-  - leftover object files and superseded incremental sessions;
-  - old-layout files after an upgrade to Cargo 1.100+;
-  - incremental caches and build units nobody has used lately;
-  - build directories of deleted worktrees, or unused for weeks;
-  - when a disk is low, the build directories that are cheapest to rebuild.
-
-  It holds Cargo's own locks while it works, never touches a running build,
-  and keeps any directory a running program was started from.
-- **With the `cargo` proxy on PATH**, each worktree's target directory and
-  TMPDIR are routed under a central root, a new worktree's first build starts
-  as a copy-on-write clone of the main checkout's (seconds instead of
-  minutes), and concurrent builds can be limited.
+- **Leak fix:** deletes the `*.rcgu.o` files each incremental rebuild
+  replaces (Rust 1.88 to 1.100).
+- **Background cleanup**, at most hourly: stale objects, old sessions, idle
+  caches, build directories of deleted worktrees or unused for weeks, more
+  when a disk runs low. It skips busy directories and running programs'.
+- **Routing** (when `cargo` on PATH is the proxy): each worktree builds into
+  its own directory under a central root, with its own TMPDIR.
+- **Warm starts:** a new worktree's first build starts as a copy-on-write
+  clone of the main checkout's.
+- **Build slots:** at most `max-builds` cargo builds and `max-compiles`
+  rustc processes run at once, machine-wide.
 
 ## Rules
 
-1. **Don't free space by hand.** Don't run `cargo clean`, `rm -rf target`, or
-   delete `*.rcgu.o`, `incremental/` or `deps/` files to save space. Preview
-   with `cargo steward gc`, then run `cargo steward gc --apply`. It keeps what
-   builds still use, and it removes an incremental session whole: deleting
-   part of one can crash rustc.
-2. **Don't reroute or rewrap builds** unless the task requires it: no
-   `RUSTC_WRAPPER`, `build.rustc-wrapper`, `CARGO_TARGET_DIR`, `--target-dir`
-   or `build.target-dir` of your own. Setting `RUSTC_WRAPPER` (even to empty)
-   bypasses cargo-steward. To run rustc through another wrapper, set
-   `CARGO_STEWARD_INNER` instead. `cargo steward shim explain` shows where a
-   build in the current directory goes and why.
-3. **Create worktrees where the project's other worktrees live**, inside the
-   repository's tree when the project keeps them there (for example
-   `<repo>/.worktrees/<name>`). A worktree outside the tree misses the
-   project's `.cargo/config.toml`, so it builds with different settings,
-   can't start from another checkout's build, and recompiles everything.
-   After creating one, `cargo steward shim explain --json` (in it) should
-   report `"seed": {"status": "will_seed", ...}`.
-4. **Retire a worktree's build output with it.** Before deleting a worktree
-   your task created, remove its build directory, then the worktree:
+1. **Never clean by hand.** No `cargo clean`, `rm -rf target`, or deleting
+   `*.rcgu.o`, `incremental/` or `deps/`. Preview with `cargo steward gc`,
+   then `cargo steward gc --apply`.
+2. **Never set `RUSTC_WRAPPER`**; it bypasses cargo-steward. To run rustc
+   through another wrapper, set `CARGO_STEWARD_INNER=<program>`.
+3. **Target directory:** if `cargo steward shim explain --json` shows
+   `target_dir.routed: true`, don't set `CARGO_TARGET_DIR` or
+   `--target-dir`. Otherwise follow the project's policy.
+4. **Create worktrees where the project's worktrees live** (its docs, or
+   beside those in `git worktree list`). One outside the project tree misses
+   its `.cargo/config.toml` and builds cold.
+5. **Retire a worktree** you created before deleting it:
 
    ```sh
-   cargo steward remove --worktree <path> --json            # preview
-   cargo steward remove --worktree <path> --apply --json
-   git worktree remove <path>
+   cargo steward remove --worktree <dir> --json           # preview
+   cargo steward remove --worktree <dir> --apply --json
+   git worktree remove <dir>
    ```
 
-   If the worktree is already gone, cleanup removes its build directory on
-   its own: right away once `git worktree remove` (or `prune`) has removed
-   it, otherwise a couple of days later. Never remove build directories, or
-   worktrees, that another task or person owns.
-5. **Protect a build directory a long run depends on** (a benchmark baseline,
-   a node under test) with `cargo steward pin <build dir>`, and
-   `cargo steward unpin <build dir>` when done. Running programs are
-   protected anyway; pin anything that must survive between runs.
-6. **Report real numbers.** Sizes in `gc` and `status` are counted as `du`
-   counts them, so blocks shared between copy-on-write clones count in every
-   copy. Report `freed_on_disk` from `cargo steward gc --apply --json` (the
-   "Freed on disk" line in text), or the change in `df`, as the space
-   recovered, and `unshared_bytes` from `cargo steward status --sizes --json`
-   (the UNSHARED column) as what a directory really costs.
+   If you built it with your own `CARGO_TARGET_DIR`, pass that directory:
+   `cargo steward remove <build-dir> --apply`. For worktrees already deleted:
+   `cargo steward remove --orphaned [--apply]`. Never remove what another
+   task or person owns.
+6. **Pin what a long run depends on** (a benchmark baseline, a binary under
+   test): `cargo steward pin <build-dir>`, then `unpin`.
+7. **Report real numbers.** Sizes count like `du`, so clones count in every
+   copy. Report space recovered from `freed_on_disk[].bytes` (`gc --apply
+   --json`), or `df` before and after a `remove`; report a directory's real
+   cost as `unshared_bytes` (`status --sizes --json`).
 
-## Maintaining a workspace
+## Machine output
 
-When asked to clean up or check on Rust workspaces:
+`status`, `gc`, `remove`, `dedup`, `doctor` and `shim explain` take `--json`:
+one document on stdout, sizes in bytes. Failure prints
+`{"version": 1, "error": "..."}` and exits nonzero.
 
-1. `cargo steward doctor --json`. Checks with level `warn` carry a `fix`.
-   Note what concerns this workspace: toolchain pins in the leak window,
-   project configs or Makefiles that override the wrapper, worktrees outside
-   the tree, unused toolchains. Fix them only within the task's scope, and
-   mention the rest.
-2. `cargo steward status --json`. Find this workspace's build directories
-   (`build_dirs[].workspaces`), when each was last used, and which belong to
-   deleted workspaces (`orphaned`).
-3. `cargo steward gc --json` previews a cleanup; `cargo steward gc --apply
-   --json` runs it. It is safe while other builds run: busy directories are
-   skipped (`skipped[].reason` says why) and retried next time.
-4. Retire the worktrees your task created that are merged or abandoned
-   (rule 4).
-5. On macOS, `cargo steward dedup` previews sharing identical files across
-   build directories as clones; `--apply` does it. Automatic cleanup already
-   does this.
-6. Report the commands you ran, the `freed_on_disk` figures, and anything
-   skipped (busy, pinned, or kept because a program runs from it).
+- `doctor`: `sections[].checks[]` (`level`, `message`, `fix`).
+- `status`: `build_dirs[]` (`path`, `last_used`, `pinned`, `orphaned`,
+  `workspaces`, `size_bytes`, `unshared_bytes`), `disks[].free_bytes`.
+- `gc`, `remove`: `applied`, `actions[]` (`kind`, `path`, `bytes`),
+  `skipped[].reason`, `total_bytes`, `freed_on_disk[]`; `remove` adds
+  `worktrees[]` (`build_dir`, `exists`).
+- `dedup`: `files`, `bytes`, `freed_on_disk_bytes`.
+- `shim explain`: `target_dir` (`routed`, `path`, `free_bytes`), `seed`
+  (`status`, `message`), `build_slot`. Put `--json` before cargo arguments:
+  `cargo steward shim explain --json -- test -p foo`.
 
-Before a large build, check free space on the build's actual disk:
-`cargo steward shim explain --json` reports it as `target_dir.free_bytes`
-when the proxy routes the build (`target_dir.routed`); otherwise run `df -h`
-on the target directory you know. If it's low, run
-`cargo steward gc --apply` first.
+**Before a large build**, check `target_dir.free_bytes` from `shim explain
+--json` (unrouted: `df` the target directory). If low, run `gc --apply`.
+
+## Waiting for a build slot
+
+```
+cargo-steward: waiting for one of 2 Cargo build slots (held by pid 4121: `cargo test` in /src/app)
+```
+
+All `max-builds` slots are taken by the builds named. Yours starts when one
+frees: wait. Never kill other agents' builds or run the real cargo to skip
+the line. If a holder is your own background build, finish or stop it.
+`max-compiles` waits are silent: slower, not stuck.
 
 ## Commands
 
 | Command | Use |
 | --- | --- |
-| `cargo steward doctor [--json]` | Check the setup; says what to change |
-| `cargo steward status [--sizes] [--json]` | Build directories, last use, layout, size, unshared size |
+| `cargo steward doctor [--json]` | Check the setup |
+| `cargo steward status [--sizes] [--json]` | Build directories, last use, sizes |
 | `cargo steward gc [--apply] [-v] [--json]` | Preview, or run, a cleanup |
-| `cargo steward remove (--worktree DIR \| BUILD_DIR... \| --orphaned) [--apply] [--json]` | Remove whole build directories safely; `--orphaned`: every one whose worktrees were deleted |
-| `cargo steward pin DIR` / `unpin DIR` | Keep, or stop keeping, a build directory |
+| `cargo steward remove (--worktree DIR \| BUILD_DIR... \| --orphaned) [--apply] [--json]` | Remove whole build directories safely |
+| `cargo steward pin DIR` / `unpin DIR` | Protect a build directory from cleanup |
 | `cargo steward dedup [--apply] [--json]` | Share identical files across build directories |
-| `cargo steward seed --worktree DIR` | Start a worktree's build directory from the main checkout's, or the most recently used idle worktree's |
-| `cargo steward hooks install\|status` | Seed every new worktree of a repository (git hook) |
-| `cargo steward shim explain [--json] [-- ARGS]` | Where a build here goes, which route applies, whether it seeds, free space there |
-| `cargo steward ci start\|trim` | Trim a CI job's build output to what it used |
+| `cargo steward seed --worktree DIR` | Start a worktree's build from another checkout's |
+| `cargo steward shim explain [--json] [-- ARGS]` | Where a build here goes, seeding, free space |
+| `cargo steward shim status` | Whether `cargo` on PATH is the proxy |
 
-Settings live in `~/.cargo/steward/config.toml`, and automatic cleanups log to
-`~/.cargo/steward/gc.log`. Change settings only when the user asks.
+Change settings (`~/.cargo/steward/config.toml`) only when the user asks.
 
-## When something looks wrong
+## Troubleshooting
 
-- **A build is cold in a new worktree.** Run `cargo steward shim explain
-  --json` there. Check that `target_dir.path` is the worktree's own, what
-  `seed.status` says, and that the worktree is inside the project tree
-  (rule 3).
-- **A build fails mentioning cargo-steward.** Rerun once. If it persists,
-  `cargo steward doctor`, then tell the user; `cargo steward setup --undo`
-  restores the previous wrapper. Don't edit `~/.cargo/config.toml` yourself.
-- **Disk keeps filling.** Run `cargo steward status --sizes` and look for
-  large directories whose workspace still exists but that nobody builds in.
-  Ask the user before removing ones your task doesn't own.
+- **Cold build in a new worktree:** run `cargo steward shim explain --json`
+  there. `seed.status`: `will_seed` is good; `source_missing`: no other
+  checkout has built yet; `target_not_empty`: it already has output;
+  `nothing_routed`: run `cargo steward seed --worktree <dir>` before the
+  first build. Check rule 4.
+- **Build fails mentioning cargo-steward:** rerun once. If it fails again,
+  run `cargo steward doctor --json` and tell the user what it reports. Don't
+  edit `~/.cargo/config.toml` or set `RUSTC_WRAPPER` to get past it.
+- **Disk keeps filling:** find large idle directories in `cargo steward
+  status --sizes --json`; ask before removing ones your task doesn't own.

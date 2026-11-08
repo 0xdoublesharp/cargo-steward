@@ -1,36 +1,54 @@
 # cargo-steward
 
-Keeps Cargo build output fast and bounded, so a machine that builds all day
-(many worktrees, many agents, several toolchains) doesn't fill its disk or
-slow down.
+Keeps Cargo build output fast and bounded on machines where people and many
+AI agents build many git worktrees at once.
 
-- **Stops the debug object-file leak.** Since Rust 1.88, every incremental
-  rebuild on macOS (or anywhere with `split-debuginfo = "unpacked"`) leaves a
-  full new set of `*.rcgu.o` / `*.rcgu.dwo` files behind and never removes the
-  old ones ([rust-lang/rust#161824]). Build directories grow by hundreds of
+cargo-steward is Cargo's `rustc-wrapper` (with sccache or any other wrapper
+kept behind it) plus build-directory cleanup. Around that it adds a `cargo`
+proxy that routes and limits builds, warm starts for new git worktrees, a
+CI step that trims cached build output, and a skill that teaches AI coding
+agents to use it.
+
+## The problem
+
+- **Leaked debug objects.** With Rust 1.88 to 1.100, every incremental
+  rebuild on macOS (or anywhere with `split-debuginfo = "unpacked"`) writes
+  a full new set of `*.rcgu.o` / `*.rcgu.dwo` files and never removes the old
+  ones ([rust-lang/rust#161824]). Build directories grow by hundreds of
   gigabytes, and every rustc start slows down listing them
-  ([rust-lang/cargo#16665]). Cargo 1.101 fixes this for its own builds
-  ([rust-lang/cargo#17675]); cargo-steward fixes it for every toolchain from
-  1.88 up, including projects pinned to older ones.
-- **Removes what no build uses any more**: object files earlier builds
-  replaced, old-layout files after an upgrade to Cargo 1.100's new build
-  directory layout, idle incremental caches and build units, whole build
-  directories whose worktrees were deleted or that nothing has built in for
-  weeks, and, when a disk runs low, the least recently used build
-  directories.
-- **Runs itself.** It's Cargo's `rustc-wrapper` (with sccache or any other
-  wrapper kept behind it), and starts its cleanup in the background after
-  builds. There is no daemon, no cron job and no launchd agent.
-- **Checks your setup**: `cargo steward doctor` reports toolchains and pins in
-  the leak window, toolchains no project uses, configs that bypass the
-  wrapper, split sccache caches, full debug info in dev profiles,
+  ([rust-lang/cargo#16665]). Cargo 1.101 removes them for its own builds
+  ([rust-lang/cargo#17675]).
+- **No cleanup.** Cargo doesn't remove what a build directory no longer
+  needs ([rust-lang/cargo#5026]), or a build directory whose workspace is
+  gone ([rust-lang/cargo#13136]), and each worktree keeps its own full copy
+  of every dependency ([rust-lang/cargo#17453]).
+- **Cold starts and contention.** A new worktree compiles every dependency
+  from scratch, and ten agents each running `cargo test` with a job per core
+  oversubscribe CPU and memory.
+
+## What it does
+
+- **Removes the leaked objects** as each compile finishes, for every
+  toolchain from 1.88 up, including projects pinned to one.
+- **Cleans up in the background** after builds: object files later builds
+  replaced, idle incremental caches and build units, old-layout files after
+  an upgrade to Cargo 1.100's build-directory layout, build directories of
+  deleted worktrees or ones nothing has built in for weeks, and, when a disk
+  runs low, the build directories that cost least to rebuild. There is no
+  daemon, cron job or launchd agent.
+- **Limits concurrent compiles** machine-wide (`max-compiles`), and through
+  the proxy, concurrent cargo builds (`max-builds`).
+- **Warm-starts new worktrees** as copy-on-write clones of the best build
+  among the repository's other worktrees, and shares identical files across
+  build directories ([warm starts](docs/warm-start.md)).
+- **Routes build output and temporary files** for each worktree to a
+  scratch volume, through the [`cargo` proxy](docs/proxy.md).
+- **Trims CI caches** to what a job used, within a budget ([CI](docs/ci.md)).
+- **Checks the setup.** `cargo steward doctor` reports bad settings,
+  toolchains and pins that leak, toolchains no project uses, configs that
+  bypass the wrapper, split sccache caches, full debug info in dev profiles,
   rust-analyzer's extra target directory, and on macOS, build output that
   Time Machine backs up or Spotlight indexes.
-
-Cargo's own answers are coming ([build-dir cleanup][rust-lang/cargo#5026],
-[whole-directory cleanup][rust-lang/cargo#13136], [cross-workspace
-deduplication][rust-lang/cargo#17453]) but haven't shipped. cargo-steward is
-meant to step aside as each one does.
 
 ## Install
 
@@ -41,16 +59,13 @@ git clone <repository URL> cargo-steward
 cargo-steward/scripts/install.sh
 ```
 
-The script runs `cargo install --locked --path` on the checkout, then
-`cargo steward setup` and `cargo steward doctor`. It can also install from
-git (`--git URL`) or a prebuilt release binary (`--release VERSION --repo
-OWNER/NAME`, checksum verified). Options it doesn't know go to `setup`, such
-as `--scan-root DIR`. [docs/install.md](docs/install.md) covers each way,
-first-time setup, upgrading and uninstalling.
+The script installs the binary, then runs `cargo steward setup`,
+`cargo steward skill install` and `cargo steward doctor`.
+[docs/install.md](docs/install.md) covers installing from git or a prebuilt
+release, first-time setup, a build volume on macOS, upgrading and
+uninstalling.
 
 ## Quick start
-
-The install script runs the first two of these for you.
 
 ```sh
 cargo steward setup               # become Cargo's rustc-wrapper; turn on automatic cleanup
@@ -59,245 +74,257 @@ cargo steward status --sizes      # the build directories it manages
 cargo steward gc                  # preview a cleanup (`--apply` to run one now)
 ```
 
-`setup` edits `~/.cargo/config.toml` (keeping its comments, and a backup next
-to it): `build.rustc-wrapper` becomes cargo-steward, and the wrapper that was
-there, such as `sccache`, becomes cargo-steward's inner wrapper. Undo it with
-`cargo steward setup --undo`.
+`setup` edits Cargo's user config (`~/.cargo/config.toml`, keeping its
+comments and a backup next to it): `build.rustc-wrapper` becomes
+cargo-steward, and the wrapper that was there, such as `sccache`, becomes
+cargo-steward's inner wrapper. `cargo steward setup --undo` puts it back.
 
-Build directories are found two ways: those the wrapper sees as you build, and
-any under a scan root. On its first run, `setup` adds where build output
-already goes (the parent of `CARGO_TARGET_DIR`, the root of `build.build-dir`
-or `build.target-dir`, and other volumes holding recorded build directories)
-and prints what it added. Add more with:
+Before deleting a worktree, remove its build directory:
 
 ```sh
-cargo steward setup --scan-root /Volumes/Scratch
+cargo steward remove --worktree ../app-fix-login --apply
+git worktree remove ../app-fix-login
 ```
-
-On macOS, `cargo steward setup --volume Scratch` creates a separate APFS
-volume for build output; see [Build volume](#build-volume-macos).
 
 ## Commands
 
 ```sh
-cargo steward setup [--scan-root DIR] [--build-dir DIR] [--volume NAME] [--undo] [--dry-run]
-cargo steward doctor [--json]             # check the setup and report what to change
-cargo steward status [--sizes] [--json]   # build directories, when each was last used, layout, size
-cargo steward gc [--json]                 # what a cleanup would remove, by kind
-cargo steward gc --apply [-v] [--json]    # remove it now
-cargo steward pin <dir>                   # never clean this build directory (except stale objects)
-cargo steward unpin <dir>
-cargo steward remove --worktree <dir> [--apply] [--json]   # remove a retiring worktree's build dir safely
-cargo steward remove --orphaned [--apply] [--json]         # remove every build dir of deleted workspaces now
-cargo steward skill install               # teach Claude Code / Codex agents to use cargo-steward
+cargo steward setup [--inner PROGRAM] [--scan-root DIR]... [--build-dir DIR]
+                    [--no-auto-gc] [--volume NAME] [--undo] [--dry-run]
+cargo steward doctor [--json]
+cargo steward status [--sizes] [--json]
+cargo steward gc [--apply] [-v] [--json]
+cargo steward pin DIR
+cargo steward unpin DIR
+cargo steward remove [BUILD_DIR]... [--worktree DIR]... [--orphaned]
+                     [--apply] [--force] [--json]
+cargo steward seed [--target-dir DIR] [--from DIR]... [--worktree DIR] [-q]
+cargo steward hooks install|uninstall|status [--repo DIR]
+cargo steward dedup [--apply] [-v] [--json]
+cargo steward ci start [--target-dir DIR]
+cargo steward ci trim [--target-dir DIR] [--budget SIZE] [--keep-workspace]
+                      [--keep-incremental] [--dry-run] [-v]
+cargo steward shim install [--bin-dir DIR] [--shell zsh|bash|fish]
+cargo steward shim uninstall [--bin-dir DIR]
+cargo steward shim status
+cargo steward shim explain [--json] [-- CARGO_ARGS...]
+cargo steward skill install|uninstall [--dir DIR]...
+cargo steward skill status|show
 ```
-
-With `--json`, a command prints one JSON document for scripts and agents
-instead of text; [docs/json.md](docs/json.md) describes each one.
-
-Warm starts, CI and the cargo proxy:
 
 | Command | What it does | Docs |
 |---|---|---|
-| `cargo steward seed` | Starts a new worktree's build directory as a copy-on-write clone of the main checkout's, or of the most recently used idle worktree's | [warm-start.md](docs/warm-start.md) |
-| `cargo steward hooks` | Installs or removes the git hooks that seed new worktrees | [warm-start.md](docs/warm-start.md) |
-| `cargo steward dedup [--json]` | Replaces identical files across build directories with clones | [warm-start.md](docs/warm-start.md) |
-| `cargo steward ci` | Trims build output to what a CI job used, within a budget | [ci.md](docs/ci.md) |
-| `cargo steward shim` | Installs or removes the `cargo` proxy, which routes each worktree's build output and limits concurrent builds; `shim explain [--json]` shows what it does here | [proxy.md](docs/proxy.md) |
+| `setup` | Makes cargo-steward Cargo's rustc-wrapper, turns on automatic cleanup and sets scan roots. `--build-dir` also sets `build.build-dir`; `--volume` creates a macOS build volume | [install.md](docs/install.md#first-time-setup) |
+| `doctor` | Checks the setup and says what to change | |
+| `status` | Lists the build directories it manages, most recently used first, with layout; `--sizes` measures them | |
+| `gc` | Shows what a cleanup would remove, by kind (`-v`: every item); `--apply` removes it now | [below](#what-gets-removed) |
+| `pin`, `unpin` | Keeps a build directory (named by any path inside it) out of cleanup, except its stale object files | |
+| `remove` | Removes whole build directories the way cleanup does: the paths given, the one each `--worktree` builds into, or with `--orphaned`, every one whose workspaces were all deleted, without waiting out `orphan-grace`. Previews without `--apply`; pinned ones need `--force` | |
+| `seed` | Starts a new worktree's build directory as a clone of the best build among the repository's worktrees | [warm-start.md](docs/warm-start.md#cargo-steward-seed) |
+| `hooks` | Installs the git hook that seeds each new worktree | [warm-start.md](docs/warm-start.md#cargo-steward-hooks) |
+| `dedup` | Replaces identical files across build directories with clones | [warm-start.md](docs/warm-start.md#cargo-steward-dedup) |
+| `ci` | Trims a CI job's build output to what it used, within a budget | [ci.md](docs/ci.md) |
+| `shim` | Installs the `cargo` proxy; `status` and `explain` show what it does here | [proxy.md](docs/proxy.md) |
+| `skill` | Installs the agent skill for Claude Code and Codex | [below](#agent-skill) |
+
+With `--json`, `status`, `gc`, `remove`, `dedup`, `doctor` and
+`shim explain` print one JSON document for scripts and agents;
+[docs/json.md](docs/json.md) describes each one.
+
+The reports (`status`, `doctor`, `shim status`, `shim explain`, and `gc`,
+`remove` and `dedup` without `--apply`) change nothing, and work where the
+steward home is read-only, as in an agent's sandbox.
 
 ## What gets removed
 
-Cheapest-to-rebuild first. Every threshold is a setting.
+Cheapest to rebuild first. Every threshold is a [setting](#settings).
 
-| What | When | Rebuild cost |
+| What (`--json` kind) | When | Rebuild cost |
 |---|---|---|
-| Object files a later compile replaced | Right after the compile, by the wrapper (while a program started from that unit's binary or test runs, once older than `object-grace`, 10 minutes); any left over, by cleanup | None. Nothing reads them. |
-| Old-layout files (`deps/`, `.fingerprint/`, `build/<pkg>-<hash>/`) | Once Cargo 1.100's layout is in use in that directory and no older toolchain has built there for `legacy-idle` (3 days) | None |
-| A crate's incremental cache | Unused for `incremental-idle` (7 days) | That crate compiles from scratch once |
-| A build unit (new layout) | Unused for `unit-idle` (14 days), and no unit used since was built from it (cargo's fingerprints link them) | That unit rebuilds if needed again |
-| A whole build directory | Every workspace that built there is deleted: at once when each was a linked worktree that git has removed (`git worktree remove`, `prune`), else after `orphan-grace` (2 days); or unused for `dir-idle` (21 days) | Full rebuild |
-| A worktree's TMPDIR the proxy routed (`tmp-root`) | With its build directory; or, when that build directory is gone, once nothing in it has changed for `orphan-grace` | None |
-| Whole build directories, cheapest to rebuild first (idle time × unshared size ÷ recorded compile time) | The disk has under `min-free` (50 GiB) free; until it has `target-free` (100 GiB), or until removals stop raising free space (local snapshots or clones holding it). Never one used within `recent-guard` (1 day) | Full rebuild |
+| Object files a later compile replaced (`stale_objects`) | By the wrapper, right after each incremental compile; anything left over, by cleanup | None |
+| Superseded incremental sessions (`old_sessions`) | Older sessions of an incremental cache, which rustc never loads again | None |
+| Old-layout files: `deps/`, `.fingerprint/`, `build/<pkg>-<hash>/` (`legacy_layout`) | Once a profile also holds Cargo 1.100's layout and no older toolchain has built there for `legacy-idle` (3 days) | None |
+| A crate's incremental cache (`idle_incremental`) | Unused for `incremental-idle` (7 days) | That crate compiles from scratch once |
+| A Cargo 1.100-layout build unit (`idle_unit`) | Unused for `unit-idle` (14 days), and no unit used within that time was built from it | That unit rebuilds if needed again |
+| A whole build directory whose workspaces were all deleted (`orphaned`) | At once when each was a linked worktree that git has removed (`git worktree remove` or `prune`); otherwise once unused for `orphan-grace` (2 days) | Full rebuild |
+| A whole idle build directory (`idle`) | Unused for `dir-idle` (21 days) | Full rebuild |
+| Whole build directories, for space (`low_space`) | A disk has under `min-free` (50 GiB) free: until it has `target-free` (100 GiB), or until removals stop raising free space | Full rebuild |
+| A TMPDIR the proxy routed (`routed_tmp`, `leftover_tmp`) | With its build directory; or, when that build directory is gone, once nothing in it has changed for `orphan-grace` | None |
 
-Safety:
+When a disk runs low, build directories go in order of idle time ×
+unshared size ÷ recorded compile time, highest first: a big directory
+nothing has used in weeks goes before a small one used yesterday, and one
+that took an hour to build stays longer than one as big that took a minute.
+Pinned directories and any used within `recent-guard` (1 day) are never
+removed for space. When removals stop raising free space (Time Machine's
+local snapshots or clones still hold the blocks), cleanup stops and says
+so.
+
+### Safety
 
 - Every removal from a build directory happens while holding cargo's own
   locks on it (`.cargo-lock`, `.cargo-build-lock` and `.cargo-artifact-lock`,
-  exclusively), so a running build is never touched; a busy directory is
-  skipped until next time.
-- A directory a running program was started from (a test node, a server) is
-  kept, whatever its age (`process-guard`).
-- Replaced object files are kept while a program started from their unit's
-  binary or test executable (in the build directory, or the copy cargo puts
-  in the profile directory) still runs, for up to `object-grace`, so it keeps
-  symbolized backtraces. With `process-guard = false` they're kept for
-  `object-grace` whether or not anything runs.
-- Directories are renamed aside before they're deleted, so nothing ever sees
-  one half removed. What an interrupted cleanup leaves is finished by the
-  next `gc --apply`, never by a preview.
-- Incremental caches are removed whole. Removing part of one can crash rustc.
-- The wrapper only removes a compiled unit's own objects, only after rustc
-  succeeds, and only ones the compile didn't rewrite. Binaries keep their debug
-  info: the objects they reference are the ones kept.
-- `gc` without `--apply` only reports.
+  exclusively), and what was found unused is dated again under them. A
+  directory a build is using is skipped until next time.
+- Nothing a running program was started from (a test node, a server) is
+  removed, whatever its age (`process-guard`). A build directory such a
+  program runs from is cleaned inside instead of removed.
+- Replaced object files from within `object-grace` (10 minutes) are kept
+  while a program started from their unit's binary or test (or the copy cargo
+  puts in the profile directory) runs, so it keeps symbolized backtraces.
+  With `process-guard = false`, they're kept for `object-grace` either way.
+- The wrapper removes only the objects of the unit it just compiled, only
+  after rustc succeeds, and only ones the compile didn't rewrite. Cleanup
+  keeps the objects each unit's outputs still reference, so binaries keep
+  their debug info.
+- Incremental caches and sessions are removed whole: removing part of one
+  can crash rustc.
+- Directories are renamed aside before they're deleted, so nothing sees one
+  half removed. The next `gc --apply` finishes what an interrupted cleanup
+  left.
 
-Sizes are counted the way `du` counts them, so blocks that APFS or btrfs clones
-share count in every copy. `status --sizes` also shows each directory's
-UNSHARED size (what removing it alone would free), and `gc --apply` reports
-the change in each disk's free space ("Freed on disk"), which is the real
-measure.
+Sizes are counted the way `du` counts them, so blocks that APFS or btrfs
+clones share count in every copy. `status --sizes` also shows each
+directory's UNSHARED size (what removing it alone frees), and `gc --apply`
+reports the change in each disk's free space ("Freed on disk").
 
 ## Settings
 
-`~/.cargo/steward/config.toml` (or `$CARGO_HOME/steward/`, or
-`$CARGO_STEWARD_HOME`):
+`config.toml` in the steward home: `$CARGO_STEWARD_HOME`, else
+`$CARGO_HOME/steward`, else `~/.cargo/steward`. Every setting, with its
+default:
 
 ```toml
-inner-wrapper = "sccache"     # what rustc runs through; unset for none
-leak-fix = true               # remove replaced object files after each compile
-auto-gc = true                # clean up in the background after builds
-gc-interval = "1h"            # at most this often (sooner when space is low)
-scan-roots = ["/Volumes/Scratch"]
-unit-idle = "14d"
-incremental-idle = "7d"
-legacy-idle = "3d"
-dir-idle = "21d"
-orphan-grace = "2d"
-recent-guard = "1d"
-min-free = "50GiB"
-target-free = "100GiB"
-object-grace = "10m"          # keep replaced object files up to this long while a binary built from them runs
-process-guard = true          # don't remove a build directory a running process was started from
-# max-compiles = 8            # at most this many compiles at once, machine-wide; unset or 0 for no limit
-seed = true                   # start new worktrees' build directories as clones (`seed`)
-dedup = true                  # let cleanup replace identical files with clones (`dedup`)
+# inner-wrapper = "sccache"   # what rustc runs through; unset: rustc directly (setup keeps the wrapper it replaces)
+leak-fix = true               # remove the object files each incremental compile replaces
+auto-gc = false               # clean up in the background after builds (`setup` turns this on)
+gc-interval = "1h"            # at most this often, or sooner when a disk is low on space
+scan-roots = []               # directory trees searched for build directories the wrapper hasn't seen
+unit-idle = "14d"             # remove a Cargo 1.100-layout build unit unused this long
+incremental-idle = "7d"       # remove a crate's incremental cache unused this long
+legacy-idle = "3d"            # remove old-layout files once no old-layout build has run for this long
+dir-idle = "21d"              # remove a whole build directory unused this long
+orphan-grace = "2d"           # remove a deleted workspace's build directory once unused this long
+recent-guard = "1d"           # never remove for space a build directory used within this
+min-free = "50GiB"            # when a disk has less free than this, remove build directories...
+target-free = "100GiB"        # ...until it has this much (at least min-free)
+object-grace = "10m"          # keep replaced objects up to this long while a binary built from them runs
+process-guard = true          # never remove what a running program was started from
+# max-compiles = 8            # most compiles at once, machine-wide; unset or 0: no limit
+seed = true                   # let `seed` (the hook and the proxy) clone build directories
+dedup = true                  # on macOS, share identical files after each cleanup
 
-# For the cargo proxy (`cargo steward shim`); unset by default:
-# target-root = "/Volumes/Scratch/{label}/cargo"   # each worktree's target dir goes under this
-# tmp-root = "/Volumes/Scratch/{label}/tmp"        # and its TMPDIR for builds under this
-# max-builds = 4                                   # at most this many cargo builds at once
-# real-cargo = "/path/to/cargo"                    # the cargo to run; found on PATH if unset
+# The cargo proxy (docs/proxy.md); with none of the roots set it just runs cargo:
+# target-root = "/Volumes/Scratch/{label}/cargo"   # each worktree's target directory goes under this
+# tmp-root = "/Volumes/Scratch/{label}/tmp"        # and its TMPDIR under this
+# max-builds = 4                                   # most cargo builds at once; unset or 0: no limit
+# real-cargo = "/path/to/cargo"                    # the cargo to run; searched for when unset
+link-target = false                                # point a missing <workspace>/target at the routed directory
 #
-# [[routes]]                                       # per-directory overrides; see docs/proxy.md
+# [[routes]]                                       # per-directory overrides (docs/proxy.md#routes)
 # path = "/Users/me/Workspaces/bigproject"
 # target-root = "/Volumes/Scratch/bigproject/cargo"
 # max-builds = 3
+# force = true                                     # route even over a target dir chosen elsewhere
 ```
 
-`CARGO_STEWARD_INNER` overrides `inner-wrapper` (empty for none), and
-`CARGO_STEWARD_MAX_COMPILES` overrides `max-compiles` (`0` for no limit).
+Durations are written like `10m`, `12h`, `14d` or `2w`. Sizes are bytes, or
+take `K`, `M`, `G` or `T` (alone, or with `B` or `iB`), always binary:
+`50GiB` and `50G` are the same.
 
-Automatic cleanups log to `~/.cargo/steward/gc.log`.
+A setting that can't be used (a wrong type, a duration or size that doesn't
+parse, `target-free` below `min-free`) falls back to its default alone; the
+others still apply. Commands print a warning for each, and `doctor` lists
+them under Settings, along with keys that aren't settings (usually typos).
+The wrapper and the proxy never fail a build over one. `setup` rewrites the
+file with the settings it knows, stops at a setting of the wrong type, and
+records what it replaced in Cargo's config (`previous-wrapper`,
+`previous-build-dir`, `managed-build-dir`) for `--undo`.
+
+Environment variables:
+
+| Variable | Effect |
+|---|---|
+| `CARGO_STEWARD_HOME` | The steward home |
+| `CARGO_STEWARD_INNER` | Overrides `inner-wrapper`; empty for none |
+| `CARGO_STEWARD_MAX_COMPILES` | Overrides `max-compiles`; `0` or empty for no limit |
 
 ## How it works
 
-Cargo runs `cargo-steward <rustc> <args>` for every compile. Before a compile
-that writes objects, the wrapper lists the unit's existing `*.rcgu.o` files.
-After rustc succeeds, it removes those the compile didn't rewrite. Each compile
-gives all of its objects new names, including the ones it reuses from the
-incremental cache, so anything with an old name and an old timestamp belongs
-to an earlier compile. Calls that compile nothing (`rustc -vV`, `--print`) are
-handed straight to rustc. Measured overhead is under a millisecond per
-compile, and about 4 ms on cargo's cached version probe.
+**The wrapper.** Cargo runs `cargo-steward <rustc> <args>` for every
+compile. Calls that compile nothing (`rustc -vV`, `--print`) are handed
+straight to rustc. Before an incremental compile, the wrapper lists the
+unit's existing `*.rcgu.o` / `*.rcgu.dwo` files; after rustc succeeds, it
+removes those the compile didn't rewrite. Each incremental compile gives all
+of its objects new names, including the ones it reuses, so anything with an
+old name and an old timestamp belongs to an earlier compile. When some of
+those are from within `object-grace` and the unit has an executable, the
+wrapper first looks for a program started from it (or from the copy cargo
+puts in the profile directory), and keeps them while one runs. An inner
+wrapper that isn't installed is skipped, so builds keep working without it.
 
-A program still running from the unit's binary or test executable may have
-been linked from the objects a compile replaced, and its backtraces need
-them. When some of those objects are from within `object-grace`, the wrapper
-looks for such a program, first by the short process names the system keeps
-(about half a millisecond on macOS), then by path, file identity, or the name
-and size of the copy cargo uplifts into the profile directory. It keeps them
-while one runs and removes them otherwise. Cleanup applies the same rule to
-what's left over. Libraries have no executable, so their replaced objects
-never need the lookup.
+**Compile slots.** With `max-compiles = N`, at most N compiles run at once
+on the machine, however many builds start them: several agents each running
+cargo with a job per core share N rustc processes. Each compile holds a lock
+on one of N files in `compile-slots/` in the steward home while its rustc
+runs, and the system releases it however the compile ends. A compile that
+finds every slot taken waits without printing anything, and one started
+from inside another compile (by a proc macro, say) doesn't wait. The
+proxy's `max-builds` limits whole cargo builds instead.
 
-With `max-compiles = N`, at most N compiles run at once on the machine,
-however many builds start them: several agents each running cargo with a
-job per core share N rustc processes instead of oversubscribing CPU and
-memory. Each compile holds one of N slots while its rustc runs: an exclusive
-lock on a file in `compile-slots/` in the steward home, which rustc and what
-it starts never inherit and the system releases however the compile ends. A
-compile that finds every slot taken waits for one without printing anything
-(cargo reads rustc's output), and one started from inside another compile,
-such as by a proc macro, doesn't wait. Calls that compile nothing take no
-slot. The `cargo` proxy's `max-builds` limits whole builds instead.
+**Records.** For each workspace member it compiles, the wrapper appends a
+line to a ledger in the steward home: the build directory, the package, the
+linked git worktree it's in (read from `.git`, without running git), and how
+long the compile took. Cleanup compacts the ledger into a registry. That's
+how it knows when a build directory was last used, what rebuilding it
+costs, and when every worktree that built into it is gone. Once one is
+gone, cleanup asks its repository: a linked worktree whose
+`.git/worktrees/<name>` is gone was removed for good. Records of build
+directories on a volume that isn't mounted are kept until it's back.
 
-For workspace members, the wrapper also appends one line to a ledger: which
-build directory, which package, which linked git worktree it's in (read from
-`.git`, without running git), how long the compile took. Cleanup compacts it
-into a registry. That's how cleanup knows when a directory was last used, and
-when every worktree that built into it is gone. Once one is gone, cleanup
-asks its repository: a worktree whose admin directory
-(`.git/worktrees/<name>`) is gone was removed for good.
+**Finding build directories.** Cleanup manages the build directories the
+wrapper has recorded and any it finds under `scan-roots` (six levels deep).
+A build directory's root is where cargo keeps `.rustc_info.json`, or its
+`CACHEDIR.TAG` beside build profiles. Both of Cargo's layouts are handled,
+and a directory holding both.
 
-A cleanup is due once `gc-interval` has passed since the last. When a disk
-is below `min-free`, one is due after 5 minutes instead; while those
-cleanups free nothing, the wait doubles, up to `gc-interval`, and it's back
-to 5 minutes once one frees space or the disk has `min-free` again.
-
-When a cleanup is due, the wrapper starts `cargo-steward gc --auto` in its own
-session, at background CPU and I/O priority, with its output going to the log,
-so cargo never waits for it.
+**When cleanup runs.** With `auto-gc` on, after a compile the wrapper
+starts `cargo-steward gc --auto` when one is due: in its own session, at
+background CPU and I/O priority, so cargo never waits for it. Only one
+cleanup runs at a time, and automatic ones log to `gc.log` in the steward
+home. A cleanup is due once `gc-interval` has passed since the last. When
+the compile's disk is below `min-free`, one is due after 5 minutes instead;
+while those cleanups free nothing, the wait doubles, up to `gc-interval`,
+and it's back to 5 minutes once one frees space or no disk is low. On macOS
+with `dedup = true`, each applied cleanup then shares identical files among
+what changed since the last pass.
 
 ## Build volume (macOS)
 
-Build output on the system disk is caught by Time Machine's local snapshots,
-which keep deleted files for about a day; Spotlight indexes it too. A separate
-APFS volume in the same container shares free space with the system disk and
-avoids both. It needs no repartitioning:
-
-```sh
-cargo steward setup --volume Scratch   # creates /Volumes/Scratch and adds it as a scan root
-sudo mdutil -i off /Volumes/Scratch            # no Spotlight (setup prints these two)
-sudo tmutil addexclusion -v /Volumes/Scratch   # no Time Machine
-```
-
-`--volume` runs `diskutil apfs addVolume` on the system disk's container,
-reuses the volume if it already exists, and with `--dry-run` only prints the
-plan. Then send build output there, either with `CARGO_TARGET_DIR`, or for
-every workspace at once:
-
-```sh
-cargo steward setup --build-dir /Volumes/Scratch/cargo-build
-```
-
-which sets `build.build-dir = "/Volumes/Scratch/cargo-build/{workspace-path-hash}"`:
-one intermediate build directory per worktree, in one place, which IDEs and
-rust-analyzer follow too.
-
-Build directories that stay on the system disk should at least be out of
-Time Machine. Cargo excludes target directories it creates, but not ones a
-script created first; `doctor` lists those, with the `tmutil addexclusion`
-command for each.
+Build output on the system disk is held for about a day after deletion by
+Time Machine's local snapshots, and Spotlight indexes it.
+`cargo steward setup --volume Scratch` creates a separate APFS volume in the
+same container, which shares free space with the system disk and avoids
+both, and `setup --build-dir` sends every workspace's build output there.
+See [docs/install.md](docs/install.md#a-build-volume-macos).
 
 ## CI
 
-On ephemeral runners with [Swatinem/rust-cache], the leak doesn't arise
-(that action turns off incremental builds). On persistent self-hosted runners,
-especially macOS ones, it does, and build directories grow without bound. There:
+On persistent self-hosted runners, make cargo-steward the wrapper and clean
+up periodically. On runners that restore a cached build directory,
+`cargo steward ci start` and `cargo steward ci trim` keep the cache to what
+the job used. Both, and the GitHub Action, are in [docs/ci.md](docs/ci.md).
 
-```sh
-export RUSTC_WRAPPER=cargo-steward CARGO_STEWARD_INNER=sccache   # env outranks config in CI
-cargo steward gc --apply                                         # e.g. as a nightly job
-```
+## Agent skill
 
-`cargo steward ci` trims a job's build output to what it used; see
-[docs/ci.md](docs/ci.md).
-
-## Development
-
-```sh
-cargo test                     # unit and end-to-end tests (real cargo builds)
-cargo clippy --all-targets -- -D warnings
-cargo fmt --check
-shellcheck scripts/install.sh
-```
-
-The end-to-end tests build with the cargo running them. To check another
-version or layout:
-
-```sh
-STEWARD_TEST_CARGO=$(rustup +beta which cargo) RUSTC=$(rustup +beta which rustc) cargo test --test e2e
-```
+`cargo steward skill install` installs a skill (`SKILL.md`) that teaches AI
+coding agents to build, clean up and retire worktrees with cargo-steward. It
+goes into the skills directory of each agent found, Claude Code
+(`$CLAUDE_CONFIG_DIR` or `~/.claude`) and Codex (`$CODEX_HOME` or
+`~/.codex`), or into each `--dir DIR` given. The skill is built into the
+binary: `skill status` shows whether each installed copy matches it, and
+`skill install` updates them. `skill show` prints it, and `skill uninstall`
+removes it.
 
 [rust-lang/rust#161824]: https://github.com/rust-lang/rust/issues/161824
 [rust-lang/cargo#16665]: https://github.com/rust-lang/cargo/issues/16665
@@ -305,7 +332,6 @@ STEWARD_TEST_CARGO=$(rustup +beta which cargo) RUSTC=$(rustup +beta which rustc)
 [rust-lang/cargo#5026]: https://github.com/rust-lang/cargo/issues/5026
 [rust-lang/cargo#13136]: https://github.com/rust-lang/cargo/issues/13136
 [rust-lang/cargo#17453]: https://github.com/rust-lang/cargo/issues/17453
-[Swatinem/rust-cache]: https://github.com/Swatinem/rust-cache
 
 ## License
 

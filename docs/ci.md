@@ -8,9 +8,9 @@ cargo steward ci start                 # before the job builds
 cargo steward ci trim --budget 8GiB    # the job's last step, before the cache is saved
 ```
 
-`trim` removes, in this order:
+`trim` removes:
 
-1. build units that no build in the job used, since `start`;
+1. build units that no build in the job used since `start`;
 2. the workspace's own crates, unless `--keep-workspace` (they change with most
    commits, so a cached copy rarely helps);
 3. incremental caches, unless `--keep-incremental`;
@@ -30,8 +30,8 @@ each item.
 
 Both commands find the build directory with `cargo metadata` in the current
 directory (`build-dir` if one is set, else the target directory), or take
-`--target-dir DIR`. They handle the old build-directory layout and the one
-Cargo 1.100 introduces (`build/<package>/<hash>/`), and a directory holding
+`--target-dir DIR`. They handle the build-directory layout before Cargo
+1.100, Cargo 1.100's (`build/<package>/<hash>/`), and a directory holding
 both.
 
 ## GitHub-hosted runners with rust-cache
@@ -60,7 +60,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2           # restores now, saves in its post step
+      - uses: Swatinem/rust-cache@v2           # restores here, saves in its post step
       - uses: doublesharp/cargo-steward@v0.1.0
         with:
           mode: start                          # after the restore, before any build
@@ -75,11 +75,11 @@ jobs:
 - `start` must come after the cache is restored and before anything builds.
   Extracting the cache writes every file, and `start` resets what it needs
   afterwards.
-- Leave `trim` without an `if:` (so it only runs when the job succeeds). A
+- Leave `trim` without an `if:`, so it runs only when the job succeeds. A
   failed job stops partway, before it has used everything it would have, and
   rust-cache doesn't save after a failure by default anyway. Nothing is lost
   by skipping it: the next `start` puts back the access times this one saved
-  (see below).
+  ([below](#how-used-this-job-works)).
 - Pick a budget so that every cache key you keep fits in 10 GB together.
   rust-cache compresses what it saves, and keeps one cache per OS, job, and
   toolchain.
@@ -93,9 +93,9 @@ With [actions/cache] instead, split it into `actions/cache/restore` and
 on `PATH`. By default it builds the action's own checkout (the ref you wrote
 after `@`) with `cargo install --locked --path`, which takes about a minute.
 rust-cache caches binaries installed during a job (`cache-bin`, on by
-default), so later runs find it and skip the build. Set `version` to install that release from
-crates.io instead. To install it some other way, put it on `PATH` before the
-`start` step.
+default), so later runs find it and skip the build. Set `version` to
+install that release from crates.io instead. To install it some other way,
+put it on `PATH` before the `start` step.
 
 The build uses the runner's default toolchain, not your workspace's
 `rust-toolchain.toml`, and needs Rust 1.89 or newer.
@@ -136,33 +136,35 @@ Then clean up periodically, either for the whole machine:
 cargo steward gc --apply          # e.g. a scheduled workflow, or cron
 ```
 
-which goes by idle time and free disk space (see the README's settings), or
-for each job's build directory, as its last step:
+which goes by idle time and free disk space
+([README](../README.md#what-gets-removed)), or for each job's build
+directory, as its last step:
 
 ```yaml
       - run: cargo steward ci trim --keep-workspace --keep-incremental --budget 30GiB
 ```
 
 On a persistent runner, keep the workspace's crates and incremental caches
-(the next job rebuilds faster with them), and use `ci start` with `ci trim` only
-where one workflow owns the build directory. A unit that another workflow
-builds into the same directory, but this job didn't, counts as unused (see
-below). Without `ci start`, `ci trim` applies only the budget.
+(the next job rebuilds faster with them), and use `ci start` with `ci trim`
+only where one workflow owns the build directory: a unit that another
+workflow builds into the same directory, but this job didn't, counts as
+unused. Without `ci start`, `ci trim` applies only the budget.
 
 ## How "used this job" works
 
 Cargo keeps a fingerprint for each unit, in `.fingerprint/<package>-<hash>/`
-(old layout) or `build/<package>/<hash>/fingerprint/` (Cargo 1.100), and reads
-it every time a build considers the unit, including when the unit is up to
-date and nothing compiles. That read is the signal.
+(before Cargo 1.100) or `build/<package>/<hash>/fingerprint/` (Cargo 1.100),
+and reads it every time a build considers the unit, including when the unit
+is up to date and nothing compiles. That read is the signal.
 
 `ci start` writes `.cargo-steward-ci-start` at the root of the build directory
 with the time, saves when each unit's fingerprint was last used to
 `.cargo-steward-ci-atimes` next to it, then sets the access time of every
-fingerprint file to the Unix epoch, leaving modification times alone. An access time older than the
-modification time is the case every common mount updates on the next read:
-Linux `relatime` (the default) and `strictatime`, and macOS, whose APFS
-updates an access time only when it's older than the modification time. So after the job, a unit whose fingerprint files were
+fingerprint file to the Unix epoch, leaving modification times alone. An
+access time older than the modification time is the case every common mount
+updates on the next read: Linux `relatime` (the default) and `strictatime`,
+and macOS, whose APFS updates an access time only when it's older than the
+modification time. So after the job, a unit whose fingerprint files were
 neither read nor written since the start was in none of its builds. `trim`
 removes those units, puts back the saved access times of the fingerprints no
 build read, and removes both files.
@@ -191,9 +193,9 @@ Limits:
   counts as used.
 - **Anything else that reads the files counts as use.** A virus scanner, an
   indexer, or a backup reading the build directory during the job makes units
-  look used. That errs on the side of keeping them.
-- **Old-layout outputs whose fingerprint is gone** (left by another tool's
-  cleanup) can't be dated reliably. Only the budget removes them.
+  look used, so they're kept.
+- **Old-layout outputs whose fingerprint is gone** (left by another tool's cleanup)
+  can't be dated. Only the budget removes them.
 - Final outputs that cargo copies up into the profile directory
   (`target/debug/<bin>`) and `target/doc` aren't units and are left alone.
   rust-cache removes the former before saving.
