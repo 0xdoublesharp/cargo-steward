@@ -12,6 +12,8 @@ use anyhow::{Context, Result, bail};
 
 use super::{Plan, gate, is_empty, real_cargo, settings, slot_dir, this_exe};
 use crate::config::{self, Paths};
+use crate::ledger;
+use crate::seed::{self, baseline, baseline::Preview};
 
 #[derive(Debug, clap::Subcommand)]
 pub enum ShimCommand {
@@ -266,7 +268,7 @@ fn explain(args: &[OsString]) -> Result<()> {
     );
     let cwd = env::current_dir()?;
     match Plan::new(&config, &cwd, &args) {
-        Ok(plan) => describe(&config, &plan),
+        Ok(plan) => describe(&config, paths.as_ref(), &plan),
         Err(e) => println!("routing:      not routed: {e:#}"),
     }
     let me = this_exe();
@@ -292,7 +294,7 @@ fn explain(args: &[OsString]) -> Result<()> {
     Ok(())
 }
 
-fn describe(config: &config::Config, plan: &Plan) {
+fn describe(config: &config::Config, paths: Option<&Paths>, plan: &Plan) {
     println!("directory:    {}", plan.dir.display());
     match &plan.namespace.git {
         Some(git) => {
@@ -323,16 +325,42 @@ fn describe(config: &config::Config, plan: &Plan) {
         "off".to_string()
     } else if plan.skip.is_some() || plan.target.is_none() {
         "no: nothing routed".into()
-    } else if let Some(from) = &plan.seed_from {
-        match &plan.target {
-            Some(target) if !is_empty(target) => "no: the target dir already has files".into(),
-            _ if !from.is_dir() => format!("no: {} doesn't exist yet", from.display()),
-            _ => format!("yes, from {}", from.display()),
+    } else if let (Some(target), Some(namespace)) = (&plan.target, &plan.seed_from) {
+        if is_empty(target) {
+            seed_source(paths, target, namespace, &plan.namespace.key)
+        } else {
+            "no: the target dir already has files".into()
         }
     } else {
         "no: only builds in a linked worktree are seeded".into()
     };
     println!("seed:         {seed}");
+}
+
+/// Which of the other target directories in `namespace` seeding `target`
+/// would clone now, and why that one.
+fn seed_source(paths: Option<&Paths>, target: &Path, namespace: &Path, key: &str) -> String {
+    let registry = paths.map(ledger::peek).unwrap_or_default();
+    let candidates = baseline::namespace_candidates(namespace, key, &registry);
+    match baseline::preview(target, &candidates) {
+        Preview::Nothing => format!(
+            "no: no other worktree has built in {} yet",
+            namespace.display()
+        ),
+        Preview::Ready { pick, busy } => {
+            let mut why = candidates[pick].about();
+            if !busy.is_empty() {
+                let labels: Vec<&str> =
+                    busy.iter().map(|&i| candidates[i].label.as_str()).collect();
+                why.push_str(&format!("; busy: {}", labels.join(", ")));
+            }
+            format!("yes, from {} ({why})", candidates[pick].dir.display())
+        }
+        Preview::AllBusy => format!(
+            "not now: builds are using every build to seed from; it waits up to {} s for one",
+            seed::LOCK_WAIT.as_secs()
+        ),
+    }
 }
 
 /// The shell `$SHELL` names; zsh when unknown.

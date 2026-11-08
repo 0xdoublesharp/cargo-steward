@@ -9,7 +9,7 @@
 //! directories each worktree's packages compiled into.
 
 use std::collections::{BTreeMap, HashSet};
-use std::fs;
+use std::fs::{self, File, TryLockError};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -179,6 +179,12 @@ pub(crate) fn namespace_candidates(ns: &Path, own: &str, registry: &Registry) ->
     rank(found)
 }
 
+/// Whether the proxy's namespace directory `ns` holds a target directory
+/// besides `own`'s to seed from. One directory listing.
+pub(crate) fn has_namespace_candidates(ns: &Path, own: &str) -> bool {
+    fsutil::entries(ns).any(|(name, path)| !name.starts_with('.') && name != own && path.is_dir())
+}
+
 /// The build directories the worktree holding `dir`, whose own are `mine`,
 /// can be seeded from, ranked: each other worktree's, found where the same
 /// layout puts them, and the main checkout's found by `cargo metadata` there
@@ -298,6 +304,53 @@ fn recorded_roots(
         }
     }
     best.into_iter().map(|(w, (_, root))| (w, root)).collect()
+}
+
+/// Whether a build is using the build directory `root` right now. Opens
+/// cargo's lock files without creating any and holds none.
+pub(crate) fn in_use(root: &Path) -> bool {
+    scan::profiles(root).iter().any(|profile| {
+        fsutil::LOCK_FILES.iter().any(|name| {
+            File::open(profile.path.join(name))
+                .is_ok_and(|f| matches!(f.try_lock(), Err(TryLockError::WouldBlock)))
+        })
+    })
+}
+
+/// What seeding would do now, without waiting or changing anything.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Preview {
+    /// No candidate holds a build to seed from.
+    Nothing,
+    /// It would seed from `candidates[pick]`; the ones in `busy`, ranked
+    /// higher, are in use by builds.
+    Ready { pick: usize, busy: Vec<usize> },
+    /// Builds are using every candidate.
+    AllBusy,
+}
+
+/// Which of the ranked `candidates` seeding `target` would use now.
+pub(crate) fn preview(target: &Path, candidates: &[Candidate]) -> Preview {
+    let resolved = route::resolve(target);
+    let mut busy = Vec::new();
+    for (i, c) in candidates.iter().enumerate() {
+        let Ok(dir) = c.dir.canonicalize() else {
+            continue;
+        };
+        if !super::holds_build(&dir) || resolved.starts_with(&dir) || dir.starts_with(&resolved) {
+            continue;
+        }
+        if in_use(&dir) {
+            busy.push(i);
+        } else {
+            return Preview::Ready { pick: i, busy };
+        }
+    }
+    if busy.is_empty() {
+        Preview::Nothing
+    } else {
+        Preview::AllBusy
+    }
 }
 
 #[cfg(test)]
@@ -529,6 +582,8 @@ mod tests {
             built(&space.join(key));
         }
         fs::create_dir_all(space.join("b")).unwrap();
+        assert!(has_namespace_candidates(&space, "b"));
+        assert!(!has_namespace_candidates(&root.join("nowhere"), "b"));
 
         let mine = Dirs::one(&space.join("b"));
         let found = discover(&b, &mine, &Registry::default());
@@ -576,6 +631,52 @@ mod tests {
                 .iter()
                 .any(|c| c.dir == theirs && c.label == "worktree a"),
             "{found:?}"
+        );
+    }
+
+    #[test]
+    fn previews_the_pick_without_waiting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let main = root.join("main");
+        let recent = root.join("recent");
+        let empty = root.join("empty");
+        built(&main);
+        built(&recent);
+        fs::create_dir_all(&empty).unwrap();
+        let target = root.join("new");
+        let candidates = rank(vec![
+            candidate(&empty, false, 300),
+            candidate(&recent, false, 200),
+            candidate(&main, true, 100),
+        ]);
+        assert_eq!(
+            preview(&target, &candidates),
+            Preview::Ready {
+                pick: 0,
+                busy: vec![]
+            }
+        );
+        let held = fsutil::lock_profile(&main.join("debug"));
+        assert!(in_use(&main));
+        assert_eq!(
+            preview(&target, &candidates),
+            Preview::Ready {
+                pick: 2,
+                busy: vec![0]
+            }
+        );
+        let also = fsutil::lock_profile(&recent.join("debug"));
+        assert_eq!(preview(&target, &candidates), Preview::AllBusy);
+        drop((held, also));
+        assert_eq!(
+            preview(&target, &[candidate(&empty, true, 1)]),
+            Preview::Nothing
+        );
+        // The target itself is never a candidate.
+        assert_eq!(
+            preview(&main, &[candidate(&main, true, 1)]),
+            Preview::Nothing
         );
     }
 }

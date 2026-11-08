@@ -4,6 +4,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- With `build.build-dir` set, the `cargo` proxy also seeds a new worktree's
+  build directory, from the build directory of the worktree its target
+  directory is cloned from. It runs `cargo metadata` once, only when it
+  seeds a new target directory.
+
 ### Changed
 
 - Seeding starts a new worktree from the best build the repository has, not
@@ -15,6 +22,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   without running cargo in each, and prints which one it used and why.
 - `seed --from` can be given more than once; the first is preferred, then
   the most recently used.
+- The `cargo` proxy seeds a new worktree when any other checkout of the
+  repository has a target directory under `target-root`, not only the main
+  checkout, and leaves the choice to `seed`: it runs `cargo-steward seed
+  --target-dir <new> --worktree <dir> --quiet`. `shim explain` shows which
+  directory it would seed from.
 
 ### Fixed
 

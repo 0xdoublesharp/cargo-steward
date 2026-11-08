@@ -17,11 +17,18 @@ For each `cargo ...` it:
 2. **Routes temporary files.** With `tmp-root` set, it sets `TMPDIR` (with
    a trailing slash), `TMP` and `TEMP` to `<tmp-root>/<repo>-<hash>/<worktree>`.
 3. **Seeds new worktrees.** When a build runs in a linked worktree whose
-   target directory is new or empty, and the main checkout's
-   (`<target-root>/<repo>-<hash>/main`) exists, it first runs
-   `cargo-steward seed --target-dir <new> --from <main> --worktree <checkout> --quiet`
-   and waits for it. A failed seed only means a cold build. Turn this off
-   with `seed = false`.
+   target directory is new or empty, and another checkout of the repository
+   has a target directory in `<target-root>/<repo>-<hash>/`, it first runs
+   `cargo-steward seed --target-dir <new> --worktree <dir> --quiet` and
+   waits for it. `seed` clones the main checkout's target directory, or,
+   when the main checkout hasn't built or a build is using it, the most
+   recently used other one (see
+   [warm-start.md](warm-start.md#which-build-it-clones)). With
+   `build.build-dir` set, `seed` asks `cargo metadata` where the new
+   worktree's build directory is and starts it from the same worktree's
+   build directory too. A failed seed only means a cold build.
+   `cargo steward shim explain` names the directory it would seed from.
+   Turn this off with `seed = false`.
 4. **Waits for a build slot.** With `max-builds = N`, at most N builds run
    at once across the machine. A build that has to wait prints
    `cargo-steward: waiting for one of N Cargo build slots (held by ...)`
@@ -33,7 +40,8 @@ For each `cargo ...` it:
    each build it starts takes its own.
 5. **Runs the real cargo**, with `argv[0]` still `cargo`.
 
-The proxy never runs `git` or any other program, except `seed` in step 3.
+The proxy never runs `git` or any other program, except `seed` in step 3,
+which runs only for a target directory that is new or empty.
 It finds the repository by reading `.git` itself. It adds about 2 ms to a
 cargo invocation.
 
@@ -70,7 +78,7 @@ set, the proxy just runs cargo.
 | `tmp-root`    | unset   | Directory that holds the per-worktree `TMPDIR`s. |
 | `max-builds`  | unset   | Most cargo builds to run at once. Unset or `0`: no limit. |
 | `real-cargo`  | unset   | The cargo to run. Searched for when unset. |
-| `seed`        | `true`  | Seed new worktrees' target directories from the main checkout's. |
+| `seed`        | `true`  | Seed new worktrees' target directories from another checkout's. |
 
 Roots must be absolute paths. A leading `~/` means `$HOME`. `{label}` in a
 root is replaced by the repository's label (the `<label>` of the namespace
