@@ -4,6 +4,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Release builds use the supported macOS 15 Apple Silicon runner. A manual
+  workflow run can rebuild binaries from an existing release tag without
+  republishing the crate.
+
 ## [0.1.0] - 2026-11-08
 
 ### Added
