@@ -9,9 +9,11 @@ use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use serde::Serialize;
 
 use super::{Plan, gate, is_empty, real_cargo, settings, slot_dir, this_exe};
 use crate::config::{self, Paths};
+use crate::json;
 
 #[derive(Debug, clap::Subcommand)]
 pub enum ShimCommand {
@@ -34,6 +36,9 @@ pub enum ShimCommand {
     Status,
     /// What the proxy would do for a cargo command run here
     Explain {
+        /// Print one JSON document instead of text
+        #[arg(long)]
+        json: bool,
         /// The cargo command's arguments [default: build]
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<OsString>,
@@ -56,7 +61,14 @@ pub fn run(command: &ShimCommand) -> Result<()> {
         ShimCommand::Install { bin_dir, shell } => install(bin_dir.as_deref(), *shell),
         ShimCommand::Uninstall { bin_dir } => uninstall(bin_dir.as_deref()),
         ShimCommand::Status => status(),
-        ShimCommand::Explain { args } => explain(args),
+        ShimCommand::Explain { args, json } => explain(args, *json),
+    }
+}
+
+impl ShimCommand {
+    /// Whether the command was asked for a JSON document.
+    pub fn json(&self) -> bool {
+        matches!(self, ShimCommand::Explain { json: true, .. })
     }
 }
 
@@ -230,69 +242,365 @@ fn status() -> Result<()> {
         println!("PATH set in:  {}", rcs.join(", "));
     }
     println!();
-    explain(&[])
+    explain(&[], false)
 }
 
-fn explain(args: &[OsString]) -> Result<()> {
-    let args: Vec<OsString> = if args.is_empty() {
-        vec!["build".into()]
-    } else {
-        args.to_vec()
-    };
-    let paths = Paths::resolve();
-    let config = settings(paths.as_ref(), false);
-    match &paths {
-        Some(p) => {
-            if p.config().exists() {
-                println!("settings:     {}", p.config().display());
-            } else {
-                println!(
-                    "settings:     {} (missing: defaults, nothing routed)",
-                    p.config().display()
-                );
+/// What the proxy would do for a cargo command run here: what `explain`
+/// shows, as text or JSON.
+struct Explanation {
+    /// The settings file, when there is a home to find it in.
+    settings: Option<PathBuf>,
+    /// Settings that can't be used, and so have their defaults.
+    problems: Vec<String>,
+    args: Vec<OsString>,
+    plan: std::result::Result<Planned, String>,
+    real_cargo: Option<PathBuf>,
+    route: Option<PathBuf>,
+    slot: Slot,
+}
+
+/// A plan and whether it seeds.
+struct Planned {
+    plan: Plan,
+    seed: Seed,
+}
+
+/// Whether a build here starts its target dir as a clone of the main
+/// checkout's, and if not, why not.
+#[derive(Debug, Clone, PartialEq)]
+enum Seed {
+    Off,
+    NothingRouted,
+    TargetHasFiles,
+    SourceMissing(PathBuf),
+    Yes(PathBuf),
+    NotLinked,
+}
+
+impl Seed {
+    fn of(config: &config::Config, plan: &Plan) -> Seed {
+        if !config.seed {
+            Seed::Off
+        } else if plan.skip.is_some() || plan.target.is_none() {
+            Seed::NothingRouted
+        } else if let Some(from) = &plan.seed_from {
+            match &plan.target {
+                Some(target) if !is_empty(target) => Seed::TargetHasFiles,
+                _ if !from.is_dir() => Seed::SourceMissing(from.clone()),
+                _ => Seed::Yes(from.clone()),
             }
-            for problem in config::load_lenient(p).1 {
-                println!("              {problem}");
-            }
+        } else {
+            Seed::NotLinked
         }
-        None => println!("settings:     none (no HOME): defaults"),
     }
-    println!(
-        "command:      cargo {}",
-        args.iter()
-            .map(|a| a.to_string_lossy())
-            .collect::<Vec<_>>()
-            .join(" ")
-    );
-    let cwd = env::current_dir()?;
-    match Plan::new(&config, &cwd, &args) {
-        Ok(plan) => describe(&config, &plan),
-        Err(e) => println!("routing:      not routed: {e:#}"),
+
+    fn id(&self) -> &'static str {
+        match self {
+            Seed::Off => "off",
+            Seed::NothingRouted => "nothing_routed",
+            Seed::TargetHasFiles => "target_not_empty",
+            Seed::SourceMissing(_) => "source_missing",
+            Seed::Yes(_) => "will_seed",
+            Seed::NotLinked => "not_linked_worktree",
+        }
     }
-    let me = this_exe();
-    match real_cargo(&config, me.as_deref()) {
-        Some(real) => println!("real cargo:   {}", real.display()),
-        None => println!("real cargo:   none found: the proxy can't run cargo"),
+
+    fn describe(&self) -> String {
+        match self {
+            Seed::Off => "off".into(),
+            Seed::NothingRouted => "no: nothing routed".into(),
+            Seed::TargetHasFiles => "no: the target dir already has files".into(),
+            Seed::SourceMissing(from) => format!("no: {} doesn't exist yet", from.display()),
+            Seed::Yes(from) => format!("yes, from {}", from.display()),
+            Seed::NotLinked => "no: only builds in a linked worktree are seeded".into(),
+        }
     }
-    let command = gate::command(&args).unwrap_or_else(|| "(none)".into());
-    let plan = Plan::new(&config, &cwd, &args).ok();
-    let limit = plan.as_ref().and_then(|p| p.max_builds).filter(|&n| n > 0);
-    let set = plan.as_ref().map(|p| p.slots.clone()).unwrap_or_default();
-    if let Some(route) = plan.as_ref().and_then(|p| p.route.as_ref()) {
-        println!("route:        {}", route.display());
-    }
-    match (limit, &paths) {
-        (None, _) | (_, None) => println!("build slot:   no limit (max-builds isn't set)"),
-        (Some(n), Some(paths)) if gate::is_build(&args) => println!(
-            "build slot:   takes one of {n} (in {})",
-            slot_dir(paths, &set).display()
-        ),
-        (Some(_), _) => println!("build slot:   none needed: `{command}` doesn't build"),
-    }
-    Ok(())
 }
 
-fn describe(config: &config::Config, plan: &Plan) {
+/// Whether the command takes one of the build slots `max-builds` limits.
+#[derive(Debug, Clone, PartialEq)]
+enum Slot {
+    NoLimit,
+    Takes { limit: u32, dir: PathBuf },
+    NotABuild { command: String },
+}
+
+impl Slot {
+    fn id(&self) -> &'static str {
+        match self {
+            Slot::NoLimit => "no_limit",
+            Slot::Takes { .. } => "takes_slot",
+            Slot::NotABuild { .. } => "not_a_build",
+        }
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            Slot::NoLimit => "no limit (max-builds isn't set)".into(),
+            Slot::Takes { limit, dir } => format!("takes one of {limit} (in {})", dir.display()),
+            Slot::NotABuild { command } => format!("none needed: `{command}` doesn't build"),
+        }
+    }
+}
+
+impl Explanation {
+    fn new(args: &[OsString]) -> Result<Explanation> {
+        let args: Vec<OsString> = if args.is_empty() {
+            vec!["build".into()]
+        } else {
+            args.to_vec()
+        };
+        let paths = Paths::resolve();
+        let config = settings(paths.as_ref(), false);
+        let problems = paths
+            .as_ref()
+            .map(|p| config::load_lenient(p).1)
+            .unwrap_or_default();
+        let cwd = env::current_dir()?;
+        let plan = Plan::new(&config, &cwd, &args)
+            .map(|plan| Planned {
+                seed: Seed::of(&config, &plan),
+                plan,
+            })
+            .map_err(|e| format!("{e:#}"));
+        let me = this_exe();
+        let command = gate::command(&args).unwrap_or_else(|| "(none)".into());
+        let planned = plan.as_ref().ok().map(|p| &p.plan);
+        let limit = planned.and_then(|p| p.max_builds).filter(|&n| n > 0);
+        let set = planned.map(|p| p.slots.clone()).unwrap_or_default();
+        let slot = match (limit, &paths) {
+            (None, _) | (_, None) => Slot::NoLimit,
+            (Some(limit), Some(paths)) if gate::is_build(&args) => Slot::Takes {
+                limit,
+                dir: slot_dir(paths, &set),
+            },
+            (Some(_), _) => Slot::NotABuild { command },
+        };
+        Ok(Explanation {
+            settings: paths.as_ref().map(Paths::config),
+            problems,
+            real_cargo: real_cargo(&config, me.as_deref()),
+            route: planned.and_then(|p| p.route.clone()),
+            args,
+            plan,
+            slot,
+        })
+    }
+
+    fn print(&self) {
+        match &self.settings {
+            Some(file) => {
+                if file.exists() {
+                    println!("settings:     {}", file.display());
+                } else {
+                    println!(
+                        "settings:     {} (missing: defaults, nothing routed)",
+                        file.display()
+                    );
+                }
+                for problem in &self.problems {
+                    println!("              {problem}");
+                }
+            }
+            None => println!("settings:     none (no HOME): defaults"),
+        }
+        println!(
+            "command:      cargo {}",
+            self.args
+                .iter()
+                .map(|a| a.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        match &self.plan {
+            Ok(planned) => describe(planned),
+            Err(e) => println!("routing:      not routed: {e}"),
+        }
+        match &self.real_cargo {
+            Some(real) => println!("real cargo:   {}", real.display()),
+            None => println!("real cargo:   none found: the proxy can't run cargo"),
+        }
+        if let Some(route) = &self.route {
+            println!("route:        {}", route.display());
+        }
+        println!("build slot:   {}", self.slot.describe());
+    }
+
+    fn document(&self) -> ExplainDoc {
+        let planned = self.plan.as_ref().ok();
+        let plan = planned.map(|p| &p.plan);
+        ExplainDoc {
+            version: json::VERSION,
+            settings: SettingsDoc {
+                path: self.settings.as_deref().map(json::path),
+                exists: self.settings.as_ref().is_some_and(|f| f.exists()),
+                problems: self.problems.clone(),
+            },
+            command: self
+                .args
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect(),
+            routing_error: self.plan.as_ref().err().cloned(),
+            directory: plan.map(|p| json::path(&p.dir)),
+            checkout: plan.map(|p| match &p.namespace.git {
+                Some(git) => CheckoutDoc {
+                    in_git: true,
+                    linked: git.linked(),
+                    worktree: git.worktree.as_deref().map(json::path),
+                    git_dir: Some(json::path(&git.checkout)),
+                },
+                None => CheckoutDoc {
+                    in_git: false,
+                    linked: false,
+                    worktree: None,
+                    git_dir: None,
+                },
+            }),
+            namespace: plan.map(|p| NamespaceDoc {
+                repo: p.namespace.repo.clone(),
+                key: p.namespace.key.clone(),
+                path: json::path(&p.namespace.relative()),
+            }),
+            target_dir: plan.map(|p| RoutedDoc::of(p, &p.target, "target-root")),
+            tmp_dir: plan.map(|p| RoutedDoc::of(p, &p.tmp, "tmp-root")),
+            seed: planned.map(|p| SeedDoc {
+                status: p.seed.id(),
+                will_seed: matches!(p.seed, Seed::Yes(_)),
+                from: p.plan.seed_from.as_deref().map(json::path),
+                message: p.seed.describe(),
+            }),
+            route: self.route.as_deref().map(json::path),
+            real_cargo: self.real_cargo.as_deref().map(json::path),
+            build_slot: SlotDoc {
+                status: self.slot.id(),
+                limit: match &self.slot {
+                    Slot::Takes { limit, .. } => Some(*limit),
+                    _ => None,
+                },
+                dir: match &self.slot {
+                    Slot::Takes { dir, .. } => Some(json::path(dir)),
+                    _ => None,
+                },
+                message: self.slot.describe(),
+            },
+        }
+    }
+}
+
+/// `shim explain --json`.
+#[derive(Serialize)]
+struct ExplainDoc {
+    version: u32,
+    settings: SettingsDoc,
+    /// The cargo command's arguments.
+    command: Vec<String>,
+    /// Why nothing could be planned here; the plan's fields are null then.
+    routing_error: Option<String>,
+    directory: Option<String>,
+    checkout: Option<CheckoutDoc>,
+    namespace: Option<NamespaceDoc>,
+    target_dir: Option<RoutedDoc>,
+    tmp_dir: Option<RoutedDoc>,
+    seed: Option<SeedDoc>,
+    route: Option<String>,
+    real_cargo: Option<String>,
+    build_slot: SlotDoc,
+}
+
+#[derive(Serialize)]
+struct SettingsDoc {
+    path: Option<String>,
+    exists: bool,
+    problems: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct CheckoutDoc {
+    in_git: bool,
+    /// A linked worktree (`git worktree add`), not the main checkout.
+    linked: bool,
+    /// The working tree; null inside a git directory.
+    worktree: Option<String>,
+    git_dir: Option<String>,
+}
+
+#[derive(Serialize)]
+struct NamespaceDoc {
+    repo: String,
+    key: String,
+    /// `<repo>/<key>`, the part of routed paths below the roots.
+    path: String,
+}
+
+#[derive(Serialize)]
+struct RoutedDoc {
+    routed: bool,
+    /// Where it goes, when routed.
+    path: Option<String>,
+    /// Why not, when not.
+    reason: Option<String>,
+    /// When routed: free space on the disk that holds (or will hold) it.
+    free_bytes: Option<u64>,
+}
+
+impl RoutedDoc {
+    fn of(plan: &Plan, dir: &Option<PathBuf>, setting: &str) -> RoutedDoc {
+        match (&plan.skip, dir) {
+            (_, None) => RoutedDoc {
+                routed: false,
+                path: None,
+                reason: Some(format!("{setting} isn't set")),
+                free_bytes: None,
+            },
+            (Some(why), Some(_)) => RoutedDoc {
+                routed: false,
+                path: None,
+                reason: Some(why.clone()),
+                free_bytes: None,
+            },
+            (None, Some(dir)) => RoutedDoc {
+                routed: true,
+                path: Some(json::path(dir)),
+                reason: None,
+                free_bytes: crate::fsutil::free_space_near(dir),
+            },
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct SeedDoc {
+    /// "will_seed", "off", "nothing_routed", "target_not_empty",
+    /// "source_missing" or "not_linked_worktree".
+    status: &'static str,
+    will_seed: bool,
+    /// The main checkout's target dir, for a linked worktree.
+    from: Option<String>,
+    message: String,
+}
+
+#[derive(Serialize)]
+struct SlotDoc {
+    /// "no_limit", "takes_slot" or "not_a_build".
+    status: &'static str,
+    limit: Option<u32>,
+    dir: Option<String>,
+    message: String,
+}
+
+fn explain(args: &[OsString], as_json: bool) -> Result<()> {
+    let explanation = Explanation::new(args)?;
+    if as_json {
+        json::print(&explanation.document())
+    } else {
+        explanation.print();
+        Ok(())
+    }
+}
+
+fn describe(planned: &Planned) {
+    let plan = &planned.plan;
     println!("directory:    {}", plan.dir.display());
     match &plan.namespace.git {
         Some(git) => {
@@ -319,20 +627,7 @@ fn describe(config: &config::Config, plan: &Plan) {
     };
     println!("target dir:   {}", routed(&plan.target, "target-root"));
     println!("tmp dir:      {}", routed(&plan.tmp, "tmp-root"));
-    let seed = if !config.seed {
-        "off".to_string()
-    } else if plan.skip.is_some() || plan.target.is_none() {
-        "no: nothing routed".into()
-    } else if let Some(from) = &plan.seed_from {
-        match &plan.target {
-            Some(target) if !is_empty(target) => "no: the target dir already has files".into(),
-            _ if !from.is_dir() => format!("no: {} doesn't exist yet", from.display()),
-            _ => format!("yes, from {}", from.display()),
-        }
-    } else {
-        "no: only builds in a linked worktree are seeded".into()
-    };
-    println!("seed:         {seed}");
+    println!("seed:         {}", planned.seed.describe());
 }
 
 /// The shell `$SHELL` names; zsh when unknown.

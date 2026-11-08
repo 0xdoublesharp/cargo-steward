@@ -3,15 +3,20 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
+use serde::Serialize;
 
 use crate::config::{self, Paths};
 use crate::fsutil::{self, Usage, ago, human};
 use crate::gc::{self, BuildDir};
+use crate::json;
 
-pub fn run(sizes: bool) -> Result<()> {
+pub fn run(sizes: bool, as_json: bool) -> Result<()> {
     let paths = Paths::resolve().context("cannot locate the home directory")?;
     let config = config::load_warning(&paths);
     let (_, mut dirs) = gc::inventory(&paths, &config.scan_roots, false)?;
+    if as_json {
+        return json::print(&document(dirs, sizes));
+    }
     if dirs.is_empty() {
         println!("No build directories found yet.");
         println!(
@@ -91,6 +96,92 @@ pub fn run(sizes: bool) -> Result<()> {
         println!("Run with --sizes to measure each directory.");
     }
     Ok(())
+}
+
+/// `status --json`.
+#[derive(Serialize)]
+struct Document {
+    version: u32,
+    /// Whether sizes were measured (`--sizes`).
+    sizes_measured: bool,
+    /// Most recently used first.
+    build_dirs: Vec<DirEntry>,
+    /// With `--sizes`: the sums over every directory.
+    total_bytes: Option<u64>,
+    total_unshared_bytes: Option<u64>,
+    /// Free space on each disk holding build directories.
+    disks: Vec<Disk>,
+}
+
+#[derive(Serialize)]
+struct DirEntry {
+    path: String,
+    last_used: String,
+    last_used_secs_ago: u64,
+    /// "legacy", "v2", "mixed" or "empty".
+    layout: &'static str,
+    pinned: bool,
+    /// Every workspace that built here has been deleted.
+    orphaned: bool,
+    workspaces: Vec<String>,
+    /// As `du` counts it; with `--sizes` only.
+    size_bytes: Option<u64>,
+    /// Blocks no clone shares; with `--sizes`, where the filesystem can tell.
+    unshared_bytes: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct Disk {
+    /// The first build directory on the disk.
+    path: String,
+    free_bytes: u64,
+}
+
+fn document(mut dirs: Vec<BuildDir>, sizes: bool) -> Document {
+    dirs.sort_by_key(|d| std::cmp::Reverse(d.last_used));
+    let usages: Vec<Option<Usage>> = if sizes {
+        fsutil::parallel_map(&dirs, |d| Some(fsutil::tree_usage(&d.root)))
+    } else {
+        vec![None; dirs.len()]
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    let disks = dirs
+        .iter()
+        .filter(|d| d.device.is_some_and(|device| seen.insert(device)))
+        .filter_map(|d| {
+            Some(Disk {
+                path: json::path(&d.root),
+                free_bytes: fsutil::free_space(&d.root)?,
+            })
+        })
+        .collect();
+    let measured: Option<Vec<Usage>> = sizes.then(|| usages.iter().flatten().copied().collect());
+    Document {
+        version: json::VERSION,
+        sizes_measured: sizes,
+        total_bytes: measured
+            .as_ref()
+            .map(|u| u.iter().map(|u| u.allocated).sum()),
+        total_unshared_bytes: measured
+            .as_ref()
+            .and_then(|u| u.iter().map(|u| u.private).sum()),
+        build_dirs: dirs
+            .iter()
+            .zip(&usages)
+            .map(|(dir, usage)| DirEntry {
+                path: json::path(&dir.root),
+                last_used: json::time(dir.last_used),
+                last_used_secs_ago: json::secs_ago(dir.last_used),
+                layout: layout(dir),
+                pinned: dir.pinned,
+                orphaned: dir.orphaned(),
+                workspaces: dir.workspaces.iter().map(|w| json::path(w)).collect(),
+                size_bytes: usage.map(|u| u.allocated),
+                unshared_bytes: usage.and_then(|u| u.private),
+            })
+            .collect(),
+        disks,
+    }
 }
 
 fn layout(dir: &BuildDir) -> &'static str {

@@ -10,6 +10,7 @@ mod dedup;
 mod doctor;
 mod fsutil;
 mod gc;
+mod json;
 mod ledger;
 mod proxy;
 mod scan;
@@ -50,12 +51,19 @@ enum Cmd {
     /// Make cargo-steward Cargo's rustc-wrapper and turn on automatic cleanup
     Setup(setup::Args),
     /// Check the setup and report what to change
-    Doctor,
+    Doctor {
+        /// Print one JSON document instead of text
+        #[arg(long)]
+        json: bool,
+    },
     /// List the build directories cargo-steward manages
     Status {
         /// Measure each directory's size (slower)
         #[arg(long)]
         sizes: bool,
+        /// Print one JSON document instead of text
+        #[arg(long)]
+        json: bool,
     },
     /// Show what a cleanup would remove; with --apply, remove it
     Gc {
@@ -66,8 +74,11 @@ enum Cmd {
         #[arg(short, long)]
         verbose: bool,
         /// Run as the wrapper's background cleanup: apply, quietly, at low priority
-        #[arg(long, hide = true)]
+        #[arg(long, hide = true, conflicts_with = "json")]
         auto: bool,
+        /// Print one JSON document instead of text
+        #[arg(long)]
+        json: bool,
     },
     /// Protect a build directory from cleanup (stale object files are still removed)
     Pin { dir: PathBuf },
@@ -85,6 +96,9 @@ enum Cmd {
         /// List every file group, not just the totals
         #[arg(short, long)]
         verbose: bool,
+        /// Print one JSON document instead of text
+        #[arg(long)]
+        json: bool,
     },
     /// CI support: trim build output to what a job used, within a budget
     Ci(ci::Args),
@@ -105,6 +119,9 @@ enum Cmd {
         /// Also remove pinned directories
         #[arg(long)]
         force: bool,
+        /// Print one JSON document instead of text
+        #[arg(long)]
+        json: bool,
     },
     /// Install or remove the agent skill that teaches AI agents to use cargo-steward
     Skill(skill::Args),
@@ -151,14 +168,16 @@ fn main() -> ExitCode {
     }
 
     let cli = Cli::parse_from(args);
+    let json = cli.command.json();
     let result = match cli.command {
         Cmd::Setup(args) => setup::run(&args),
-        Cmd::Doctor => doctor::run(),
-        Cmd::Status { sizes } => status::run(sizes),
+        Cmd::Doctor { json } => doctor::run(json),
+        Cmd::Status { sizes, json } => status::run(sizes, json),
         Cmd::Gc {
             apply,
             verbose,
             auto,
+            json,
         } => {
             if auto {
                 gc::become_background();
@@ -168,13 +187,18 @@ fn main() -> ExitCode {
                 auto,
                 verbose,
                 command: "gc",
+                json,
             })
         }
         Cmd::Pin { dir } => pin(&dir, true),
         Cmd::Unpin { dir } => pin(&dir, false),
         Cmd::Seed(args) => seed::run_seed(&args),
         Cmd::Hooks(args) => seed::run_hooks(&args),
-        Cmd::Dedup { apply, verbose } => dedup::run(apply, verbose),
+        Cmd::Dedup {
+            apply,
+            verbose,
+            json,
+        } => dedup::run(apply, verbose, json),
         Cmd::Ci(args) => ci::run(&args),
         Cmd::Shim(args) => proxy::run_shim(&args),
         Cmd::Remove {
@@ -182,14 +206,37 @@ fn main() -> ExitCode {
             worktree,
             apply,
             force,
-        } => remove(build_dirs, &worktree, apply, force),
+            json,
+        } => remove(build_dirs, &worktree, apply, force, json),
         Cmd::Skill(args) => skill::run(&args),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("error: {e:#}");
+            let message = format!("{e:#}");
+            eprintln!("error: {message}");
+            if json {
+                let _ = json::print(&json::Failure {
+                    version: json::VERSION,
+                    error: &message,
+                });
+            }
             ExitCode::FAILURE
+        }
+    }
+}
+
+impl Cmd {
+    /// Whether the command was asked for a JSON document.
+    fn json(&self) -> bool {
+        match self {
+            Cmd::Doctor { json }
+            | Cmd::Status { json, .. }
+            | Cmd::Gc { json, .. }
+            | Cmd::Dedup { json, .. }
+            | Cmd::Remove { json, .. } => *json,
+            Cmd::Shim(args) => args.json(),
+            _ => false,
         }
     }
 }
@@ -209,19 +256,43 @@ fn is_wrapper_call(first: &OsString) -> bool {
         || env::var_os("CARGO").is_some()
 }
 
-fn remove(mut dirs: Vec<PathBuf>, worktrees: &[PathBuf], apply: bool, force: bool) -> Result<()> {
+fn remove(
+    mut dirs: Vec<PathBuf>,
+    worktrees: &[PathBuf],
+    apply: bool,
+    force: bool,
+    as_json: bool,
+) -> Result<()> {
+    let mut found = Vec::new();
     for worktree in worktrees {
         let dir = gc::build_dir_of(worktree)?;
-        println!("{} builds into {}", worktree.display(), dir.display());
+        if !as_json {
+            println!("{} builds into {}", worktree.display(), dir.display());
+        }
+        found.push(gc::document::Worktree {
+            worktree: json::path(worktree),
+            build_dir: json::path(&dir),
+            exists: dir.exists(),
+        });
         if dir.exists() {
             dirs.push(dir);
         }
     }
-    if dirs.is_empty() {
-        println!("Nothing to remove.");
-        return Ok(());
+    let requested = if dirs.is_empty() {
+        if !as_json {
+            println!("Nothing to remove.");
+            return Ok(());
+        }
+        gc::Requested::default()
+    } else {
+        gc::remove_requested(&dirs, apply, force)?
+    };
+    if as_json {
+        json::print(&gc::Document::removal(&requested, found, apply))
+    } else {
+        gc::report_requested(&requested, apply);
+        Ok(())
     }
-    gc::remove_requested(&dirs, apply, force)
 }
 
 fn pin(dir: &Path, on: bool) -> Result<()> {

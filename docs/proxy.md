@@ -48,6 +48,7 @@ to run.
 cargo steward shim install --shell zsh   # or bash, fish; omit to just print the PATH line
 cargo steward shim status                # installed? first on PATH? what would it do here?
 cargo steward shim explain -- test -p foo  # what it would do for one command, here
+cargo steward shim explain --json          # the same as one JSON document (docs/json.md)
 cargo steward shim uninstall
 ```
 

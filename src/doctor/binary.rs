@@ -5,7 +5,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use super::{Level, cmd, say};
+use super::{Level, Report, cmd};
 use crate::wrapper;
 
 /// This binary's version.
@@ -68,17 +68,17 @@ fn is_executable(path: &Path) -> bool {
     }
 }
 
-pub fn report(health: &Health) {
+pub fn report(out: &mut Report, health: &Health) {
     match health {
         Health::NotConfigured => {}
-        Health::Missing(configured) => say(
+        Health::Missing(configured) => out.say(
             Level::Warn,
             format!(
                 "The configured wrapper {configured} doesn't exist, so every build fails.\n\
                  Fix: reinstall cargo-steward, or run `cargo steward setup --undo`"
             ),
         ),
-        Health::NotExecutable(path) => say(
+        Health::NotExecutable(path) => out.say(
             Level::Warn,
             format!(
                 "The configured wrapper {} isn't executable, so every build fails.\nFix: chmod +x {}",
@@ -86,18 +86,18 @@ pub fn report(health: &Health) {
                 path.display()
             ),
         ),
-        Health::Running(path) => say(
+        Health::Running(path) => out.say(
             Level::Ok,
             format!("The wrapper is this binary ({}), {VERSION}", path.display()),
         ),
-        Health::Version(path, Some(v)) if v == VERSION => say(
+        Health::Version(path, Some(v)) if v == VERSION => out.say(
             Level::Ok,
             format!(
                 "The wrapper {} is {v}, the same as this one",
                 path.display()
             ),
         ),
-        Health::Version(path, other) => say(
+        Health::Version(path, other) => out.say(
             Level::Warn,
             format!(
                 "The wrapper {} is {}, but this binary is {VERSION}.\n\
@@ -109,7 +109,7 @@ pub fn report(health: &Health) {
     }
     // `cargo steward` runs `cargo-steward` from PATH.
     if wrapper::find_program("cargo-steward".as_ref()).is_none() {
-        say(
+        out.say(
             Level::Warn,
             "cargo-steward isn't on PATH, so `cargo steward` can't find it.\n\
              Fix: add ~/.cargo/bin (or wherever it is installed) to PATH",

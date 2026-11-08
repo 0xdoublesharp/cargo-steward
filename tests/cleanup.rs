@@ -73,6 +73,27 @@ impl Fixture {
         text
     }
 
+    /// Runs cargo-steward with `--json` added, expecting success: its stdout
+    /// parsed as exactly one JSON document, and its stderr.
+    fn steward_json(&self, args: &[&str]) -> (serde_json::Value, String) {
+        let out = Command::new(BIN)
+            .args(args)
+            .arg("--json")
+            .env("CARGO_STEWARD_HOME", &self.home)
+            .env_remove("CARGO")
+            .env_remove("CARGO_TARGET_DIR")
+            .env_remove("CARGO_BUILD_TARGET_DIR")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "cargo-steward {args:?} --json failed:\n{}",
+            text(&out)
+        );
+        let doc = json_document(&out.stdout);
+        (doc, String::from_utf8_lossy(&out.stderr).into_owned())
+    }
+
     /// Runs cargo-steward expecting it to fail; returns its output.
     fn steward_fails(&self, args: &[&str]) -> String {
         let out = Command::new(BIN)
@@ -96,6 +117,16 @@ fn text(out: &Output) -> String {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     )
+}
+
+/// `stdout` parsed as one JSON document of format version 1: anything
+/// before or after it fails.
+fn json_document(stdout: &[u8]) -> serde_json::Value {
+    let text = String::from_utf8_lossy(stdout);
+    let doc: serde_json::Value = serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("stdout isn't one JSON document ({e}):\n{text}"));
+    assert_eq!(doc["version"], 1, "{doc}");
+    doc
 }
 
 /// Backdates everything under `path`, files before their directories.
@@ -351,4 +382,255 @@ fn remove_worktree_follows_the_proxy_route_without_the_process_guard() {
     let dir = fx.build_dir("old", DAY);
     let out = fx.steward(&["remove", "--apply", dir.to_str().unwrap()]);
     assert!(!dir.exists(), "{out}");
+}
+
+// ---- --json ----
+
+#[test]
+fn status_json_lists_each_dir_with_its_flags() {
+    let fx = Fixture::new("");
+    let (doc, _) = fx.steward_json(&["status"]);
+    assert_eq!(doc["build_dirs"], serde_json::json!([]), "{doc}");
+
+    let dir = fx.build_dir("target", 3 * DAY);
+    fs::write(dir.join(".cargo-steward-keep"), "").unwrap();
+    let deleted = fx.root.join("deleted-workspace");
+    fs::write(
+        fx.home.join("registry.json"),
+        format!(
+            r#"{{"roots":{{{:?}:{{"last_used":1,"workspaces":[{:?}],"compile_ms":0}}}}}}"#,
+            dir.display().to_string(),
+            deleted.display().to_string()
+        ),
+    )
+    .unwrap();
+    let (doc, _) = fx.steward_json(&["status"]);
+    assert_eq!(doc["sizes_measured"], false, "{doc}");
+    assert_eq!(doc["total_bytes"], serde_json::Value::Null, "{doc}");
+    let entry = &doc["build_dirs"][0];
+    assert_eq!(entry["path"], dir.display().to_string(), "{doc}");
+    assert_eq!(entry["layout"], "legacy", "{doc}");
+    assert_eq!(entry["pinned"], true, "{doc}");
+    assert_eq!(entry["orphaned"], true, "{doc}");
+    assert_eq!(
+        entry["workspaces"],
+        serde_json::json!([deleted.display().to_string()])
+    );
+    assert_eq!(entry["size_bytes"], serde_json::Value::Null, "{doc}");
+    let ago = entry["last_used_secs_ago"].as_u64().unwrap();
+    assert!((3 * 86_400..4 * 86_400).contains(&ago), "{doc}");
+    assert!(entry["last_used"].as_str().unwrap().ends_with('Z'), "{doc}");
+    assert!(doc["disks"][0]["free_bytes"].as_u64().unwrap() > 0, "{doc}");
+}
+
+#[test]
+fn status_json_with_sizes_measures_each_dir() {
+    let fx = Fixture::new("");
+    fx.build_dir("a", DAY);
+    fx.build_dir("b", 2 * DAY);
+    let (doc, _) = fx.steward_json(&["status", "--sizes"]);
+    assert_eq!(doc["sizes_measured"], true, "{doc}");
+    let dirs = doc["build_dirs"].as_array().unwrap();
+    // Most recently used first; each holds a 1 MiB file.
+    assert!(dirs[0]["path"].as_str().unwrap().ends_with("/a"), "{doc}");
+    let sizes: Vec<u64> = dirs
+        .iter()
+        .map(|d| d["size_bytes"].as_u64().unwrap())
+        .collect();
+    assert!(sizes.iter().all(|&s| s >= 1 << 20), "{doc}");
+    assert_eq!(
+        doc["total_bytes"].as_u64().unwrap(),
+        sizes.iter().sum::<u64>()
+    );
+}
+
+#[test]
+fn json_stays_alone_on_stdout_when_there_are_warnings() {
+    let fx = Fixture::new("unit-idle = \"soon\"\n");
+    fx.build_dir("target", 60 * DAY);
+    for args in [&["status"][..], &["status", "--sizes"], &["gc"], &["dedup"]] {
+        let (_, stderr) = fx.steward_json(args);
+        assert!(
+            stderr.contains("warning: cargo-steward: settings"),
+            "{stderr}"
+        );
+    }
+}
+
+#[test]
+fn gc_json_lists_removals_kept_dirs_and_the_space_freed() {
+    let fx = Fixture::new("dedup = false\n");
+    let idle = fx.build_dir("idle", 60 * DAY);
+    // A program running from a build dir keeps it.
+    let busy = fx.build_dir("busy", 60 * DAY);
+    let program = busy.join("debug/sleeper");
+    fs::copy("/bin/sleep", &program).unwrap();
+    age(&busy, 60 * DAY);
+    let mut child = Command::new(&program).arg("60").spawn().unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+
+    let (preview, _) = fx.steward_json(&["gc"]);
+    let (applied, _) = fx.steward_json(&["gc", "--apply"]);
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert_eq!(preview["command"], "gc", "{preview}");
+    assert_eq!(preview["applied"], false, "{preview}");
+    let action = &preview["actions"][0];
+    assert_eq!(action["kind"], "idle", "{preview}");
+    assert_eq!(action["description"], "idle build dirs", "{preview}");
+    assert_eq!(action["path"], idle.display().to_string(), "{preview}");
+    assert!(action["bytes"].as_u64().unwrap() >= 1 << 20, "{preview}");
+    assert_eq!(preview["actions"].as_array().unwrap().len(), 1, "{preview}");
+    assert_eq!(preview["totals"][0]["kind"], "idle", "{preview}");
+    assert_eq!(preview["totals"][0]["count"], 1, "{preview}");
+    assert_eq!(preview["total_bytes"], action["bytes"], "{preview}");
+    let kept = &preview["skipped"][0];
+    assert_eq!(kept["kind"], "idle", "{preview}");
+    assert_eq!(kept["path"], busy.display().to_string(), "{preview}");
+    assert!(
+        kept["reason"].as_str().unwrap().contains("running from it"),
+        "{preview}"
+    );
+    assert_eq!(preview["freed_on_disk"], serde_json::json!([]), "{preview}");
+
+    assert_eq!(applied["applied"], true, "{applied}");
+    assert_eq!(applied["busy"], false, "{applied}");
+    assert_eq!(applied["actions"][0]["path"], idle.display().to_string());
+    assert!(!idle.exists(), "{applied}");
+    assert!(busy.exists(), "{applied}");
+    let freed = applied["freed_on_disk"].as_array().unwrap();
+    assert_eq!(freed.len(), 1, "{applied}");
+    assert!(freed[0]["path"].is_string(), "{applied}");
+    assert!(freed[0]["bytes"].is_i64(), "{applied}");
+    assert_eq!(applied["shared"], serde_json::Value::Null, "{applied}");
+}
+
+#[test]
+fn gc_json_says_when_another_cleanup_runs() {
+    let fx = Fixture::new("");
+    let dir = fx.build_dir("target", 60 * DAY);
+    let lock = File::create(fx.home.join("gc.lock")).unwrap();
+    lock.lock().unwrap();
+    let (doc, stderr) = fx.steward_json(&["gc", "--apply"]);
+    assert_eq!(doc["busy"], true, "{doc}");
+    assert_eq!(doc["actions"], serde_json::json!([]), "{doc}");
+    assert!(stderr.contains("another cleanup is already running"));
+    assert!(dir.exists());
+}
+
+#[test]
+fn remove_json_lists_removed_kept_and_refused_paths() {
+    let fx = Fixture::new("");
+    let old = fx.build_dir("old", DAY);
+    let pinned = fx.build_dir("pinned", DAY);
+    fs::write(pinned.join(".cargo-steward-keep"), "").unwrap();
+    let plain = fx.root.join("plain");
+    fs::create_dir_all(&plain).unwrap();
+    let paths = [&old, &pinned, &plain].map(|p| p.to_str().unwrap().to_owned());
+    let mut args = vec!["remove"];
+    args.extend(paths.iter().map(String::as_str));
+    let (doc, stderr) = fx.steward_json(&args);
+    assert!(stderr.contains("refusing to remove"), "{stderr}");
+    assert_eq!(doc["command"], "remove", "{doc}");
+    assert_eq!(doc["applied"], false, "{doc}");
+    assert_eq!(doc["actions"][0]["kind"], "requested", "{doc}");
+    assert_eq!(doc["actions"][0]["path"], paths[0], "{doc}");
+    assert_eq!(doc["skipped"][0]["path"], paths[1], "{doc}");
+    assert!(
+        doc["skipped"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("pinned"),
+        "{doc}"
+    );
+    assert_eq!(doc["refused"][0]["path"], paths[2], "{doc}");
+    assert!(old.exists() && pinned.exists());
+
+    args.insert(1, "--apply");
+    let (doc, _) = fx.steward_json(&args);
+    assert_eq!(doc["applied"], true, "{doc}");
+    assert!(!old.exists() && pinned.exists(), "{doc}");
+}
+
+#[test]
+fn remove_worktree_json_reports_where_it_builds() {
+    let fx = Fixture::new("process-guard = false\ntarget-root = \"ROUTED\"\n");
+    let routed = fx.root.join("routed");
+    let config = fx.home.join("config.toml");
+    let settings = fs::read_to_string(&config).unwrap();
+    fs::write(
+        &config,
+        settings.replace("ROUTED", routed.to_str().unwrap()),
+    )
+    .unwrap();
+    let worktree = fx.root.join("wt");
+    fs::create_dir_all(&worktree).unwrap();
+    let (doc, _) = fx.steward_json(&["remove", "--worktree", worktree.to_str().unwrap()]);
+    let entry = &doc["worktrees"][0];
+    assert_eq!(entry["worktree"], worktree.display().to_string(), "{doc}");
+    let build_dir = entry["build_dir"].as_str().unwrap();
+    assert!(build_dir.starts_with(routed.to_str().unwrap()), "{doc}");
+    assert_eq!(entry["exists"], false, "{doc}");
+    assert_eq!(doc["actions"], serde_json::json!([]), "{doc}");
+}
+
+#[test]
+fn a_failure_with_json_prints_an_error_document() {
+    let fx = Fixture::new("");
+    let plain = fx.root.join("plain");
+    fs::create_dir_all(&plain).unwrap();
+    let out = Command::new(BIN)
+        .args(["remove", "--json", plain.to_str().unwrap()])
+        .env("CARGO_STEWARD_HOME", &fx.home)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let doc = json_document(&out.stdout);
+    assert_eq!(doc["error"], "nothing to remove", "{doc}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("error: nothing to remove"));
+}
+
+#[test]
+fn dedup_json_lists_each_group_of_identical_files() {
+    let fx = Fixture::new("");
+    let (doc, _) = fx.steward_json(&["dedup"]);
+    assert_eq!(doc["build_dirs"], 0, "{doc}");
+    assert_eq!(doc["files"], 0, "{doc}");
+
+    let (a, b) = duplicate_pair(&fx);
+    let (doc, _) = fx.steward_json(&["dedup"]);
+    assert_eq!(doc["build_dirs"], 2, "{doc}");
+    assert_eq!(doc["applied"], false, "{doc}");
+    assert_eq!(doc["freed_on_disk_bytes"], serde_json::Value::Null, "{doc}");
+    if doc["unsupported_volumes"] != 0 {
+        return; // The temp dir's filesystem can't clone files.
+    }
+    // Both dirs hold the same rlib and the same 1 MiB file.
+    assert_eq!(doc["files"], 2, "{doc}");
+    let groups = doc["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 2, "{doc}");
+    let dup = groups
+        .iter()
+        .find(|g| {
+            g["kept"]
+                .as_str()
+                .unwrap()
+                .ends_with("libdup-0123456789abcdef.rlib")
+        })
+        .unwrap();
+    assert_eq!(dup["size_bytes"], 200_000, "{doc}");
+    let pair = [
+        dup["kept"].as_str().unwrap(),
+        dup["replaced"][0].as_str().unwrap(),
+    ];
+    let name = "debug/deps/libdup-0123456789abcdef.rlib";
+    for path in [a.join(name), b.join(name)] {
+        assert!(pair.contains(&path.to_str().unwrap()), "{doc}");
+    }
+
+    let (doc, _) = fx.steward_json(&["dedup", "--apply"]);
+    assert_eq!(doc["applied"], true, "{doc}");
+    assert_eq!(doc["files"], 2, "{doc}");
+    assert!(doc["freed_on_disk_bytes"].is_i64(), "{doc}");
 }

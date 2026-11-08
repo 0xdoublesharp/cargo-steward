@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
 
-use super::{Level, cmd, say};
+use super::{Level, Report, cmd};
 use crate::fsutil::{self, human};
 
 /// A toolchain's rustc version: minor version, channel, and commit date.
@@ -229,9 +229,14 @@ pub fn unused<'a>(
         .collect()
 }
 
-pub fn report(probe: Option<&Probe>, pins: &BTreeMap<String, BTreeSet<PathBuf>>, projects: usize) {
+pub fn report(
+    out: &mut Report,
+    probe: Option<&Probe>,
+    pins: &BTreeMap<String, BTreeSet<PathBuf>>,
+    projects: usize,
+) {
     let Some(probe) = probe else {
-        say(
+        out.say(
             Level::Info,
             "rustup isn't installed; skipping the toolchain checks",
         );
@@ -247,7 +252,7 @@ pub fn report(probe: Option<&Probe>, pins: &BTreeMap<String, BTreeSet<PathBuf>>,
         }
     }
     if !leaking.is_empty() {
-        say(
+        out.say(
             Level::Info,
             format!(
                 "{} of {} installed toolchains leave stale object files behind (Rust 1.88 to 1.100):\n{}\n\
@@ -259,12 +264,12 @@ pub fn report(probe: Option<&Probe>, pins: &BTreeMap<String, BTreeSet<PathBuf>>,
         );
     }
     if !fixed.is_empty() {
-        say(Level::Ok, format!("Not affected: {}", fixed.join(", ")));
+        out.say(Level::Ok, format!("Not affected: {}", fixed.join(", ")));
     }
 
     let total: u64 = probe.sizes.iter().flatten().sum();
     if projects == 0 {
-        say(
+        out.say(
             Level::Info,
             format!(
                 "{} toolchains take {} in {}; ones no project uses are reported once projects\n\
@@ -278,7 +283,7 @@ pub fn report(probe: Option<&Probe>, pins: &BTreeMap<String, BTreeSet<PathBuf>>,
     }
     let unused = unused(probe, pins);
     if unused.is_empty() {
-        say(
+        out.say(
             Level::Ok,
             format!(
                 "Every installed toolchain is the default, active, or pinned by a recorded project ({} in {})",
@@ -305,7 +310,7 @@ pub fn report(probe: Option<&Probe>, pins: &BTreeMap<String, BTreeSet<PathBuf>>,
         .filter(|(_, size)| size.is_some())
         .map(|(t, _)| t.name.as_str())
         .collect();
-    say(
+    out.say(
         Level::Info,
         format!(
             "{} of {} installed toolchains ({} of {}) aren't the default, active, or pinned by any of\n\

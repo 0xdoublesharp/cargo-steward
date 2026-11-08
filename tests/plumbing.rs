@@ -77,6 +77,18 @@ impl Env {
         String::from_utf8_lossy(&out.stderr).into_owned()
     }
 
+    /// `shim explain --json args...` in `dir`, parsed: stdout must be
+    /// exactly one JSON document.
+    fn explain_json(&self, dir: &Path, args: &[&str]) -> serde_json::Value {
+        let mut full = vec!["shim", "explain", "--json"];
+        full.extend_from_slice(args);
+        let out = self.ok(&mut self.cmd(dir, &full));
+        let doc: serde_json::Value = serde_json::from_str(&out)
+            .unwrap_or_else(|e| panic!("stdout isn't one JSON document ({e}):\n{out}"));
+        assert_eq!(doc["version"], 1, "{doc}");
+        doc
+    }
+
     fn config(&self, toml: &str) {
         fs::write(self.home.join("config.toml"), toml).unwrap();
     }
@@ -619,6 +631,120 @@ fn explain_describes_worktrees_and_seeding() {
     let out = explain(&wt, &["build", "--target-dir", "/x"]);
     assert!(out.contains("target dir:   not routed: "), "{out}");
     assert!(out.contains("seed:         no: nothing routed"), "{out}");
+}
+
+#[test]
+fn explain_json_describes_settings_routing_and_build_slots() {
+    let env = Env::new();
+    let work = env.root.join("work");
+    fs::create_dir_all(&work).unwrap();
+
+    let doc = env.explain_json(&work, &[]);
+    assert_eq!(doc["settings"]["exists"], false, "{doc}");
+    assert_eq!(
+        doc["settings"]["path"],
+        env.home.join("config.toml").display().to_string()
+    );
+    assert_eq!(doc["command"], serde_json::json!(["build"]), "{doc}");
+    assert_eq!(doc["build_slot"]["status"], "no_limit", "{doc}");
+    assert_eq!(doc["target_dir"]["routed"], false, "{doc}");
+
+    // A setting it can't use is reported in the document, not on stdout.
+    env.config("max-builds = \"lots\"\n");
+    let doc = env.explain_json(&work, &[]);
+    let problems = doc["settings"]["problems"].as_array().unwrap();
+    assert!(
+        problems[0]
+            .as_str()
+            .unwrap()
+            .contains("max-builds: invalid type"),
+        "{doc}"
+    );
+
+    let targets = env.root.join("targets");
+    env.config(&format!(
+        "max-builds = 2\nseed = false\n\n[[routes]]\npath = {:?}\ntarget-root = {:?}\nforce = true\nmax-builds = 1\n",
+        work.display().to_string(),
+        targets.display().to_string(),
+    ));
+    let doc = env.explain_json(&work, &["build"]);
+    assert_eq!(doc["routing_error"], serde_json::Value::Null, "{doc}");
+    assert_eq!(doc["directory"], work.display().to_string(), "{doc}");
+    assert_eq!(doc["checkout"]["in_git"], false, "{doc}");
+    assert_eq!(doc["namespace"]["key"], "standalone", "{doc}");
+    assert_eq!(doc["route"], work.display().to_string(), "{doc}");
+    assert_eq!(doc["target_dir"]["routed"], true, "{doc}");
+    let target = doc["target_dir"]["path"].as_str().unwrap();
+    assert!(target.starts_with(targets.to_str().unwrap()), "{doc}");
+    assert!(
+        target.ends_with(doc["namespace"]["path"].as_str().unwrap()),
+        "{doc}"
+    );
+    // Not created yet: the space is that of the disk it will be on.
+    assert!(
+        doc["target_dir"]["free_bytes"].as_u64().unwrap() > 0,
+        "{doc}"
+    );
+    assert_eq!(doc["tmp_dir"]["routed"], false, "{doc}");
+    assert_eq!(doc["tmp_dir"]["reason"], "tmp-root isn't set", "{doc}");
+    assert_eq!(doc["tmp_dir"]["free_bytes"], serde_json::Value::Null);
+    assert_eq!(doc["seed"]["status"], "off", "{doc}");
+    assert_eq!(doc["build_slot"]["status"], "takes_slot", "{doc}");
+    assert_eq!(doc["build_slot"]["limit"], 1, "{doc}");
+    assert!(doc["build_slot"]["dir"].is_string(), "{doc}");
+    let doc = env.explain_json(&work, &["metadata"]);
+    assert_eq!(doc["command"], serde_json::json!(["metadata"]), "{doc}");
+    assert_eq!(doc["build_slot"]["status"], "not_a_build", "{doc}");
+
+    // A relative root can't be routed: no plan, and why.
+    env.config("target-root = \"relative\"\n");
+    let doc = env.explain_json(&work, &[]);
+    assert!(doc["routing_error"].is_string(), "{doc}");
+    assert_eq!(doc["target_dir"], serde_json::Value::Null, "{doc}");
+    assert_eq!(doc["seed"], serde_json::Value::Null, "{doc}");
+}
+
+#[test]
+fn explain_json_says_whether_a_worktree_seeds() {
+    let env = Env::new();
+    let repo = env.root.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    fs::write(repo.join("f"), "x").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "init"]);
+    let wt = env.root.join("wt");
+    git(&repo, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+    let targets = env.root.join("targets");
+    env.config(&format!(
+        "seed = true\n\n[[routes]]\npath = {:?}\ntarget-root = {:?}\nforce = true\n",
+        env.root.display().to_string(),
+        targets.display().to_string(),
+    ));
+
+    let doc = env.explain_json(&repo, &[]);
+    assert_eq!(doc["checkout"]["linked"], false, "{doc}");
+    assert_eq!(doc["checkout"]["worktree"], repo.display().to_string());
+    assert_eq!(doc["namespace"]["key"], "main", "{doc}");
+    assert_eq!(doc["seed"]["status"], "not_linked_worktree", "{doc}");
+
+    let doc = env.explain_json(&wt, &[]);
+    assert_eq!(doc["checkout"]["linked"], true, "{doc}");
+    assert_eq!(doc["seed"]["status"], "source_missing", "{doc}");
+    assert_eq!(doc["seed"]["will_seed"], false, "{doc}");
+    let from = doc["seed"]["from"].as_str().unwrap().to_owned();
+    fs::create_dir_all(&from).unwrap();
+    let doc = env.explain_json(&wt, &[]);
+    assert_eq!(doc["seed"]["status"], "will_seed", "{doc}");
+    assert_eq!(doc["seed"]["will_seed"], true, "{doc}");
+    assert_eq!(doc["seed"]["from"], from, "{doc}");
+    assert_eq!(doc["seed"]["message"], format!("yes, from {from}"));
+
+    // A target dir on the command line wins over routing.
+    let doc = env.explain_json(&wt, &["build", "--target-dir", "/x"]);
+    assert_eq!(doc["target_dir"]["routed"], false, "{doc}");
+    assert!(doc["target_dir"]["reason"].is_string(), "{doc}");
+    assert_eq!(doc["seed"]["status"], "nothing_routed", "{doc}");
 }
 
 // ---- ci ----

@@ -81,15 +81,18 @@ volume for build output; see [Build volume](#build-volume-macos).
 
 ```sh
 cargo steward setup [--scan-root DIR] [--build-dir DIR] [--volume NAME] [--undo] [--dry-run]
-cargo steward doctor              # check the setup and report what to change
-cargo steward status [--sizes]    # build directories, when each was last used, layout, size
-cargo steward gc                  # what a cleanup would remove, by kind
-cargo steward gc --apply [-v]     # remove it now
-cargo steward pin <dir>           # never clean this build directory (except stale objects)
+cargo steward doctor [--json]             # check the setup and report what to change
+cargo steward status [--sizes] [--json]   # build directories, when each was last used, layout, size
+cargo steward gc [--json]                 # what a cleanup would remove, by kind
+cargo steward gc --apply [-v] [--json]    # remove it now
+cargo steward pin <dir>                   # never clean this build directory (except stale objects)
 cargo steward unpin <dir>
-cargo steward remove --worktree <dir> [--apply]   # remove a retiring worktree's build dir safely
-cargo steward skill install       # teach Claude Code / Codex agents to use cargo-steward
+cargo steward remove --worktree <dir> [--apply] [--json]   # remove a retiring worktree's build dir safely
+cargo steward skill install               # teach Claude Code / Codex agents to use cargo-steward
 ```
+
+With `--json`, a command prints one JSON document for scripts and agents
+instead of text; [docs/json.md](docs/json.md) describes each one.
 
 Warm starts, CI and the cargo proxy:
 
@@ -97,9 +100,9 @@ Warm starts, CI and the cargo proxy:
 |---|---|---|
 | `cargo steward seed` | Starts a new worktree's build directory as a copy-on-write clone of its main one | [warm-start.md](docs/warm-start.md) |
 | `cargo steward hooks` | Installs or removes the git hooks that seed new worktrees | [warm-start.md](docs/warm-start.md) |
-| `cargo steward dedup` | Replaces identical files across build directories with clones | [warm-start.md](docs/warm-start.md) |
+| `cargo steward dedup [--json]` | Replaces identical files across build directories with clones | [warm-start.md](docs/warm-start.md) |
 | `cargo steward ci` | Trims build output to what a CI job used, within a budget | [ci.md](docs/ci.md) |
-| `cargo steward shim` | Installs or removes the `cargo` proxy, which routes each worktree's build output and limits concurrent builds | [proxy.md](docs/proxy.md) |
+| `cargo steward shim` | Installs or removes the `cargo` proxy, which routes each worktree's build output and limits concurrent builds; `shim explain [--json]` shows what it does here | [proxy.md](docs/proxy.md) |
 
 ## What gets removed
 

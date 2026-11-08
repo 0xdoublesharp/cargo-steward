@@ -38,6 +38,13 @@ pub fn run_shim(args: &ShimArgs) -> Result<()> {
     shim::run(&args.command)
 }
 
+impl ShimArgs {
+    /// Whether the command was asked for a JSON document.
+    pub fn json(&self) -> bool {
+        self.command.json()
+    }
+}
+
 /// Runs as `cargo`: `args[0]` is the program name as invoked.
 pub fn run(args: Vec<OsString>) -> ! {
     let cargo_args: Vec<OsString> = args.into_iter().skip(1).collect();
