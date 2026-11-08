@@ -47,6 +47,12 @@ impl Paths {
         self.home.join("gc.stamp")
     }
 
+    /// How long to wait after a cleanup before low free space starts
+    /// another, while cleanups free nothing (seconds).
+    pub fn gc_backoff(&self) -> PathBuf {
+        self.home.join("gc.backoff")
+    }
+
     /// Held by the running cleanup so only one runs at a time.
     pub fn gc_lock(&self) -> PathBuf {
         self.home.join("gc.lock")

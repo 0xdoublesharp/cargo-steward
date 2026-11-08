@@ -446,3 +446,23 @@ fn remove_orphaned_takes_every_dir_of_deleted_workspaces_now() {
     let out = fx.steward(&["remove", "--orphaned"]);
     assert!(out.contains("Nothing to clean up."), "{out}");
 }
+
+#[test]
+fn low_space_cleanups_that_free_nothing_back_off() {
+    let fx = Fixture::new("dedup = false\nmin-free = \"1000000T\"\ntarget-free = \"1000000T\"\n");
+    // Used today: low space doesn't remove it, so the cleanup frees nothing.
+    let dir = fx.build_dir("target", Duration::ZERO);
+    fx.steward(&["gc", "--apply"]);
+    assert!(dir.exists());
+    let backoff = fx.home.join("gc.backoff");
+    assert_eq!(fs::read_to_string(&backoff).unwrap().trim(), "600");
+    fx.steward(&["gc", "--apply"]);
+    assert_eq!(fs::read_to_string(&backoff).unwrap().trim(), "1200");
+
+    // Space recovered: back to the shortest wait.
+    let config = fx.home.join("config.toml");
+    let settings = fs::read_to_string(&config).unwrap();
+    fs::write(&config, settings.replace("1000000T", "0")).unwrap();
+    fx.steward(&["gc", "--apply"]);
+    assert!(!backoff.exists());
+}

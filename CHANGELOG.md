@@ -92,6 +92,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   directories, instead of reading every build directory again;
   `cargo steward dedup` still looks at every file, and reads build
   directories in parallel.
+- While a disk is below `min-free` and cleanups free nothing on it, the
+  wrapper waits longer before starting the next (5 minutes, doubling up to
+  `gc-interval`), instead of starting one every 5 minutes; the wait resets
+  once a cleanup frees space or the disk recovers.
 
 ### Added
 

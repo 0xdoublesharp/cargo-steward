@@ -411,7 +411,65 @@ pub fn run(options: Options) -> Result<()> {
             Err(e) => eprintln!("warning: cargo-steward: dedup: {e:#}"),
         }
     }
+    if options.apply {
+        // Low on space before, and not one low disk gained any or recovered.
+        let low: Vec<&Volume> = volumes
+            .iter()
+            .filter(|v| v.before < policy.min_free)
+            .collect();
+        let freed = low.iter().any(|v| {
+            v.freed().is_some_and(|gained| {
+                gained >= i128::from(STALL_FLOOR)
+                    || i128::from(v.before) + gained >= i128::from(policy.min_free)
+            })
+        });
+        note_low_space(&paths, &policy, !low.is_empty(), freed);
+    }
     Ok(())
+}
+
+/// The shortest wait between cleanups the wrapper starts because a disk is
+/// below `min-free`, before `gc-interval` has passed.
+pub const LOW_SPACE_RECHECK: Duration = Duration::from_secs(300);
+
+/// How long after the last cleanup low free space starts another:
+/// [`LOW_SPACE_RECHECK`], or longer while cleanups find nothing to free
+/// ([`note_low_space`]), up to `gc-interval`.
+pub fn low_space_recheck(paths: &Paths, policy: &Policy) -> Duration {
+    let backoff = fs::read_to_string(paths.gc_backoff())
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .map_or(LOW_SPACE_RECHECK, Duration::from_secs);
+    backoff.min(policy.gc_interval).max(LOW_SPACE_RECHECK)
+}
+
+/// Records how a cleanup went for [`low_space_recheck`]: one that started
+/// with a disk below `min-free` (`low`) and freed nothing on it doubles the
+/// wait before the next, up to `gc-interval`; one that freed space, or found
+/// none low, resets it. Best effort.
+fn note_low_space(paths: &Paths, policy: &Policy, low: bool, freed: bool) {
+    match next_recheck(low_space_recheck(paths, policy), low, freed, policy) {
+        Some(wait) => {
+            let _ = config::write_atomic(
+                &paths.gc_backoff(),
+                format!("{}\n", wait.as_secs()).as_bytes(),
+            );
+        }
+        None => {
+            let _ = fs::remove_file(paths.gc_backoff());
+        }
+    }
+}
+
+/// The wait before the next low-space cleanup after one that waited
+/// `previous`; `None` for the shortest.
+fn next_recheck(previous: Duration, low: bool, freed: bool, policy: &Policy) -> Option<Duration> {
+    (low && !freed).then(|| {
+        previous
+            .saturating_mul(2)
+            .min(policy.gc_interval)
+            .max(LOW_SPACE_RECHECK)
+    })
 }
 
 /// A volume holding build directories, and its free space before cleanup.
@@ -2186,6 +2244,46 @@ mod tests {
         assert!(tmp_of("live").exists() && tmp_of("recent").exists());
         assert!(tmp_of("busy").exists());
         drop(held);
+    }
+
+    #[test]
+    fn backs_off_while_low_space_cleanups_free_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            home: tmp.path().to_path_buf(),
+        };
+        let policy = policy();
+        let minute = Duration::from_secs(60);
+        assert_eq!(low_space_recheck(&paths, &policy), 5 * minute);
+        let mut waits = Vec::new();
+        for _ in 0..5 {
+            note_low_space(&paths, &policy, true, false);
+            waits.push(low_space_recheck(&paths, &policy));
+        }
+        // Doubling, up to `gc-interval`.
+        assert_eq!(
+            waits,
+            [
+                10 * minute,
+                20 * minute,
+                40 * minute,
+                60 * minute,
+                60 * minute
+            ]
+        );
+        // A cleanup that freed space, or found none low, starts over.
+        note_low_space(&paths, &policy, true, true);
+        assert_eq!(low_space_recheck(&paths, &policy), 5 * minute);
+        note_low_space(&paths, &policy, true, false);
+        note_low_space(&paths, &policy, false, false);
+        assert!(!paths.gc_backoff().exists());
+        // What can't be read, or is out of range, is taken in range.
+        fs::write(paths.gc_backoff(), "later\n").unwrap();
+        assert_eq!(low_space_recheck(&paths, &policy), 5 * minute);
+        fs::write(paths.gc_backoff(), "999999\n").unwrap();
+        assert_eq!(low_space_recheck(&paths, &policy), policy.gc_interval);
+        fs::write(paths.gc_backoff(), "1\n").unwrap();
+        assert_eq!(low_space_recheck(&paths, &policy), 5 * minute);
     }
 
     #[test]

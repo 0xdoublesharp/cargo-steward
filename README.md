@@ -200,6 +200,11 @@ when every worktree that built into it is gone. Once one is gone, cleanup
 asks its repository: a worktree whose admin directory
 (`.git/worktrees/<name>`) is gone was removed for good.
 
+A cleanup is due once `gc-interval` has passed since the last. When a disk
+is below `min-free`, one is due after 5 minutes instead; while those
+cleanups free nothing, the wait doubles, up to `gc-interval`, and it's back
+to 5 minutes once one frees space or the disk has `min-free` again.
+
 When a cleanup is due, the wrapper starts `cargo-steward gc --auto` in its own
 session, at background CPU and I/O priority, with its output going to the log,
 so cargo never waits for it.
