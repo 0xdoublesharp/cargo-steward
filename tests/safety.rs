@@ -1,6 +1,8 @@
 //! End to end: what cleanup and the wrapper hold back for programs that may
 //! still be running, and how sizes are reported.
 
+mod common;
+
 use std::fs::{self, File, FileTimes};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -146,13 +148,13 @@ impl Drop for Running {
 fn run_from(dir: &Path) -> Running {
     let exe = dir.join("sleeper");
     fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
-    let child = Command::new(&exe)
-        .args(["--exact", "sleeper", "--test-threads=1", "-q"])
-        .env(SLEEP_VAR, "1")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    let child = common::spawn_retrying(
+        Command::new(&exe)
+            .args(["--exact", "sleeper", "--test-threads=1", "-q"])
+            .env(SLEEP_VAR, "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    );
     let mut running = Running(child);
     sleep(Duration::from_millis(200));
     assert!(

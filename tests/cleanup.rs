@@ -1,6 +1,8 @@
 //! End to end: status, dedup, automatic cleanup, and removing a worktree's
 //! build directory.
 
+mod common;
+
 use std::fs::{self, File, FileTimes};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -482,13 +484,13 @@ fn gc_json_lists_removals_kept_dirs_and_the_space_freed() {
     let program = busy.join("debug/sleeper");
     fs::copy(std::env::current_exe().unwrap(), &program).unwrap();
     age(&busy, 60 * DAY);
-    let mut child = Command::new(&program)
-        .args(["--exact", "sleeper", "--test-threads=1", "-q"])
-        .env(SLEEP_VAR, "1")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
+    let mut child = common::spawn_retrying(
+        Command::new(&program)
+            .args(["--exact", "sleeper", "--test-threads=1", "-q"])
+            .env(SLEEP_VAR, "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    );
     std::thread::sleep(Duration::from_millis(200));
     assert!(child.try_wait().unwrap().is_none(), "the copy didn't start");
 

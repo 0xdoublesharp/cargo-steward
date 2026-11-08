@@ -1693,8 +1693,14 @@ mod tests {
 
     const DAY: Duration = Duration::from_secs(86_400);
 
+    /// The default settings, except that the disk never counts as low on
+    /// space: what that removes depends on the machine's free space, so the
+    /// tests of it set their own thresholds.
     fn policy() -> Policy {
-        config::Config::default().policy().unwrap()
+        let mut policy = config::Config::default().policy().unwrap();
+        policy.min_free = 0;
+        policy.target_free = 0;
+        policy
     }
 
     /// Cleans `dirs` with the default settings and no running programs.

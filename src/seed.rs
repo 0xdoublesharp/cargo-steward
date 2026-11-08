@@ -738,12 +738,14 @@ mod tests {
             started.elapsed() < Duration::from_secs(3),
             "waited too long"
         );
-        assert_eq!(seeding.tried, [0, 1, 2, 3]);
+        assert_eq!(seeding.from, Some(2), "{seeding:?}");
         if seeding.outcome == Outcome::Unsupported {
+            // This filesystem can't clone: the fallback was the one tried.
+            assert_eq!(seeding.tried, [2]);
             return;
         }
+        assert_eq!(seeding.tried, [0, 1, 2, 3]);
         assert!(matches!(seeding.outcome, Outcome::Seeded(_)), "{seeding:?}");
-        assert_eq!(seeding.from, Some(2));
         assert_eq!(fs::read(target.join("debug/deps/newer")).unwrap(), b"x");
         let line = describe(&seeding, &target, &candidates);
         assert!(

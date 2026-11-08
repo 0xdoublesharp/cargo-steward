@@ -599,14 +599,26 @@ mod tests {
     /// build directory.
     fn run_copy_at(exe: &Path) -> Child {
         fs::copy(env::current_exe().unwrap(), exe).unwrap();
-        let child = Command::new(exe)
+        let mut command = Command::new(exe);
+        command
             .args(["--exact", "wrapper::tests::sleeper", "-q"])
             .env(SLEEP_VAR, "1")
             .stdout(process::Stdio::null())
-            .stderr(process::Stdio::null())
-            .spawn()
-            .unwrap();
-        let mut child = Child(child);
+            .stderr(process::Stdio::null());
+        // Linux won't run a program while any process has it open for
+        // writing, and another test thread that forks just as this one
+        // copies the program holds the copy open until its child execs.
+        let mut spawned = command.spawn();
+        for _ in 0..100 {
+            match &spawned {
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    std::thread::sleep(Duration::from_millis(20));
+                    spawned = command.spawn();
+                }
+                _ => break,
+            }
+        }
+        let mut child = Child(spawned.unwrap());
         std::thread::sleep(Duration::from_millis(200));
         assert!(
             child.0.try_wait().unwrap().is_none(),
