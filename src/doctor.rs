@@ -404,6 +404,13 @@ fn check_wrapper(out: &mut Report, settings: &config::Config, configured: Option
             format!("Compiles run as many at once as Cargo starts ({from} is unset)"),
         ),
     }
+    match wrapper::memory_budget(settings) {
+        Some(budget) => out.say(Level::Info, format!(
+            "Compile memory reservations: {}; unknown compilers reserve {}. Estimates are not an RSS cap; inner cache wrappers use the fallback estimate",
+            crate::fsutil::human(budget), settings.compile_memory_estimate
+        )),
+        None => out.say(Level::Info, "Compile memory admission is disabled"),
+    }
 }
 
 /// The toolchain each recorded package's project pins, and the projects

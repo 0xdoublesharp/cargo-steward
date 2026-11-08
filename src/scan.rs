@@ -260,32 +260,38 @@ pub fn v2_unit_nodes(profile: &Path) -> Vec<UnitNode> {
     v2_units(profile)
         .into_iter()
         .map(|unit| {
-            let mut node = UnitNode {
-                hashes: Vec::new(),
-                deps: Vec::new(),
-                readable: true,
+            let (hashes, deps, readable) = fingerprint_links(&unit.path.join("fingerprint"));
+            UnitNode {
                 unit,
-            };
-            for (name, path) in entries(&node.unit.path.join("fingerprint")) {
-                if name.ends_with(".json") {
-                    match fingerprint_deps(&path) {
-                        Some(deps) => node.deps.extend(deps),
-                        None => node.readable = false,
-                    }
-                } else if !name.starts_with("dep-")
-                    && !name.starts_with("output-")
-                    && name != "invoked.timestamp"
-                    && let Some(hash) = read_quietly(&path)
-                        .ok()
-                        .and_then(|bytes| String::from_utf8(bytes).ok())
-                        .and_then(|text| fingerprint_hash(text.trim()))
-                {
-                    node.hashes.push(hash);
-                }
+                hashes,
+                deps,
+                readable,
             }
-            node
         })
         .collect()
+}
+
+/// Fingerprint identity and dependencies, shared by both Cargo layouts.
+pub fn fingerprint_links(dir: &Path) -> (Vec<u64>, Vec<u64>, bool) {
+    let (mut hashes, mut deps, mut readable) = (Vec::new(), Vec::new(), true);
+    for (name, path) in entries(dir) {
+        if name.ends_with(".json") {
+            match fingerprint_deps(&path) {
+                Some(found) => deps.extend(found),
+                None => readable = false,
+            }
+        } else if !name.starts_with("dep-")
+            && !name.starts_with("output-")
+            && name != "invoked.timestamp"
+            && let Some(hash) = read_quietly(&path)
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .and_then(|text| fingerprint_hash(text.trim()))
+        {
+            hashes.push(hash);
+        }
+    }
+    (hashes, deps, readable)
 }
 
 /// A fingerprint hash file's contents: 16 hex digits of a little-endian u64.

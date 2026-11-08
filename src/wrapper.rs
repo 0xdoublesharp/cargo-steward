@@ -7,6 +7,7 @@
 //! - removes the codegen-unit object files that this compile replaced
 //!   (rust-lang/rust#161824, fixed in Cargo 1.101 for its own layout);
 //! - records the compile in the ledger, for workspace members;
+//! - records per-unit execution, queue time and direct-child resource costs;
 //! - starts a background cleanup when one is due.
 //!
 //! Nothing here may fail or slow a build: every step is best effort, and
@@ -21,12 +22,13 @@ use std::process::{self, Command, ExitStatus};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::config::{self, Config, Paths};
-use crate::{gc, ledger, scan};
+use crate::{costs, gc, ledger, scan};
 
 mod slots;
 
 /// Overrides `max-compiles`.
 pub const MAX_COMPILES_VAR: &str = "CARGO_STEWARD_MAX_COMPILES";
+pub const MEMORY_BUDGET_VAR: &str = "CARGO_STEWARD_MEMORY_BUDGET";
 
 /// Objects modified within this long before the compile started are kept,
 /// so that a file rewritten in place on a filesystem with coarse timestamps
@@ -41,7 +43,9 @@ pub fn run(argv: Vec<OsString>) -> ! {
     let paths = Paths::resolve();
     let config = settings(paths.as_ref());
 
-    let mut command: Vec<OsString> = inner_wrapper(&config).into_iter().collect();
+    let inner = inner_wrapper(&config);
+    let direct = inner.is_none();
+    let mut command: Vec<OsString> = inner.into_iter().collect();
     command.extend(argv.iter().cloned());
 
     let args = RustcArgs::parse(&argv[1..]);
@@ -54,12 +58,38 @@ pub fn run(argv: Vec<OsString>) -> ! {
         None
     };
 
-    let slot = match (&paths, compile_limit(&config)) {
-        (Some(paths), Some(limit)) => slots::acquire(&paths.compile_slots(), limit),
+    let cost_path = costs::path(&out_dir, args.extra_filename.as_deref());
+    let queued = Instant::now();
+    let memory_budget = memory_budget(&config);
+    let slot = match (&paths, compile_limit(&config), memory_budget) {
+        (Some(paths), limit, Some(budget)) => {
+            let fallback = config::parse_size(&config.compile_memory_estimate)
+                .ok()
+                .filter(|&n| n > 0)
+                .unwrap_or(2 << 30);
+            let estimate = cost_path
+                .as_deref()
+                .and_then(costs::read)
+                .and_then(|o| o.max_rss_bytes)
+                .map(|n| n.saturating_add(n / 4))
+                .unwrap_or(fallback);
+            let count = limit.unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map_or(1, |n| n.get().try_into().unwrap_or(u32::MAX))
+            });
+            slots::acquire_memory(&paths.compile_slots(), count, budget, estimate, fallback)
+        }
+        (Some(paths), Some(limit), None) => slots::acquire(&paths.compile_slots(), limit),
         _ => None,
     };
+    let queue_time = queued.elapsed();
     let started = Instant::now();
-    let status = Command::new(&command[0]).args(&command[1..]).status();
+    let mut child = Command::new(&command[0]);
+    child.args(&command[1..]);
+    if let Some(slot) = &slot {
+        slot.describe_child(&mut child);
+    }
+    let status = child.status();
     drop(slot);
     let status = match status {
         Ok(status) => status,
@@ -72,6 +102,24 @@ pub fn run(argv: Vec<OsString>) -> ! {
         }
     };
     if status.success() {
+        if config.record_costs
+            && let (Some(path), Some(name)) = (cost_path, args.crate_name.as_deref())
+        {
+            let (rss, cpu) = if direct {
+                costs::child_usage()
+            } else {
+                (None, None)
+            };
+            costs::record(
+                &path,
+                name,
+                &out_dir,
+                started.elapsed(),
+                queue_time,
+                rss,
+                cpu,
+            );
+        }
         if let Some(fix) = fix {
             fix.finish(object_grace(&config), config.process_guard);
         }
@@ -104,6 +152,22 @@ pub fn compile_limit(config: &Config) -> Option<u32> {
         env::var_os(MAX_COMPILES_VAR).as_deref(),
         config.max_compiles,
     )
+}
+
+pub fn memory_budget(config: &Config) -> Option<u64> {
+    budget_from(
+        env::var_os(MEMORY_BUDGET_VAR).as_deref(),
+        config.compile_memory_budget.as_deref(),
+    )
+}
+
+fn budget_from(var: Option<&OsStr>, setting: Option<&str>) -> Option<u64> {
+    let setting = setting.and_then(|s| config::parse_size(s).ok());
+    match var.and_then(OsStr::to_str).map(str::trim) {
+        Some("") | Some("0") => None,
+        Some(text) => config::parse_size(text).ok().or(setting).filter(|&n| n > 0),
+        None => setting.filter(|&n| n > 0),
+    }
 }
 
 /// The compile limit from the variable's value and the setting. A value
@@ -746,6 +810,21 @@ mod tests {
         // A typo never stops a build: the setting applies.
         assert_eq!(limit_from(var("four").as_deref(), Some(4)), Some(4));
         assert_eq!(limit_from(var("-1").as_deref(), None), None);
+    }
+
+    #[test]
+    fn memory_budget_can_be_disabled_independently_of_the_count_limit() {
+        assert_eq!(budget_from(None, Some("1GiB")), Some(1 << 30));
+        assert_eq!(budget_from(Some(OsStr::new("0")), Some("1GiB")), None);
+        assert_eq!(budget_from(Some(OsStr::new("")), Some("1GiB")), None);
+        assert_eq!(
+            budget_from(Some(OsStr::new("2GiB")), Some("1GiB")),
+            Some(2 << 30)
+        );
+        assert_eq!(
+            budget_from(Some(OsStr::new("bad")), Some("1GiB")),
+            Some(1 << 30)
+        );
     }
 
     #[test]

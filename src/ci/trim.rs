@@ -15,6 +15,13 @@ use super::units::{self, Kind, Unit};
 use crate::fsutil::{self, Lock, human};
 use crate::scan::{self, Profile};
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum Eviction {
+    Lru,
+    #[default]
+    RebuildCost,
+}
+
 #[derive(Debug, Clone)]
 pub struct Options {
     pub root: PathBuf,
@@ -23,6 +30,8 @@ pub struct Options {
     pub budget: Option<u64>,
     pub keep_workspace: bool,
     pub keep_incremental: bool,
+    pub keep_packages: BTreeSet<String>,
+    pub eviction: Eviction,
     pub dry_run: bool,
     pub verbose: bool,
     /// `$GITHUB_STEP_SUMMARY`: a markdown file shown on the job's page.
@@ -228,7 +237,12 @@ fn trim(options: &Options, tracking: Tracking) -> Report {
     out.report.before = fsutil::tree_size(root);
 
     let members = &options.members;
-    let member_crates: BTreeSet<String> = members.iter().map(|m| m.replace('-', "_")).collect();
+    let mut member_crates: BTreeSet<String> = members.iter().map(|m| m.replace('-', "_")).collect();
+    let mut selected_crates: BTreeSet<String> = options
+        .keep_packages
+        .iter()
+        .map(|p| p.replace('-', "_"))
+        .collect();
     let used_since = match tracking {
         Tracking::Reads { start } => Some(start),
         Tracking::Frozen | Tracking::NoMarker => None,
@@ -241,7 +255,18 @@ fn trim(options: &Options, tracking: Tracking) -> Report {
         units.extend(units::v2_units(&p.path));
         units
     }) {
-        let reason = if !options.keep_workspace && members.contains(&unit.package) {
+        // The package name need not be its [lib] or binary crate name.
+        // Keep ownership before removing the unit and its dep-info files.
+        if members.contains(&unit.package) {
+            member_crates.extend(unit.crates.iter().cloned());
+        }
+        if options.keep_packages.contains(&unit.package) {
+            selected_crates.extend(unit.crates.iter().cloned());
+        }
+        let reason = if !options.keep_workspace
+            && !options.keep_packages.contains(&unit.package)
+            && members.contains(&unit.package)
+        {
             Some(Reason::Workspace)
         } else if let Some(start) = used_since
             // Outputs without a fingerprint can't be dated reliably; leave
@@ -271,7 +296,10 @@ fn trim(options: &Options, tracking: Tracking) -> Report {
     {
         let reason = if !options.keep_incremental {
             Some(Reason::Incremental)
-        } else if !options.keep_workspace && member_crates.contains(&cache.package) {
+        } else if !options.keep_workspace
+            && !selected_crates.contains(&cache.package)
+            && member_crates.contains(&cache.package)
+        {
             Some(Reason::Workspace)
         } else if used_since.is_some() && !kept_crates.contains(&cache.package) {
             Some(Reason::Unused)
@@ -349,11 +377,19 @@ fn trim(options: &Options, tracking: Tracking) -> Report {
     if let Some(budget) = options.budget
         && removable > budget
     {
-        let items: Vec<(SystemTime, u64)> =
-            remaining.iter().map(|(u, b)| (u.last_used, *b)).collect();
-        let chosen: BTreeSet<usize> = over_budget(&items, removable - budget)
-            .into_iter()
+        let items: Vec<_> = remaining
+            .iter()
+            .map(|(u, b)| (u.last_used, *b, u.rebuild_ms()))
             .collect();
+        let dependents = if options.eviction == Eviction::RebuildCost && items.len() <= 4096 {
+            units::dependents(&remaining.iter().map(|(u, _)| u).collect::<Vec<_>>())
+        } else {
+            Vec::new()
+        };
+        let chosen: BTreeSet<usize> =
+            evict_linked(&items, removable - budget, options.eviction, &dependents)
+                .into_iter()
+                .collect();
         let mut stay = Vec::new();
         for (i, (unit, bytes)) in remaining.into_iter().enumerate() {
             if chosen.contains(&i) {
@@ -409,6 +445,126 @@ fn over_budget(items: &[(SystemTime, u64)], excess: u64) -> Vec<usize> {
         }
         freed += items[i].1;
         chosen.push(i);
+    }
+    chosen
+}
+
+/// Prefer cheap-to-reconstruct bytes. Unknown units receive the median
+/// observed cost density, avoiding a bias against unmeasured packages.
+/// With no observations this is exactly LRU. Ratios use widened integers.
+fn evict(items: &[(SystemTime, u64, Option<u64>)], excess: u64, policy: Eviction) -> Vec<usize> {
+    let mut known: Vec<_> = items
+        .iter()
+        .filter_map(|(_, bytes, ms)| Some((ms.filter(|&n| n > 0)?, (*bytes).max(1))))
+        .collect();
+    if policy == Eviction::Lru || known.is_empty() {
+        return over_budget(
+            &items.iter().map(|(t, b, _)| (*t, *b)).collect::<Vec<_>>(),
+            excess,
+        );
+    }
+    let compare = |a: (u64, u64), b: (u64, u64)| {
+        (u128::from(a.0) * u128::from(b.1)).cmp(&(u128::from(b.0) * u128::from(a.1)))
+    };
+    known.sort_by(|a, b| compare(*a, *b));
+    let fallback = known[known.len() / 2];
+    let value = |i: usize| {
+        items[i]
+            .2
+            .filter(|&n| n > 0)
+            .map(|n| (n, items[i].1.max(1)))
+            .unwrap_or(fallback)
+    };
+    let mut order: Vec<_> = (0..items.len()).collect();
+    order.sort_by(|&a, &b| compare(value(a), value(b)).then(items[a].0.cmp(&items[b].0)));
+    let mut freed = 0u64;
+    order
+        .into_iter()
+        .take_while(|&i| {
+            if freed >= excess {
+                return false;
+            }
+            freed = freed.saturating_add(items[i].1);
+            true
+        })
+        .collect()
+}
+
+/// Charge an eviction for all compiler work it invalidates, including
+/// retained dependents. Each invalidated unit is charged only once.
+fn evict_linked(
+    items: &[(SystemTime, u64, Option<u64>)],
+    excess: u64,
+    policy: Eviction,
+    dependents: &[Vec<usize>],
+) -> Vec<usize> {
+    if policy == Eviction::Lru
+        || dependents.is_empty()
+        || items.iter().all(|(_, _, ms)| ms.is_none())
+    {
+        return evict(items, excess, policy);
+    }
+    let mut densities: Vec<_> = items
+        .iter()
+        .filter_map(|(_, b, c)| c.map(|c| (c, (*b).max(1))))
+        .collect();
+    densities.sort_by(|a, b| {
+        (u128::from(a.0) * u128::from(b.1)).cmp(&(u128::from(b.0) * u128::from(a.1)))
+    });
+    let fallback = densities[densities.len() / 2];
+    let costs: Vec<u64> = items
+        .iter()
+        .map(|(_, b, c)| {
+            c.unwrap_or_else(|| {
+                (u128::from(fallback.0) * u128::from(*b) / u128::from(fallback.1))
+                    .min(u128::from(u64::MAX)) as u64
+            })
+        })
+        .collect();
+    let mut affected = vec![Vec::new(); items.len()];
+    let closures: Vec<Vec<usize>> = (0..items.len())
+        .map(|i| {
+            let mut visited = BTreeSet::new();
+            let mut stack = vec![i];
+            while let Some(j) = stack.pop() {
+                if j < items.len() && visited.insert(j) {
+                    stack.extend(dependents.get(j).into_iter().flatten().copied());
+                }
+            }
+            for &j in &visited {
+                affected[j].push(i);
+            }
+            visited.into_iter().collect()
+        })
+        .collect();
+    let mut damage: Vec<u128> = closures
+        .iter()
+        .map(|c| c.iter().map(|&i| u128::from(costs[i])).sum())
+        .collect();
+    let mut invalidated = vec![false; items.len()];
+    let mut removed = vec![false; items.len()];
+    let (mut freed, mut chosen) = (0u64, Vec::new());
+    while freed < excess {
+        let Some(i) = (0..items.len()).filter(|&i| !removed[i]).min_by(|&a, &b| {
+            // Saturation matters only for corrupt, implausibly large hints.
+            damage[a]
+                .saturating_mul(u128::from(items[b].1.max(1)))
+                .cmp(&damage[b].saturating_mul(u128::from(items[a].1.max(1))))
+                .then(items[a].0.cmp(&items[b].0))
+        }) else {
+            break;
+        };
+        removed[i] = true;
+        chosen.push(i);
+        freed = freed.saturating_add(items[i].1);
+        for &j in &closures[i] {
+            if !invalidated[j] {
+                invalidated[j] = true;
+                for &candidate in &affected[j] {
+                    damage[candidate] = damage[candidate].saturating_sub(u128::from(costs[j]));
+                }
+            }
+        }
     }
     chosen
 }
@@ -477,6 +633,7 @@ fn render_text(options: &Options, tracking: Tracking, report: &Report) -> String
     );
     if let Some(budget) = options.budget {
         let _ = write!(s, ", budget {}", human(budget));
+        let _ = write!(s, ", eviction {:?}", options.eviction);
     }
     s.push('\n');
     if let Some(note) = budget_unmet(options, report) {
@@ -555,6 +712,146 @@ mod tests {
     }
 
     #[test]
+    fn a_budget_keeps_expensive_units_instead_of_merely_recent_ones() {
+        let (_tmp, root) = fixture();
+        let deps = root.join("debug/deps");
+        for (name, hash, ms, age) in [
+            ("used", "1111111111111111", 1000, 10),
+            ("unused", "2222222222222222", 1, 20),
+        ] {
+            crate::costs::record(
+                &deps.join(format!(".cargo-steward-{hash}.json")),
+                name,
+                &deps,
+                Duration::from_millis(ms),
+                Duration::ZERO,
+                None,
+                Some(ms),
+            );
+            let fingerprint = root.join(format!("debug/.fingerprint/{name}-{hash}/lib-{name}"));
+            fs::File::open(&fingerprint)
+                .unwrap()
+                .set_times(
+                    fs::FileTimes::new()
+                        .set_accessed(at(age))
+                        .set_modified(at(age)),
+                )
+                .unwrap();
+            fs::File::open(fingerprint.parent().unwrap())
+                .unwrap()
+                .set_times(
+                    fs::FileTimes::new()
+                        .set_accessed(at(age))
+                        .set_modified(at(age)),
+                )
+                .unwrap();
+        }
+        let budget = units::legacy_units(&root.join("debug"))
+            .into_iter()
+            .find(|u| u.package == "used")
+            .unwrap()
+            .bytes();
+        let options = Options {
+            budget: Some(budget),
+            ..opts(&root)
+        };
+        trim(&options, Tracking::NoMarker);
+        assert!(
+            deps.join("libused-1111111111111111.rlib").exists(),
+            "expensive old unit was evicted"
+        );
+        assert!(
+            !deps.join("libunused-2222222222222222.rlib").exists(),
+            "cheap recent unit was kept"
+        );
+    }
+
+    #[test]
+    fn compiler_cpu_cost_is_preferred_to_contended_wall_time() {
+        let (_tmp, root) = fixture();
+        let deps = root.join("debug/deps");
+        let file = deps.join(".cargo-steward-1111111111111111.json");
+        fs::write(
+            &file,
+            serde_json::to_vec(&serde_json::json!({
+                "version":1,"output_dir":deps,"max_execution_ms":9000,
+                "cpu_samples_ms":[100,110,90],"execution_samples_ms":[9000]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let unit = units::legacy_units(&root.join("debug"))
+            .into_iter()
+            .find(|u| u.package == "used")
+            .unwrap();
+        assert_eq!(unit.rebuild_ms(), Some(100));
+    }
+
+    #[test]
+    fn eviction_falls_back_to_lru_and_supports_an_explicit_lru_override() {
+        let items = [(at(10), 100, Some(1000)), (at(20), 100, Some(1))];
+        assert_eq!(evict(&items, 100, Eviction::Lru), [0]);
+        assert_eq!(evict(&items, 100, Eviction::RebuildCost), [1]);
+        let unknown = [(at(10), 100, None), (at(20), 100, None)];
+        assert_eq!(evict(&unknown, 100, Eviction::RebuildCost), [0]);
+    }
+
+    #[test]
+    fn eviction_accounts_for_rebuilds_caused_in_retained_dependents() {
+        // A tiny, cheap dependency is required by a costly retained unit.
+        // Throwing it away also invalidates that retained compiler work.
+        let items = [
+            (at(10), 10, Some(1)),
+            (at(20), 100, Some(100)),
+            (at(30), 10, Some(5)),
+        ];
+        let dependents = vec![vec![1], vec![], vec![]];
+        assert_eq!(
+            evict_linked(&items, 10, Eviction::RebuildCost, &dependents),
+            [2]
+        );
+    }
+
+    #[test]
+    fn selected_workspace_packages_can_be_retained() {
+        let (_tmp, root) = fixture();
+        let options = Options {
+            keep_packages: BTreeSet::from(["app".into()]),
+            ..opts(&root)
+        };
+        trim(&options, Tracking::NoMarker);
+        assert!(root.join("debug/deps/app-3333333333333333").exists());
+    }
+
+    #[test]
+    fn custom_library_names_follow_their_workspace_packages_incremental_policy() {
+        for keep in [false, true] {
+            let (_tmp, root) = fixture();
+            fs::write(root.join("debug/deps/custom_lib-3333333333333333.d"), "").unwrap();
+            let cache = root.join("debug/incremental/custom_lib-1abc");
+            fs::create_dir_all(cache.join("s-1")).unwrap();
+            fs::write(cache.join("s-1/dep-graph.bin"), "x").unwrap();
+            trim(
+                &Options {
+                    keep_incremental: true,
+                    keep_packages: if keep {
+                        BTreeSet::from(["app".into()])
+                    } else {
+                        BTreeSet::new()
+                    },
+                    ..opts(&root)
+                },
+                Tracking::NoMarker,
+            );
+            assert_eq!(
+                cache.exists(),
+                keep,
+                "custom crate ignored its package's cache policy"
+            );
+        }
+    }
+
+    #[test]
     fn budget_removes_least_recently_used_first_until_under() {
         let items = [(at(30), 100), (at(10), 50), (at(20), 70), (at(40), 10)];
         assert_eq!(over_budget(&items, 0), Vec::<usize>::new());
@@ -603,6 +900,8 @@ mod tests {
             budget: None,
             keep_workspace: false,
             keep_incremental: false,
+            keep_packages: BTreeSet::new(),
+            eviction: Eviction::default(),
             dry_run: false,
             verbose: false,
             step_summary: None,

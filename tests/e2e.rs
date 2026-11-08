@@ -513,6 +513,17 @@ fn max_compiles_runs_one_compile_at_a_time_across_builds() {
 }
 
 #[test]
+fn a_memory_budget_limits_compiles_even_when_count_slots_are_free() {
+    let (_tmp, _home, overlapped) = concurrent_builds(
+        "max-compiles = 4\ncompile-memory-budget = \"1GiB\"\ncompile-memory-estimate = \"1GiB\"\n",
+    );
+    assert!(
+        !overlapped,
+        "memory reservations exceeded the configured budget"
+    );
+}
+
+#[test]
 fn without_max_compiles_compiles_run_at_once() {
     let (_tmp, home, overlapped) = concurrent_builds("");
     assert!(overlapped, "the compiles should have run at the same time");

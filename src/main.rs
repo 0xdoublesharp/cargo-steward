@@ -6,6 +6,7 @@
 
 mod ci;
 mod config;
+mod costs;
 mod dedup;
 mod doctor;
 mod fsutil;
@@ -56,7 +57,9 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// List the build directories cargo-steward manages
+    /// Show recorded per-unit execution costs, queue time and direct-compiler RSS
+    Stats(costs::Args),
+    /// List recorded build directories
     Status {
         /// Also search scan-roots for unrecorded build directories (slower)
         #[arg(long)]
@@ -134,7 +137,8 @@ enum Cmd {
     Skill(skill::Args),
 }
 
-const COMMANDS: [&str; 17] = [
+const COMMANDS: [&str; 18] = [
+    "stats",
     "setup",
     "doctor",
     "status",
@@ -179,6 +183,7 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Cmd::Setup(args) => setup::run(&args),
         Cmd::Doctor { json } => doctor::run(json),
+        Cmd::Stats(args) => costs::run(&args),
         Cmd::Status {
             sizes,
             json,
@@ -248,6 +253,7 @@ impl Cmd {
             | Cmd::Dedup { json, .. }
             | Cmd::Remove { json, .. } => *json,
             Cmd::Shim(args) => args.json(),
+            Cmd::Stats(args) => args.json,
             _ => false,
         }
     }

@@ -157,6 +157,12 @@ pub struct Config {
     /// Run at most this many compiles at once, machine-wide. Unset or 0 for
     /// no limit.
     pub max_compiles: Option<u32>,
+    /// Estimated memory reservations for concurrent compiles; not an RSS cap.
+    pub compile_memory_budget: Option<String>,
+    /// Reservation for a compile with no direct-compiler RSS observation.
+    pub compile_memory_estimate: String,
+    /// Record per-unit execution/queue costs alongside build output.
+    pub record_costs: bool,
     /// Start a new worktree's build directory as a clone of its repository's
     /// main build directory (copy-on-write; APFS, btrfs, XFS).
     pub seed: bool,
@@ -229,6 +235,9 @@ impl Default for Config {
             object_grace: "10m".into(),
             process_guard: true,
             max_compiles: None,
+            compile_memory_budget: None,
+            compile_memory_estimate: "2GiB".into(),
+            record_costs: true,
             seed: true,
             dedup: true,
             target_root: None,
@@ -278,6 +287,14 @@ impl Config {
         };
         if policy.target_free < policy.min_free {
             bail!("target-free must be at least min-free");
+        }
+        if size("compile-memory-estimate", &self.compile_memory_estimate)? == 0 {
+            bail!("compile-memory-estimate must be positive");
+        }
+        if let Some(budget) = &self.compile_memory_budget
+            && size("compile-memory-budget", budget)? == 0
+        {
+            bail!("compile-memory-budget must be positive");
         }
         Ok(policy)
     }

@@ -36,6 +36,33 @@ pub struct Unit {
 }
 
 impl Unit {
+    /// Observed direct-compiler CPU cost, used only as an eviction hint.
+    pub fn rebuild_ms(&self) -> Option<u64> {
+        let mut costs = Vec::new();
+        for path in &self.paths {
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(crate::costs::PREFIX))
+            {
+                costs.extend(crate::costs::read(path).and_then(|o| o.rebuild_ms()));
+            } else if self.kind == Kind::V2 {
+                costs.extend(
+                    crate::costs::in_dir(&path.join("out"))
+                        .into_iter()
+                        .filter_map(|(_, o)| o.rebuild_ms()),
+                );
+            } else if path.is_dir() {
+                costs.extend(
+                    crate::costs::in_dir(path)
+                        .into_iter()
+                        .filter_map(|(_, o)| o.rebuild_ms()),
+                );
+            }
+        }
+        costs.into_iter().max().filter(|&n| n > 0)
+    }
+
     /// Space removing the unit gives back.
     pub fn bytes(&self) -> u64 {
         let mut files = Vec::new();
@@ -56,6 +83,39 @@ impl Unit {
             Kind::Legacy | Kind::V2 => "unit",
         }
     }
+}
+
+/// Reverse dependency edges, using Cargo's fingerprint identities rather
+/// than package names (features, profiles and build scripts are distinct).
+pub fn dependents(units: &[&Unit]) -> Vec<Vec<usize>> {
+    let links: Vec<_> = units
+        .iter()
+        .map(|u| {
+            u.fingerprint
+                .as_deref()
+                .map(scan::fingerprint_links)
+                .unwrap_or_default()
+        })
+        .collect();
+    let mut producers: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
+    for (i, (hashes, _, _)) in links.iter().enumerate() {
+        for hash in hashes {
+            producers.entry(*hash).or_default().push(i);
+        }
+    }
+    let mut reverse = vec![Vec::new(); units.len()];
+    for (i, (_, deps, _)) in links.iter().enumerate() {
+        for producer in deps.iter().filter_map(|h| producers.get(h)).flatten() {
+            if *producer != i {
+                reverse[*producer].push(i);
+            }
+        }
+    }
+    for edges in &mut reverse {
+        edges.sort_unstable();
+        edges.dedup();
+    }
+    reverse
 }
 
 /// Fingerprint directories of a profile, in both layouts.
@@ -229,6 +289,35 @@ fn newest(paths: impl Iterator<Item = PathBuf>) -> SystemTime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dependency_edges_follow_fingerprints_across_both_layouts() {
+        let temp = tempfile::tempdir().unwrap();
+        let old = temp.path().join("debug/.fingerprint/dep-1111111111111111");
+        let new = temp
+            .path()
+            .join("debug/build/member/2222222222222222/fingerprint");
+        fs::create_dir_all(&old).unwrap();
+        fs::create_dir_all(&new).unwrap();
+        fs::write(old.join("lib-dep"), "0100000000000000").unwrap();
+        fs::write(new.join("lib-member"), "0200000000000000").unwrap();
+        fs::write(
+            new.join("lib-member.json"),
+            r#"{"deps":[[0,"dep",false,1]]}"#,
+        )
+        .unwrap();
+        let make = |fingerprint: PathBuf, kind| Unit {
+            kind,
+            package: "same-name".into(),
+            crates: BTreeSet::new(),
+            paths: vec![],
+            fingerprint: Some(fingerprint),
+            last_used: SystemTime::UNIX_EPOCH,
+        };
+        let a = make(old, Kind::Legacy);
+        let b = make(new, Kind::V2);
+        assert_eq!(dependents(&[&a, &b]), vec![vec![1], vec![]]);
+    }
 
     fn touch(path: &Path) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();

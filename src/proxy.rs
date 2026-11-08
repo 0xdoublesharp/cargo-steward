@@ -27,7 +27,7 @@ use crate::config::{self, Config, Paths};
 use route::Namespace;
 pub use route::{linked_worktree, worktree_dropped};
 
-pub use gate::is_ancestor;
+pub use gate::{ancestor_pids, is_ancestor};
 
 /// `cargo steward shim`.
 #[derive(Debug, clap::Args)]

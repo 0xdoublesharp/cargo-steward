@@ -85,6 +85,32 @@ artifact-use times. Routine status does not walk the scan roots.
 }
 ```
 
+## `stats --json`
+
+`stats [--target-dir DIR] --json` reports observations beside compiler
+output. The default directory comes from the current Cargo workspace.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `target_dir` | string | Build directory inspected |
+| `units` | array | `{path, observation}` per observed unit |
+| `units[].path` | string | Metadata file |
+| `units[].observation.version` | integer | Observation schema, currently 1 |
+| `units[].observation.crate_name` | string | rustc crate name |
+| `units[].observation.output_dir` | string | Directory that produced the observations |
+| `units[].observation.calls` | integer | Successful wrapper calls in this checkout |
+| `units[].observation.execution_ms` | integer | Total child wall time, including an inner cache wrapper |
+| `units[].observation.queue_ms` | integer | Total admission wait |
+| `units[].observation.cpu_ms` | integer | Total direct-compiler child CPU time |
+| `units[].observation.cpu_samples_ms` | array of integers | Up to nine recent direct-compiler CPU samples; eviction uses their median |
+| `units[].observation.max_execution_ms` | integer | Largest observed child wall time |
+| `units[].observation.max_rss_bytes` | integer or null | Largest individual child peak RSS, direct compilers only |
+
+Cloned observations retain estimates and producer paths, but report zero
+calls and accumulated times until this checkout compiles the unit. CPU and
+RSS are not inferred from sccache clients. An empty CPU sample list means
+the unit has no observed rebuild cost. These hints do not validate caches.
+
 ## `gc --json` and `remove --json`
 
 What a cleanup removes (or with `--apply`, removed), what it kept back and

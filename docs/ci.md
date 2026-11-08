@@ -116,6 +116,29 @@ Linux and macOS runners only.
 
 ## Persistent self-hosted runners
 
+### Choosing what to retain
+
+`cargo steward ci trim --budget 8GiB` defaults to `--eviction rebuild-cost`.
+Where the wrapper recorded direct-compiler CPU samples, it removes cheaper
+CPU work per byte first. It uses the median of nine recent samples so a
+contended build does not permanently dominate retention. For up to 4,096
+candidate units, it follows Cargo fingerprint dependencies and charges an
+eviction for retained dependent work it would invalidate. Larger inventories
+use cost per byte without that graph to bound memory and planning time. Unmeasured units
+receive the median observed cost per byte; with no measurements, eviction
+uses least recently used order. `--eviction lru` selects that order explicitly.
+
+`--keep-package my-library` can be repeated to retain selected workspace
+members as cache candidates. Job usage and the byte budget still apply.
+`--keep-workspace` retains all workspace members as candidates.
+
+The Action's start/trim steps do not enable the rustc wrapper. Existing
+build caches without direct-compiler observations use LRU. Execution time
+from an inner cache client is reported by `stats`, but is not treated as
+compiler CPU cost. These options are available through the CLI.
+
+### Configuring the runner
+
 A runner that keeps its build directories between jobs (particularly macOS,
 where every incremental rebuild leaks a set of debug object files) grows
 without bound. Two things fix that.

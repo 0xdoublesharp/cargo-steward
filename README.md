@@ -130,6 +130,7 @@ cargo steward setup [--inner PROGRAM] [--scan-root DIR]... [--build-dir DIR]
                     [--no-auto-gc] [--volume NAME] [--undo] [--dry-run]
 cargo steward doctor [--json]
 cargo steward status [--discover] [--sizes] [--json]
+cargo steward stats [--target-dir DIR] [--json]
 cargo steward gc [--apply] [-v] [--json]
 cargo steward pin DIR
 cargo steward unpin DIR
@@ -140,7 +141,8 @@ cargo steward hooks install|uninstall|status [--repo DIR]
 cargo steward dedup [--apply] [-v] [--json]
 cargo steward ci start [--target-dir DIR]
 cargo steward ci trim [--target-dir DIR] [--budget SIZE] [--keep-workspace]
-                      [--keep-incremental] [--dry-run] [-v]
+                      [--keep-package PACKAGE]... [--keep-incremental]
+                      [--eviction rebuild-cost|lru] [--dry-run] [-v]
 cargo steward shim install [--bin-dir DIR] [--shell zsh|bash|fish]
 cargo steward shim uninstall [--bin-dir DIR]
 cargo steward shim status
@@ -151,7 +153,7 @@ cargo steward skill status|show
 
 </details>
 
-With `--json`, `status`, `gc`, `remove`, `dedup`, `doctor` and
+With `--json`, `status`, `stats`, `gc`, `remove`, `dedup`, `doctor` and
 `shim explain` print one JSON document for scripts and agents;
 [docs/json.md](docs/json.md) describes each one.
 
@@ -237,6 +239,9 @@ target-free = "100GiB"        # ...until it has this much (at least min-free)
 object-grace = "10m"          # keep replaced objects up to this long while a binary built from them runs
 process-guard = true          # never remove what a running program was started from
 # max-compiles = 8            # most compiles at once, machine-wide; unset or 0: no limit
+# compile-memory-budget = "32GiB" # optional estimated reservations, not an RSS cap
+compile-memory-estimate = "2GiB"  # unknown units and inner cache wrappers
+record-costs = true           # per-unit observations beside compiler output
 seed = true                   # let `seed` (the hook and the proxy) clone build directories
 dedup = true                  # on macOS, share identical files after each cleanup
 
@@ -276,6 +281,7 @@ Environment variables:
 | `CARGO_STEWARD_HOME` | The steward home |
 | `CARGO_STEWARD_INNER` | Overrides `inner-wrapper`; empty for none |
 | `CARGO_STEWARD_MAX_COMPILES` | Overrides `max-compiles`; `0` or empty for no limit |
+| `CARGO_STEWARD_MEMORY_BUDGET` | Overrides `compile-memory-budget`; `0` or empty disables memory admission |
 
 ## How it works
 
@@ -302,6 +308,31 @@ runs, and the system releases it however the compile ends. A compile that
 finds every slot taken waits without printing anything, and one started
 from inside another compile (by a proc macro, say) doesn't wait. The
 proxy's `max-builds` limits whole cargo builds instead.
+
+With `compile-memory-budget`, a compile also reserves estimated memory.
+Direct compiler peak RSS plus 25% supplies its next estimate; unknown units
+and inner cache wrappers use `compile-memory-estimate`. Without an explicit
+count limit, memory mode uses the logical CPU count. These are cooperative
+reservations, not an RSS cap: linker processes can overlap, estimates can
+be low, and builds with admission disabled are outside the budget.
+An oversized compile runs alone. The head waiter blocks new memory-mode
+admissions while current compiles finish. A completion pipe wakes it when
+any compile finishes; a one-second recovery check handles crashed holders.
+Other waiters block in the kernel. Nested compilers share a live enclosing lease.
+Count and memory overrides are independent. Inner cache requests currently
+take the same admission path, including cache hits.
+With a memory budget enabled, `CARGO_STEWARD_MAX_COMPILES=0` removes the
+explicit count override and memory mode uses the logical CPU count.
+
+**Unit costs.** `stats` reads small `.cargo-steward-<hash>.json` observations
+alongside build output. Execution includes an inner cache wrapper; CPU and
+RSS are measured only for direct compiler children, including children they
+wait for. RSS is the largest individual child peak, not their combined peak.
+Cloning output preserves estimates and resets checkout counters.
+`record-costs = false` disables new observations. Cargo or other cache
+cleaners may leave these metadata files behind; they are disposable hints.
+During an upgrade, old wrappers can leave stale reservation fields; the
+new scheduler treats them conservatively until those compiles finish.
 
 **Records.** For each workspace member it compiles, the wrapper appends a
 line to a ledger in the steward home: the build directory, the package, the

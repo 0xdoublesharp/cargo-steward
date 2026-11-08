@@ -53,6 +53,10 @@ impl Env {
             "CARGO_TARGET_DIR",
             "CARGO_BUILD_TARGET_DIR",
             "CARGO_STEWARD_INNER",
+            "CARGO_STEWARD_MEMORY_BUDGET",
+            "CARGO_STEWARD_MAX_COMPILES",
+            "_STEWARD_COMPILE_SLOT",
+            "_STEWARD_COMPILE_TOKEN",
             "CARGO_STEWARD_SLOT",
             "CARGO_STEWARD_SLOT_FD",
             "CARGO_PRIMARY_PACKAGE",
@@ -982,6 +986,87 @@ fn the_wrapper_runs_rustc_through_the_inner_wrapper() {
         .cmd(&env.root, &args)
         .env("CARGO_STEWARD_INNER", "no-such-sccache"));
     assert_eq!(fs::read_to_string(&log).unwrap().lines().count(), 2);
+}
+
+#[test]
+fn compile_leases_preserve_cargo_environment_cache_keys() {
+    let env = Env::new();
+    env.config("max-compiles = 1\nauto-gc = false\n");
+    let rustc = fake_rustc(&env.root, "exit 0");
+    let inner = env.root.join("cargo-env-cache");
+    let cache = env.root.join("cache");
+    fs::create_dir(&cache).unwrap();
+    let log = env.root.join("misses");
+    // sccache hashes every CARGO_* variable, in addition to rustc inputs.
+    // Model that contract without touching the machine's shared cache.
+    script(
+        &inner,
+        r#"key=$(env | sed -n '/^CARGO_/p' | LC_ALL=C sort | cksum | awk '{print $1}')
+if [ -f "$CACHE/$key" ]; then exit 0; fi
+: > "$CACHE/$key"
+echo miss >> "$MISS_LOG"
+exec "$@""#,
+    );
+    for _ in 0..2 {
+        env.ok(env
+            .cmd(
+                &env.root,
+                &[
+                    rustc.to_str().unwrap(),
+                    "--crate-name",
+                    "dep",
+                    "--out-dir",
+                    env.root.to_str().unwrap(),
+                ],
+            )
+            .env("CARGO_STEWARD_INNER", &inner)
+            .env("CACHE", &cache)
+            .env("MISS_LOG", &log));
+    }
+    assert_eq!(
+        fs::read_to_string(log).unwrap().lines().count(),
+        1,
+        "changing lease markers invalidated an otherwise identical cache request"
+    );
+}
+
+#[test]
+fn the_wrapper_records_dependency_costs_without_claiming_workspace_ownership() {
+    let env = Env::new();
+    let target = env.root.join("target");
+    let deps = target.join("debug/deps");
+    fs::create_dir_all(&deps).unwrap();
+    fs::create_dir_all(target.join("debug/.fingerprint")).unwrap();
+    fs::write(target.join(".rustc_info.json"), "{}").unwrap();
+    let rustc = fake_rustc(&env.root, "sleep 0.02\nexit 0");
+    env.ok(&mut env.cmd(
+        &env.root,
+        &[
+            rustc.to_str().unwrap(),
+            "--crate-name",
+            "dep",
+            "-C",
+            "extra-filename=-0123456789abcdef",
+            "--out-dir",
+            deps.to_str().unwrap(),
+        ],
+    ));
+    let path = deps.join(".cargo-steward-0123456789abcdef.json");
+    assert!(
+        path.exists(),
+        "successful dependency compile has no cost observation"
+    );
+    let stats: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert_eq!(stats["calls"], 1);
+    assert!(stats["max_execution_ms"].as_u64().unwrap() >= 10);
+    assert!(stats["cpu_ms"].is_u64());
+    let doc: serde_json::Value = serde_json::from_str(&env.ok(&mut env.cmd(
+        &env.root,
+        &["stats", "--target-dir", target.to_str().unwrap(), "--json"],
+    )))
+    .unwrap();
+    assert_eq!(doc["units"][0]["observation"]["calls"], 1);
+    assert!(!env.home.join("ledger.jsonl").exists());
 }
 
 #[test]

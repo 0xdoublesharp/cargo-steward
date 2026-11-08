@@ -74,6 +74,13 @@ struct TrimArgs {
     /// Keep incremental caches (removed by default)
     #[arg(long)]
     keep_incremental: bool,
+    /// Keep selected workspace packages eligible for caching (still subject
+    /// to job usage and the budget); may be repeated
+    #[arg(long = "keep-package", value_name = "PACKAGE")]
+    keep_packages: Vec<String>,
+    /// Budget eviction policy; rebuild-cost falls back to LRU when unmeasured
+    #[arg(long, value_enum, default_value = "rebuild-cost")]
+    eviction: trim::Eviction,
     /// Report what would be removed without removing anything
     #[arg(long)]
     dry_run: bool,
@@ -117,6 +124,8 @@ pub fn run(args: &Args) -> Result<()> {
                 budget,
                 keep_workspace: args.keep_workspace,
                 keep_incremental: args.keep_incremental,
+                keep_packages: args.keep_packages.iter().cloned().collect(),
+                eviction: args.eviction,
                 dry_run: args.dry_run,
                 verbose: args.verbose,
                 step_summary: env::var_os("GITHUB_STEP_SUMMARY")
@@ -257,6 +266,8 @@ mod tests {
             budget: None,
             keep_workspace: true,
             keep_incremental: true,
+            keep_packages: BTreeSet::new(),
+            eviction: trim::Eviction::default(),
             dry_run: false,
             verbose: false,
             step_summary: None,

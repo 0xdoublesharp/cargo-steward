@@ -31,6 +31,13 @@ rustc-wrapper is cargo-steward. Otherwise follow the project's own rules.
   checkout's when no build holds it, else the most recently used).
 - **Build slots:** at most `max-builds` cargo builds and `max-compiles`
   rustc processes run at once, machine-wide.
+- **Memory admission:** optional `compile-memory-budget` reserves estimated
+  memory with kernel-blocking waits. Inner cache wrappers use the fallback
+  estimate; reservations are not an RSS cap. Count and memory overrides are
+  independent; `CARGO_STEWARD_MEMORY_BUDGET=0` disables memory admission.
+- **Costs:** `cargo steward stats --json` shows per-unit execution and queue
+  time, plus CPU/RSS for direct compiler children. CI trim uses recent CPU
+  cost per byte where observed, with LRU fallback and `--eviction lru`.
 
 ## Rules
 

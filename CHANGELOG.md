@@ -4,8 +4,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Optional `compile-memory-budget` admission alongside the compile count
+  limit. Unknown units reserve `compile-memory-estimate` (2 GiB); direct
+  compiler observations receive 25% headroom. Waiting uses kernel locks,
+  with a turnstile that lets a large head waiter drain active compiles and
+  a completion pipe that wakes it when any compile finishes.
+  `CARGO_STEWARD_MEMORY_BUDGET=0` disables memory admission for one build.
+- `stats [--target-dir DIR] [--json]` reports per-unit execution, queue,
+  direct-compiler CPU time and peak RSS. `record-costs = false` disables
+  observations; cloned builds retain estimates without inheriting counters.
+- `ci trim --eviction rebuild-cost` retains expensive compiler CPU work per
+  byte, including dependent work invalidated through Cargo fingerprints,
+  using a median of recent direct-compiler observations. Unmeasured
+  builds fall back to LRU; `--eviction lru` selects it explicitly.
+  `--keep-package PACKAGE` retains selected workspace members as candidates
+  for caching, still subject to job usage and the byte budget.
+
 ### Fixed
 
+- Memory admission uses the configured unknown-unit estimate for unreadable
+  or count-only reservations, and retries interrupted completion waits.
+- CI workspace retention follows custom library and binary crate names
+  recorded in dep-info when deciding which incremental caches belong to a
+  package.
 - Routine `status` no longer walks every scan root or every incremental
   session. It reports recorded build directories; `--discover` performs the
   full scan. Discovery uses directory-entry types instead of a metadata

@@ -210,24 +210,27 @@ pub fn held_by_ancestor(
 
 /// Whether `pid` is this process's parent, or its parent's, and so on.
 pub fn is_ancestor(pid: u32) -> bool {
+    ancestor_pids().contains(&pid)
+}
+
+/// Snapshot once when checking several lease holders.
+pub fn ancestor_pids() -> std::collections::BTreeSet<u32> {
+    let mut ancestors = std::collections::BTreeSet::new();
     // SAFETY: plain syscall with no arguments.
     let mut current = unsafe { libc::getppid() };
     for _ in 0..256 {
         let Ok(id) = u32::try_from(current) else {
-            return false;
+            break;
         };
-        if id == pid {
-            return true;
-        }
-        if id <= 1 {
-            return false;
+        if id == 0 || !ancestors.insert(id) || id <= 1 {
+            break;
         }
         match parent_of(current) {
             Some(parent) => current = parent,
-            None => return false,
+            None => break,
         }
     }
-    false
+    ancestors
 }
 
 #[cfg(target_os = "macos")]
