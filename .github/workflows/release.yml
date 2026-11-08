@@ -35,10 +35,10 @@ jobs:
       matrix:
         include:
           - target: aarch64-apple-darwin
-            os: macos-15
-          # The last x86_64 macOS runner image (macos-13 was retired in 2025).
+            os: macos-26
+          # Keep Intel builds on a native x86_64 runner.
           - target: x86_64-apple-darwin
-            os: macos-15-intel
+            os: macos-26-intel
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
