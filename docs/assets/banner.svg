@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="340" viewBox="0 0 1200 340" role="img" aria-labelledby="title desc">
+  <title id="title">cargo-steward</title>
+  <desc id="desc">An orange cargo crate with a lightning bolt beside the cargo-steward wordmark. Keep Cargo fast. Keep build output in check.</desc>
+  <defs>
+    <pattern id="grid" width="28" height="28" patternUnits="userSpaceOnUse">
+      <path d="M28 0H0v28" fill="none" stroke="#263440" stroke-width="1"/>
+    </pattern>
+  </defs>
+  <rect x="1" y="1" width="1198" height="338" rx="24" fill="#101820" stroke="#2b3945" stroke-width="2"/>
+  <rect x="32" y="28" width="280" height="280" rx="140" fill="url(#grid)" opacity=".6"/>
+  <circle cx="172" cy="168" r="126" fill="none" stroke="#34424d" stroke-dasharray="3 9"/>
+  <g transform="translate(63 55) scale(.9)" stroke-linejoin="round">
+    <path d="M128 12 224 68 128 124 32 68Z" fill="#ffd0a1"/>
+    <path d="m32 68 96 56v112l-96-56Z" fill="#ff9b50"/>
+    <path d="m128 124 96-56v112l-96 56Z" fill="#ed6839"/>
+    <path d="m80 40 96 56v39l-26 15v-39L54 55Z" fill="#101820" opacity=".22"/>
+    <path d="m158 100-43 65h34l-17 47 62-82h-37l20-30Z" fill="#fff8ee"/>
+    <path d="M8 111h35M0 140h43M16 169h27" fill="none" stroke="#ffb56b" stroke-width="9" stroke-linecap="round"/>
+    <path d="M224 15v24m-12-12h24" fill="none" stroke="#8ee6c0" stroke-width="6" stroke-linecap="round"/>
+  </g>
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+    <text x="352" y="145" font-size="68" font-weight="750" letter-spacing="-3" fill="#fff8ee">cargo<tspan fill="#ffac68">-steward</tspan></text>
+    <text x="355" y="195" font-size="25" fill="#b9c7d2">Keep Cargo fast. Keep build output in check.</text>
+  </g>
+  <g font-family="'SFMono-Regular', Consolas, 'Liberation Mono', monospace" font-size="13" letter-spacing="1.4" fill="#8ee6c0">
+    <path d="M355 233h740" stroke="#2b3945"/>
+    <text x="355" y="266">WARM STARTS</text>
+    <circle cx="514" cy="261" r="2"/>
+    <text x="537" y="266">BUILD LIMITS</text>
+    <circle cx="706" cy="261" r="2"/>
+    <text x="729" y="266">AUTOMATIC CLEANUP</text>
+  </g>
+  <path d="M1097 63h32m-16-16v32" stroke="#34424d" stroke-width="2" stroke-linecap="round"/>
+  <circle cx="1147" cy="292" r="4" fill="#ffac68"/>
+</svg>

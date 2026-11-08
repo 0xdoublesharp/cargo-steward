@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">cargo-steward logo</title>
+  <desc id="desc">An orange cargo crate with a lightning bolt, motion trails, and a mint spark.</desc>
+  <rect width="256" height="256" rx="56" fill="#101820"/>
+  <g transform="translate(20 18) scale(.85)" stroke-linejoin="round">
+    <path d="M128 12 224 68 128 124 32 68Z" fill="#ffd0a1"/>
+    <path d="m32 68 96 56v112l-96-56Z" fill="#ff9b50"/>
+    <path d="m128 124 96-56v112l-96 56Z" fill="#ed6839"/>
+    <path d="m80 40 96 56v39l-26 15v-39L54 55Z" fill="#101820" opacity=".22"/>
+    <path d="m158 100-43 65h34l-17 47 62-82h-37l20-30Z" fill="#fff8ee"/>
+    <path d="M8 111h35M0 140h43M16 169h27" fill="none" stroke="#ffb56b" stroke-width="9" stroke-linecap="round"/>
+    <path d="M224 15v24m-12-12h24" fill="none" stroke="#8ee6c0" stroke-width="6" stroke-linecap="round"/>
+  </g>
+</svg>

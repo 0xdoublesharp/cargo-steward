@@ -4,8 +4,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-08
+
 ### Added
 
+- A crate-and-lightning logo and a reorganized README with installation,
+  quick-start commands and expandable reference sections.
 - With `build.build-dir` set, the `cargo` proxy also seeds a new worktree's
   build directory, from the build directory of the worktree its target
   directory is cloned from. It runs `cargo metadata` once, only when it

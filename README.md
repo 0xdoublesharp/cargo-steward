@@ -1,69 +1,71 @@
-# cargo-steward
+<p align="center">
+  <img src="https://raw.githubusercontent.com/0xdoublesharp/cargo-steward/main/docs/assets/banner.png" alt="cargo-steward — Keep Cargo fast. Keep build output in check." width="100%">
+</p>
 
-Keeps Cargo build output fast and bounded on machines where people and many
-AI agents build many git worktrees at once.
+<p align="center">
+  <a href="https://github.com/0xdoublesharp/cargo-steward/actions/workflows/ci.yml"><img src="https://github.com/0xdoublesharp/cargo-steward/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://crates.io/crates/cargo-steward"><img src="https://img.shields.io/crates/v/cargo-steward?color=ed6839" alt="crates.io"></a>
+  <a href="https://github.com/0xdoublesharp/cargo-steward/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-8ee6c0" alt="License: MIT"></a>
+  <img src="https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-b9c7d2" alt="Platforms: macOS and Linux">
+</p>
 
-cargo-steward is Cargo's `rustc-wrapper` (with sccache or any other wrapper
-kept behind it) plus build-directory cleanup. Around that it adds a `cargo`
-proxy that routes and limits builds, warm starts for new git worktrees, a
-CI step that trims cached build output, and a skill that teaches AI coding
-agents to use it.
+<p align="center">
+  <a href="#install">Install</a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#commands">Commands</a> ·
+  <a href="#safety">Safety</a> ·
+  <a href="#documentation">Documentation</a>
+</p>
 
-## The problem
+**Fast, bounded Cargo builds for people and AI agents working across many
+git worktrees.** cargo-steward removes leaked debug objects, cleans unused
+build output, and gives new worktrees a warm start.
 
-- **Leaked debug objects.** With Rust 1.88 to 1.100, every incremental
-  rebuild on macOS (or anywhere with `split-debuginfo = "unpacked"`) writes
-  a full new set of `*.rcgu.o` / `*.rcgu.dwo` files and never removes the old
-  ones ([rust-lang/rust#161824]). Build directories grow by hundreds of
-  gigabytes, and every rustc start slows down listing them
-  ([rust-lang/cargo#16665]). Cargo 1.101 removes them for its own builds
-  ([rust-lang/cargo#17675]).
-- **No cleanup.** Cargo doesn't remove what a build directory no longer
-  needs ([rust-lang/cargo#5026]), or a build directory whose workspace is
-  gone ([rust-lang/cargo#13136]), and each worktree keeps its own full copy
-  of every dependency ([rust-lang/cargo#17453]).
-- **Cold starts and contention.** A new worktree compiles every dependency
-  from scratch, and ten agents each running `cargo test` with a job per core
-  oversubscribe CPU and memory.
+It runs as Cargo's `rustc-wrapper`, keeping sccache or another wrapper
+behind it. An optional `cargo` proxy routes build output and limits
+concurrent builds. Automatic cleanup runs after builds, with no daemon,
+cron job or launchd agent.
 
 ## What it does
 
-- **Removes the leaked objects** as each compile finishes, for every
-  toolchain from 1.88 up, including projects pinned to one.
-- **Cleans up in the background** after builds: object files later builds
-  replaced, idle incremental caches and build units, old-layout files after
-  an upgrade to Cargo 1.100's build-directory layout, build directories of
-  deleted worktrees or ones nothing has built in for weeks, and, when a disk
-  runs low, the build directories that cost least to rebuild. There is no
-  daemon, cron job or launchd agent.
-- **Limits concurrent compiles** machine-wide (`max-compiles`), and through
-  the proxy, concurrent cargo builds (`max-builds`).
-- **Warm-starts new worktrees** as copy-on-write clones of the best build
-  among the repository's other worktrees, and shares identical files across
-  build directories ([warm starts](docs/warm-start.md)).
-- **Routes build output and temporary files** for each worktree to a
-  scratch volume, through the [`cargo` proxy](docs/proxy.md).
-- **Trims CI caches** to what a job used, within a budget ([CI](docs/ci.md)).
-- **Checks the setup.** `cargo steward doctor` reports bad settings,
-  toolchains and pins that leak, toolchains no project uses, configs that
-  bypass the wrapper, split sccache caches, full debug info in dev profiles,
-  rust-analyzer's extra target directory, and on macOS, build output that
-  Time Machine backs up or Spotlight indexes.
+| | What you get |
+|---|---|
+| **Smaller build directories** | Removes leaked debug objects after each compile on toolchains from 1.88 up, including pinned ones. Background cleanup removes replaced objects, idle caches and build units, old Cargo layouts, and deleted or long-idle worktrees' build directories. |
+| **Warm worktrees** | Starts a new worktree as a copy-on-write clone of the best build among the repository's other worktrees. Shares identical files across build directories. [Warm starts →](docs/warm-start.md) |
+| **Less contention** | Limits concurrent compiles machine-wide with `max-compiles`, and concurrent Cargo builds through the proxy with `max-builds`. |
+| **Output where you want it** | Routes each worktree's build output and temporary files to a scratch volume. [Cargo proxy →](docs/proxy.md) |
+| **Bounded CI caches** | Trims cached build output to what the job used, within a budget. [CI →](docs/ci.md) |
+| **A setup check** | `doctor` finds bad settings, leaking or unused toolchains, wrapper overrides, split sccache caches, full dev debug info, extra rust-analyzer targets, and macOS backup or indexing overhead. |
+
+When a disk runs low, cleanup prioritizes the build directories that cost
+least to rebuild. [See what gets removed and when.](#what-gets-removed)
 
 ## Install
 
-On macOS or Linux, from a checkout (needs Rust 1.89 or newer):
+On **macOS or Linux**, with Rust 1.89 or newer:
+
+```sh
+cargo install --locked cargo-steward
+cargo steward setup
+cargo steward skill install
+cargo steward doctor
+```
+
+<details>
+<summary><strong>Install from source instead</strong></summary>
 
 ```sh
 git clone https://github.com/0xdoublesharp/cargo-steward cargo-steward
 cargo-steward/scripts/install.sh
 ```
 
-The script installs the binary, then runs `cargo steward setup`,
-`cargo steward skill install` and `cargo steward doctor`.
-[docs/install.md](docs/install.md) covers installing from git or a prebuilt
-release, first-time setup, a build volume on macOS, upgrading and
-uninstalling.
+The script installs the binary, then runs setup, installs the agent skill
+and checks the result with `doctor`.
+
+</details>
+
+For **prebuilt binaries**, installation options, upgrading and uninstalling,
+see the [installation guide](docs/install.md).
 
 ## Quick start
 
@@ -86,7 +88,42 @@ cargo steward remove --worktree ../app-fix-login --apply
 git worktree remove ../app-fix-login
 ```
 
+## Why build directories keep growing
+
+- **Leaked debug objects.** With Rust 1.88 to 1.100, every incremental
+  rebuild on macOS (or anywhere with `split-debuginfo = "unpacked"`) writes
+  a full new set of `*.rcgu.o` / `*.rcgu.dwo` files and never removes the old
+  ones ([rust-lang/rust#161824]). Build directories grow by hundreds of
+  gigabytes, and every rustc start slows down listing them
+  ([rust-lang/cargo#16665]). Cargo 1.101 removes them for its own builds
+  ([rust-lang/cargo#17675]).
+- **No cleanup.** Cargo doesn't remove what a build directory no longer
+  needs ([rust-lang/cargo#5026]), or a build directory whose workspace is
+  gone ([rust-lang/cargo#13136]), and each worktree keeps its own full copy
+  of every dependency ([rust-lang/cargo#17453]).
+- **Cold starts and contention.** A new worktree compiles every dependency
+  from scratch, and ten agents each running `cargo test` with a job per core
+  oversubscribe CPU and memory.
+
 ## Commands
+
+| Command | What it does | Docs |
+|---|---|---|
+| `setup` | Makes cargo-steward Cargo's rustc-wrapper, turns on automatic cleanup and sets scan roots. `--build-dir` also sets `build.build-dir`; `--volume` creates a macOS build volume | [Installation](docs/install.md#first-time-setup) |
+| `doctor` | Checks the setup and says what to change | |
+| `status` | Lists the build directories it manages, most recently used first, with layout; `--sizes` measures them | |
+| `gc` | Shows what a cleanup would remove, by kind (`-v`: every item); `--apply` removes it now | [Cleanup](#what-gets-removed) |
+| `pin`, `unpin` | Keeps a build directory (named by any path inside it) out of cleanup, except its stale object files | |
+| `remove` | Removes whole build directories: the paths given, the one each `--worktree` builds into, or all whose workspaces were deleted with `--orphaned`, without waiting out `orphan-grace`. Previews without `--apply`; pinned ones need `--force` | |
+| `seed` | Clones the best available build from the repository's worktrees | [Warm starts](docs/warm-start.md#cargo-steward-seed) |
+| `hooks` | Installs the git hook that seeds each new worktree | [Hooks](docs/warm-start.md#cargo-steward-hooks) |
+| `dedup` | Replaces identical files across build directories with clones | [Deduplication](docs/warm-start.md#cargo-steward-dedup) |
+| `ci` | Trims CI build output to what the job used, within a budget | [CI](docs/ci.md) |
+| `shim` | Installs the `cargo` proxy; `status` and `explain` show what it does here | [Cargo proxy](docs/proxy.md) |
+| `skill` | Installs the agent skill for Claude Code and Codex | [Agent skill](#agent-skill) |
+
+<details>
+<summary><strong>Full command reference</strong></summary>
 
 ```sh
 cargo steward setup [--inner PROGRAM] [--scan-root DIR]... [--build-dir DIR]
@@ -112,20 +149,7 @@ cargo steward skill install|uninstall [--dir DIR]...
 cargo steward skill status|show
 ```
 
-| Command | What it does | Docs |
-|---|---|---|
-| `setup` | Makes cargo-steward Cargo's rustc-wrapper, turns on automatic cleanup and sets scan roots. `--build-dir` also sets `build.build-dir`; `--volume` creates a macOS build volume | [install.md](docs/install.md#first-time-setup) |
-| `doctor` | Checks the setup and says what to change | |
-| `status` | Lists the build directories it manages, most recently used first, with layout; `--sizes` measures them | |
-| `gc` | Shows what a cleanup would remove, by kind (`-v`: every item); `--apply` removes it now | [below](#what-gets-removed) |
-| `pin`, `unpin` | Keeps a build directory (named by any path inside it) out of cleanup, except its stale object files | |
-| `remove` | Removes whole build directories the way cleanup does: the paths given, the one each `--worktree` builds into, or with `--orphaned`, every one whose workspaces were all deleted, without waiting out `orphan-grace`. Previews without `--apply`; pinned ones need `--force` | |
-| `seed` | Starts a new worktree's build directory as a clone of the best build among the repository's worktrees | [warm-start.md](docs/warm-start.md#cargo-steward-seed) |
-| `hooks` | Installs the git hook that seeds each new worktree | [warm-start.md](docs/warm-start.md#cargo-steward-hooks) |
-| `dedup` | Replaces identical files across build directories with clones | [warm-start.md](docs/warm-start.md#cargo-steward-dedup) |
-| `ci` | Trims a CI job's build output to what it used, within a budget | [ci.md](docs/ci.md) |
-| `shim` | Installs the `cargo` proxy; `status` and `explain` show what it does here | [proxy.md](docs/proxy.md) |
-| `skill` | Installs the agent skill for Claude Code and Codex | [below](#agent-skill) |
+</details>
 
 With `--json`, `status`, `gc`, `remove`, `dedup`, `doctor` and
 `shim explain` print one JSON document for scripts and agents;
@@ -160,7 +184,7 @@ removed for space. When removals stop raising free space (Time Machine's
 local snapshots or clones still hold the blocks), cleanup stops and says
 so.
 
-### Safety
+## Safety
 
 - Every removal from a build directory happens while holding cargo's own
   locks on it (`.cargo-lock`, `.cargo-build-lock` and `.cargo-artifact-lock`,
@@ -190,9 +214,11 @@ reports the change in each disk's free space ("Freed on disk").
 
 ## Settings
 
-`config.toml` in the steward home: `$CARGO_STEWARD_HOME`, else
-`$CARGO_HOME/steward`, else `~/.cargo/steward`. Every setting, with its
-default:
+Settings live in `config.toml` in the steward home: `$CARGO_STEWARD_HOME`,
+else `$CARGO_HOME/steward`, else `~/.cargo/steward`.
+
+<details>
+<summary><strong>All settings and their defaults</strong></summary>
 
 ```toml
 # inner-wrapper = "sccache"   # what rustc runs through; unset: rustc directly (setup keeps the wrapper it replaces)
@@ -228,6 +254,8 @@ link-target = false                                # point a missing <workspace>
 # force = true                                     # route even over a target dir chosen elsewhere
 ```
 
+</details>
+
 Durations are written like `10m`, `12h`, `14d` or `2w`. Sizes are bytes, or
 take `K`, `M`, `G` or `T` (alone, or with `B` or `iB`), always binary:
 `50GiB` and `50G` are the same.
@@ -250,6 +278,9 @@ Environment variables:
 | `CARGO_STEWARD_MAX_COMPILES` | Overrides `max-compiles`; `0` or empty for no limit |
 
 ## How it works
+
+<details>
+<summary><strong>Wrapper, compile slots, build records and background cleanup</strong></summary>
 
 **The wrapper.** Cargo runs `cargo-steward <rustc> <args>` for every
 compile. Calls that compile nothing (`rustc -vV`, `--print`) are handed
@@ -299,6 +330,8 @@ and it's back to 5 minutes once one frees space or no disk is low. On macOS
 with `dedup = true`, each applied cleanup then shares identical files among
 what changed since the last pass.
 
+</details>
+
 ## Build volume (macOS)
 
 Build output on the system disk is held for about a day after deletion by
@@ -325,6 +358,31 @@ goes into the skills directory of each agent found, Claude Code
 binary: `skill status` shows whether each installed copy matches it, and
 `skill install` updates them. `skill show` prints it, and `skill uninstall`
 removes it.
+
+## Documentation
+
+| Guide | Covers |
+|---|---|
+| [Installation](docs/install.md) | Source and binary installs, setup, upgrades and uninstalling |
+| [Warm starts](docs/warm-start.md) | Worktree seeding, git hooks and deduplication |
+| [Cargo proxy](docs/proxy.md) | Routing output, per-project settings and build limits |
+| [CI](docs/ci.md) | Trimming caches and using the GitHub Action |
+| [JSON output](docs/json.md) | Machine-readable reports for scripts and agents |
+| [Changelog](CHANGELOG.md) | Release history |
+
+## Development
+
+With the toolchain pinned in `rust-toolchain.toml`:
+
+```sh
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+shellcheck scripts/install.sh
+```
+
+CI runs on macOS and Linux, with additional end-to-end checks against
+Cargo beta and nightly.
 
 [rust-lang/rust#161824]: https://github.com/rust-lang/rust/issues/161824
 [rust-lang/cargo#16665]: https://github.com/rust-lang/cargo/issues/16665
