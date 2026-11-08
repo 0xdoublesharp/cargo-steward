@@ -235,6 +235,7 @@ impl Cmd {
             | Cmd::Gc { json, .. }
             | Cmd::Dedup { json, .. }
             | Cmd::Remove { json, .. } => *json,
+            Cmd::Shim(args) => args.json(),
             _ => false,
         }
     }
