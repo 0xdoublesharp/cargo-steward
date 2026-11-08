@@ -678,8 +678,14 @@ fn explain_json_describes_settings_routing_and_build_slots() {
         target.ends_with(doc["namespace"]["path"].as_str().unwrap()),
         "{doc}"
     );
+    // Not created yet: the space is that of the disk it will be on.
+    assert!(
+        doc["target_dir"]["free_bytes"].as_u64().unwrap() > 0,
+        "{doc}"
+    );
     assert_eq!(doc["tmp_dir"]["routed"], false, "{doc}");
     assert_eq!(doc["tmp_dir"]["reason"], "tmp-root isn't set", "{doc}");
+    assert_eq!(doc["tmp_dir"]["free_bytes"], serde_json::Value::Null);
     assert_eq!(doc["seed"]["status"], "off", "{doc}");
     assert_eq!(doc["build_slot"]["status"], "takes_slot", "{doc}");
     assert_eq!(doc["build_slot"]["limit"], 1, "{doc}");

@@ -540,6 +540,8 @@ struct RoutedDoc {
     path: Option<String>,
     /// Why not, when not.
     reason: Option<String>,
+    /// When routed: free space on the disk that holds (or will hold) it.
+    free_bytes: Option<u64>,
 }
 
 impl RoutedDoc {
@@ -549,16 +551,19 @@ impl RoutedDoc {
                 routed: false,
                 path: None,
                 reason: Some(format!("{setting} isn't set")),
+                free_bytes: None,
             },
             (Some(why), Some(_)) => RoutedDoc {
                 routed: false,
                 path: None,
                 reason: Some(why.clone()),
+                free_bytes: None,
             },
             (None, Some(dir)) => RoutedDoc {
                 routed: true,
                 path: Some(json::path(dir)),
                 reason: None,
+                free_bytes: crate::fsutil::free_space_near(dir),
             },
         }
     }
