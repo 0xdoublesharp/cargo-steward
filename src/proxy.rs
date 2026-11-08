@@ -26,6 +26,8 @@ use anyhow::{Result, bail};
 use crate::config::{self, Config, Paths};
 use route::Namespace;
 
+pub use gate::is_ancestor;
+
 /// `cargo steward shim`.
 #[derive(Debug, clap::Args)]
 pub struct ShimArgs {

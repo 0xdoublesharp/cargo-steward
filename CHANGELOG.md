@@ -80,6 +80,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `max-compiles` setting (or `CARGO_STEWARD_MAX_COMPILES`): at most that
+  many compiles run at once, machine-wide. The wrapper holds one of N lock
+  file slots for as long as rustc runs, so concurrent builds from many
+  worktrees stop oversubscribing CPU and memory. `doctor` shows the limit.
 - `link-target` setting for the `cargo` proxy: when it routes a workspace's
   build output, it also points a missing `<workspace>/target` at the routed
   directory (only where git ignores `target`), so `./target` paths and builds

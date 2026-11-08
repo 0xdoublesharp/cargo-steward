@@ -160,6 +160,7 @@ min-free = "50GiB"
 target-free = "100GiB"
 object-grace = "10m"          # keep replaced object files this long, so running binaries keep backtraces
 process-guard = true          # don't remove a build directory a running process was started from
+# max-compiles = 8            # at most this many compiles at once, machine-wide; unset or 0 for no limit
 seed = true                   # start new worktrees' build directories as clones (`seed`)
 dedup = true                  # let cleanup replace identical files with clones (`dedup`)
 
@@ -175,7 +176,8 @@ dedup = true                  # let cleanup replace identical files with clones 
 # max-builds = 3
 ```
 
-`CARGO_STEWARD_INNER` overrides `inner-wrapper` (empty for none).
+`CARGO_STEWARD_INNER` overrides `inner-wrapper` (empty for none), and
+`CARGO_STEWARD_MAX_COMPILES` overrides `max-compiles` (`0` for no limit).
 
 Automatic cleanups log to `~/.cargo/steward/gc.log`.
 
@@ -189,6 +191,17 @@ incremental cache, so anything with an old name and an old timestamp belongs
 to an earlier compile. Calls that compile nothing (`rustc -vV`, `--print`) are
 handed straight to rustc. Measured overhead is under a millisecond per
 compile, and about 4 ms on cargo's cached version probe.
+
+With `max-compiles = N`, at most N compiles run at once on the machine,
+however many builds start them: several agents each running cargo with a
+job per core share N rustc processes instead of oversubscribing CPU and
+memory. Each compile holds one of N slots while its rustc runs: an exclusive
+lock on a file in `compile-slots/` in the steward home, which rustc and what
+it starts never inherit and the system releases however the compile ends. A
+compile that finds every slot taken waits for one without printing anything
+(cargo reads rustc's output), and one started from inside another compile,
+such as by a proc macro, doesn't wait. Calls that compile nothing take no
+slot. The `cargo` proxy's `max-builds` limits whole builds instead.
 
 For workspace members, the wrapper also appends one line to a ledger: which
 build directory, which package, how long the compile took. Cleanup compacts it

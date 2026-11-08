@@ -2,6 +2,8 @@
 //! for every compile; this runs it (through the inner wrapper, such as
 //! sccache), then:
 //!
+//! - holds one of `max-compiles` machine-wide slots while rustc runs
+//!   ([`slots`]);
 //! - removes the codegen-unit object files that this compile replaced
 //!   (rust-lang/rust#161824, fixed in Cargo 1.101 for its own layout);
 //! - records the compile in the ledger, for workspace members;
@@ -20,6 +22,11 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::config::{self, Config, Paths};
 use crate::{gc, ledger, scan};
+
+mod slots;
+
+/// Overrides `max-compiles`.
+pub const MAX_COMPILES_VAR: &str = "CARGO_STEWARD_MAX_COMPILES";
 
 /// Objects modified within this long before the compile started are kept,
 /// so that a file rewritten in place on a filesystem with coarse timestamps
@@ -51,8 +58,14 @@ pub fn run(argv: Vec<OsString>) -> ! {
         None
     };
 
+    let slot = match (&paths, compile_limit(&config)) {
+        (Some(paths), Some(limit)) => slots::acquire(&paths.compile_slots(), limit),
+        _ => None,
+    };
     let started = Instant::now();
-    let status = match Command::new(&command[0]).args(&command[1..]).status() {
+    let status = Command::new(&command[0]).args(&command[1..]).status();
+    drop(slot);
+    let status = match status {
         Ok(status) => status,
         Err(e) => {
             eprintln!(
@@ -86,6 +99,26 @@ fn settings(paths: Option<&Paths>) -> Config {
 /// beforehand would be wasted work.
 fn wants_leak_fix(config: &Config, args: &RustcArgs) -> bool {
     config.leak_fix && args.incremental && args.writes_objects()
+}
+
+/// How many compiles may run at once: `$CARGO_STEWARD_MAX_COMPILES`, else
+/// `max-compiles`. `None` for no limit.
+pub fn compile_limit(config: &Config) -> Option<u32> {
+    limit_from(
+        env::var_os(MAX_COMPILES_VAR).as_deref(),
+        config.max_compiles,
+    )
+}
+
+/// The compile limit from the variable's value and the setting. A value
+/// that isn't a number is ignored; an empty one or 0 means no limit.
+fn limit_from(var: Option<&OsStr>, setting: Option<u32>) -> Option<u32> {
+    let value = match var.map(|v| v.to_str().map(str::trim)) {
+        Some(Some("")) => None,
+        Some(Some(text)) => text.parse().ok().or(setting),
+        Some(None) | None => setting,
+    };
+    value.filter(|&n| n > 0)
 }
 
 /// How long replaced objects are kept for binaries that may still be
@@ -503,6 +536,22 @@ mod tests {
                 "app-0123456789abcdef.x.0new.rcgu.o",
             ]
         );
+    }
+
+    #[test]
+    fn reads_the_compile_limit() {
+        let var = |v: &str| Some(OsString::from(v));
+        assert_eq!(limit_from(None, None), None);
+        assert_eq!(limit_from(None, Some(4)), Some(4));
+        assert_eq!(limit_from(None, Some(0)), None);
+        assert_eq!(limit_from(var("2").as_deref(), Some(4)), Some(2));
+        assert_eq!(limit_from(var(" 3 ").as_deref(), None), Some(3));
+        // Turned off for one build.
+        assert_eq!(limit_from(var("0").as_deref(), Some(4)), None);
+        assert_eq!(limit_from(var("").as_deref(), Some(4)), None);
+        // A typo never stops a build: the setting applies.
+        assert_eq!(limit_from(var("four").as_deref(), Some(4)), Some(4));
+        assert_eq!(limit_from(var("-1").as_deref(), None), None);
     }
 
     #[test]

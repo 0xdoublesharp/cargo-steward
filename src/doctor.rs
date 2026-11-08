@@ -217,6 +217,21 @@ fn check_wrapper(settings: &config::Config, configured: Option<&str>) {
             "No inner wrapper (such as sccache) is configured",
         ),
     }
+    let from = if env::var_os(wrapper::MAX_COMPILES_VAR).is_some() {
+        wrapper::MAX_COMPILES_VAR
+    } else {
+        "max-compiles"
+    };
+    match wrapper::compile_limit(settings) {
+        Some(limit) => say(
+            Level::Ok,
+            format!("At most {limit} compile(s) run at once, machine-wide ({from})"),
+        ),
+        None => say(
+            Level::Info,
+            format!("Compiles run as many at once as Cargo starts ({from} is unset)"),
+        ),
+    }
 }
 
 /// The toolchain each recorded package's project pins, and the projects
