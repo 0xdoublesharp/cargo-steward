@@ -71,7 +71,7 @@ pub struct Summary {
 pub fn run(apply: bool, verbose: bool, as_json: bool) -> Result<()> {
     let paths = Paths::resolve().context("cannot locate the home directory")?;
     let config = config::load_warning(&paths);
-    let (_, dirs) = gc::inventory(&paths, &config.scan_roots, apply)?;
+    let (_, dirs) = gc::inventory(&paths, &gc::scan_roots(&config), apply)?;
     if dirs.is_empty() && !as_json {
         println!("No build directories found yet.");
         return Ok(());

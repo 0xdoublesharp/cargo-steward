@@ -271,6 +271,8 @@ fn remove(
 ) -> Result<()> {
     let mut found = Vec::new();
     for worktree in worktrees {
+        // Named in full, however it was given (`.`).
+        let worktree = &worktree.canonicalize().unwrap_or_else(|_| worktree.clone());
         let dir = gc::build_dir_of(worktree)?;
         if !as_json {
             println!("{} builds into {}", worktree.display(), dir.display());

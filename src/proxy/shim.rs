@@ -259,6 +259,10 @@ struct Explanation {
     real_cargo: Option<PathBuf>,
     route: Option<PathBuf>,
     slot: Slot,
+    /// The first `cargo` on PATH, which builds started here run.
+    first_cargo: Option<PathBuf>,
+    /// Whether that is the proxy, so what's planned here happens.
+    proxy_active: bool,
 }
 
 /// A plan and whether it seeds.
@@ -399,6 +403,14 @@ impl Explanation {
             .unwrap_or_default();
         let cwd = env::current_dir()?;
         let plan = Plan::new(&config, &cwd, &args)
+            .map(|mut plan| {
+                // With nothing to route the proxy skips finding the
+                // checkout; an explanation still names it.
+                if plan.namespace.git.is_none() && plan.namespace.repo.is_empty() {
+                    plan.namespace = crate::proxy::route::Namespace::of(&plan.dir);
+                }
+                plan
+            })
             .map(|plan| Planned {
                 seed: Seed::of(&config, paths.as_ref(), &plan),
                 plan,
@@ -417,7 +429,11 @@ impl Explanation {
             },
             (Some(_), _) => Slot::NotABuild { command },
         };
+        let first_cargo = first_cargo();
+        let proxy_active = me.as_deref().is_some_and(first_cargo_is);
         Ok(Explanation {
+            first_cargo,
+            proxy_active,
             settings: paths.as_ref().map(Paths::config),
             problems,
             real_cargo: real_cargo(&config, me.as_deref()),
@@ -465,6 +481,18 @@ impl Explanation {
             println!("route:        {}", route.display());
         }
         println!("build slot:   {}", self.slot.describe());
+        let routes = self.plan.as_ref().is_ok_and(|p| {
+            p.plan.skip.is_none() && (p.plan.target.is_some() || p.plan.tmp.is_some())
+        });
+        if routes && !self.proxy_active {
+            match &self.first_cargo {
+                Some(first) => println!(
+                    "proxy:        not in use here: `cargo` on PATH is {}, so builds run without it",
+                    first.display()
+                ),
+                None => println!("proxy:        not in use here: no `cargo` on PATH"),
+            }
+        }
     }
 
     fn document(&self) -> ExplainDoc {
@@ -525,6 +553,10 @@ impl Explanation {
                 },
                 message: self.slot.describe(),
             },
+            proxy: ProxyDoc {
+                first_cargo: self.first_cargo.as_deref().map(json::path),
+                active: self.proxy_active,
+            },
         }
     }
 }
@@ -547,6 +579,16 @@ struct ExplainDoc {
     route: Option<String>,
     real_cargo: Option<String>,
     build_slot: SlotDoc,
+    proxy: ProxyDoc,
+}
+
+#[derive(Serialize)]
+struct ProxyDoc {
+    /// The first `cargo` on PATH.
+    first_cargo: Option<String>,
+    /// Whether that is the proxy: only then are builds here routed, seeded
+    /// and given build slots as described.
+    active: bool,
 }
 
 #[derive(Serialize)]

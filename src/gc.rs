@@ -259,6 +259,14 @@ impl BuildDir {
     }
 }
 
+/// Where to search for build directories: the `scan-roots`, and the
+/// directories the `cargo` proxy routes target directories under.
+pub fn scan_roots(config: &config::Config) -> Vec<PathBuf> {
+    let mut roots = config.scan_roots.clone();
+    roots.extend(crate::proxy::target_roots(config));
+    roots
+}
+
 /// Every known build directory: those the wrapper recorded and those found
 /// under the scan roots. Registry entries are re-resolved to the build
 /// directory's root (merging any recorded against a subdirectory), and
@@ -373,7 +381,7 @@ pub fn run(options: Options) -> Result<()> {
         touch(&paths.stamp());
     }
 
-    let (mut registry, dirs) = inventory(&paths, &config.scan_roots, options.apply)?;
+    let (mut registry, dirs) = inventory(&paths, &scan_roots(&config), options.apply)?;
     let running = if config.process_guard {
         Running::collect()
     } else {
@@ -391,16 +399,7 @@ pub fn run(options: Options) -> Result<()> {
         apply: options.apply,
     };
     let mut cleanup = clean(&dirs, sweep);
-    let freed: Vec<(PathBuf, i128)> = volumes
-        .iter()
-        .filter(|v| {
-            cleanup.actions.iter().any(|a| {
-                dirs.iter()
-                    .any(|d| d.device == Some(v.device) && a.path.starts_with(&d.root))
-            })
-        })
-        .filter_map(|v| Some((v.probe.clone(), v.freed()?)))
-        .collect();
+    let freed = Volume::freed_by(&volumes, &dirs, &cleanup.actions);
 
     let tmp = remove_routed_tmp_dirs(&config, &cleanup.actions, options.apply);
     cleanup.actions.extend(tmp);
@@ -546,6 +545,21 @@ impl Volume {
             }
         }
         volumes
+    }
+
+    /// The change in free space on each of `volumes` that `actions` removed
+    /// something from, inside one of `dirs`.
+    fn freed_by(volumes: &[Volume], dirs: &[BuildDir], actions: &[Action]) -> Vec<(PathBuf, i128)> {
+        volumes
+            .iter()
+            .filter(|v| {
+                actions.iter().any(|a| {
+                    dirs.iter()
+                        .any(|d| d.device == Some(v.device) && a.path.starts_with(&d.root))
+                })
+            })
+            .filter_map(|v| Some((v.probe.clone(), v.freed()?)))
+            .collect()
     }
 
     /// How much the volume's free space rose since [`Volume::measure`]. Other
@@ -1055,6 +1069,9 @@ pub struct Requested {
     pub refused: Vec<(PathBuf, String)>,
     /// The command, for the report's closing hint and the document.
     pub command: &'static str,
+    /// With `apply`: the measured change in free space on each disk
+    /// something was removed from.
+    pub freed: Vec<(PathBuf, i128)>,
 }
 
 /// Removes the TMPDIRs the `cargo` proxy routed for build directories that
@@ -1186,7 +1203,7 @@ pub fn remove_requested(
         Running::default()
     };
     let (mut registry, mut targets) = if orphaned {
-        let (registry, dirs) = inventory(&paths, &config.scan_roots, apply)?;
+        let (registry, dirs) = inventory(&paths, &scan_roots(&config), apply)?;
         let orphans = dirs
             .into_iter()
             .filter(BuildDir::orphaned)
@@ -1228,6 +1245,12 @@ pub fn remove_requested(
             targets.push((Kind::Requested, dir));
         }
     }
+    let measured: Vec<BuildDir> = targets.iter().map(|(_, dir)| dir.clone()).collect();
+    let volumes = if apply {
+        Volume::measure(&measured)
+    } else {
+        Vec::new()
+    };
     for (kind, dir) in &targets {
         if dir.pinned && !force {
             out.skipped.push(Skipped {
@@ -1256,6 +1279,7 @@ pub fn remove_requested(
             _ => {}
         }
     }
+    let freed = Volume::freed_by(&volumes, &measured, &out.actions);
     out.actions
         .extend(remove_routed_tmp_dirs(&config, &out.actions, apply));
     if apply {
@@ -1270,6 +1294,7 @@ pub fn remove_requested(
     Ok(Requested {
         cleanup: out,
         refused,
+        freed,
         command: if orphaned && roots.is_empty() {
             "remove --orphaned"
         } else {
@@ -1282,7 +1307,7 @@ pub fn remove_requested(
 pub fn report_requested(requested: &Requested, apply: bool) {
     report(
         &requested.cleanup,
-        &[],
+        &requested.freed,
         Options {
             apply,
             verbose: true,

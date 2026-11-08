@@ -162,7 +162,7 @@ impl Document {
     ) -> Document {
         let mut doc = Document::new(
             &requested.cleanup,
-            &[],
+            &requested.freed,
             Options {
                 apply,
                 command: requested.command,
