@@ -84,7 +84,7 @@ enum Cmd {
     Pin { dir: PathBuf },
     /// Undo `pin`
     Unpin { dir: PathBuf },
-    /// Start a new worktree's build directory as a clone of its main one
+    /// Start a new worktree's build directory as a clone of another worktree's
     Seed(seed::SeedArgs),
     /// Install or remove the git hooks that seed new worktrees
     Hooks(seed::HooksArgs),

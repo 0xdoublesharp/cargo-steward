@@ -73,7 +73,16 @@ fn repo_name(label: &str, identity: &Path) -> String {
     format!("{label}-{}", &hex[..10])
 }
 
+/// The cargo the proxy runs: the one running the tests, or
+/// `STEWARD_TEST_CARGO` (with `RUSTC` set to its rustc) to check other
+/// versions and layouts.
+fn test_cargo() -> String {
+    std::env::var("STEWARD_TEST_CARGO").unwrap_or_else(|_| env!("CARGO").to_owned())
+}
+
 impl Fixture {
+    /// Seeding is off and the real cargo is the one running the tests,
+    /// unless `extra_config` sets them.
     fn new(extra_config: &str) -> Fixture {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
@@ -84,16 +93,19 @@ impl Fixture {
         fs::create_dir_all(&home).unwrap();
         let targets = root.join("targets");
         let tmps = root.join("tmps");
-        fs::write(
-            home.join("config.toml"),
-            format!(
-                "target-root = {:?}\ntmp-root = {:?}\nreal-cargo = {:?}\nseed = false\n{extra_config}",
-                targets.display().to_string(),
-                tmps.display().to_string(),
-                env!("CARGO"),
-            ),
-        )
-        .unwrap();
+        let mut config = format!(
+            "target-root = {:?}\ntmp-root = {:?}\n",
+            targets.display().to_string(),
+            tmps.display().to_string(),
+        );
+        if !extra_config.contains("real-cargo =") {
+            config.push_str(&format!("real-cargo = {:?}\n", env!("CARGO")));
+        }
+        if !extra_config.contains("seed =") {
+            config.push_str("seed = false\n");
+        }
+        config.push_str(extra_config);
+        fs::write(home.join("config.toml"), config).unwrap();
         let repo = root.join("repo");
         write_crate(&repo, "pfx");
         fs::write(repo.join(".gitignore"), "/target\n").unwrap();
@@ -603,4 +615,115 @@ fn a_daemon_a_build_left_running_doesnt_keep_the_slot() {
     builds_without_waiting(&fx);
     // SAFETY: stopping the daemon this test started.
     unsafe { libc::kill(daemon, libc::SIGKILL) };
+}
+
+/// A repository whose crate depends on a crate outside it, as registry
+/// dependencies are, with seeding on and `extra` in its files.
+fn seeding_fixture(extra: &[(&str, &str)]) -> Fixture {
+    let fx = Fixture::new(&format!("seed = true\nreal-cargo = {:?}\n", test_cargo()));
+    let helper = fx.root.join("shared/helper");
+    fs::create_dir_all(helper.join("src")).unwrap();
+    fs::write(
+        helper.join("Cargo.toml"),
+        "[package]\nname = \"helper\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(helper.join("src/lib.rs"), "pub fn answer() -> u32 { 42 }\n").unwrap();
+    let manifest = fx.repo.join("Cargo.toml");
+    let mut text = fs::read_to_string(&manifest).unwrap();
+    text.push_str("\n[dependencies]\nhelper = { path = \"../shared/helper\" }\n");
+    fs::write(&manifest, text).unwrap();
+    for (name, contents) in extra {
+        let path = fx.repo.join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+    git(&fx.repo, &["add", "."]);
+    git(&fx.repo, &["commit", "-qm", "depend on helper"]);
+    fx
+}
+
+/// `cargo build -v` through the proxy in `dir`; its output.
+fn build_verbose(fx: &Fixture, dir: &Path) -> String {
+    let out = fx.run(dir, &["build", "-v"]);
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+/// The proxy's `seed:` line for a build in `dir`.
+fn seed_line(fx: &Fixture, dir: &Path) -> String {
+    let out = stdout(&fx.steward(dir, &["shim", "explain"]));
+    out.lines()
+        .find(|l| l.starts_with("seed:"))
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// Agents often build only in worktrees: a new worktree's target directory
+/// starts as a clone of another worktree's when the main checkout has never
+/// built, and cargo finds the dependencies fresh there.
+#[test]
+fn seeds_a_new_worktree_from_another_worktree() {
+    let fx = seeding_fixture(&[]);
+    let ns = fx.targets.join(fx.repo_ns());
+    git(&fx.repo, &["worktree", "add", "-q", "../wt-a"]);
+    let a = fx.root.join("wt-a");
+    assert!(seed_line(&fx, &a).contains("no: no other worktree has built"));
+    let cold = build_verbose(&fx, &a);
+    assert!(cold.contains("Compiling helper"), "{cold}");
+
+    git(&fx.repo, &["worktree", "add", "-q", "../wt-b"]);
+    let b = fx.root.join("wt-b");
+    let line = seed_line(&fx, &b);
+    assert!(
+        line.starts_with(&format!(
+            "seed:         yes, from {} (worktree wt-a, last used ",
+            ns.join("wt-a").display()
+        )),
+        "{line}"
+    );
+    let warm = build_verbose(&fx, &b);
+    if !cfg!(target_os = "macos") && warm.contains("Compiling helper") {
+        // This filesystem can't clone: a cold build, as without seeding.
+        return;
+    }
+    assert!(warm.contains("Fresh helper"), "{warm}");
+    assert!(ns.join("wt-b/debug").is_dir());
+    let names: Vec<String> = fs::read_dir(&ns)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(names.iter().all(|n| !n.contains("steward")), "{names:?}");
+    assert!(seed_line(&fx, &b).contains("no: the target dir already has files"));
+}
+
+/// With `build.build-dir` set, intermediate artifacts live outside the
+/// target directory the proxy routes: the new worktree's build-dir starts
+/// as a clone of the same worktree's that its target directory comes from.
+#[test]
+fn seeds_a_new_worktrees_build_dir_too() {
+    let fx = seeding_fixture(&[
+        (".cargo/config.toml", "[build]\nbuild-dir = \"bdir\"\n"),
+        (".gitignore", "/target\n/bdir\n"),
+    ]);
+    git(&fx.repo, &["worktree", "add", "-q", "../wt-a"]);
+    let a = fx.root.join("wt-a");
+    let out = fx.metadata(&a, &[]).output().unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    if json["build_directory"].as_str().map(PathBuf::from) != Some(a.join("bdir")) {
+        // A cargo too old to report its build directory.
+        return;
+    }
+    build_verbose(&fx, &a);
+    assert!(a.join("bdir").is_dir());
+
+    git(&fx.repo, &["worktree", "add", "-q", "../wt-b"]);
+    let b = fx.root.join("wt-b");
+    let warm = build_verbose(&fx, &b);
+    if !cfg!(target_os = "macos") && warm.contains("Compiling helper") {
+        return;
+    }
+    assert!(warm.contains("Fresh helper"), "{warm}");
+    assert!(b.join("bdir/debug").is_dir());
+    let out = fx.proxy(&b, &["run", "-q"]).output().unwrap();
+    assert!(out.status.success(), "{out:?}");
 }

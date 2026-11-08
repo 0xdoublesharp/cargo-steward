@@ -14,6 +14,8 @@ use serde::Serialize;
 use super::{Plan, gate, is_empty, real_cargo, settings, slot_dir, this_exe};
 use crate::config::{self, Paths};
 use crate::json;
+use crate::ledger;
+use crate::seed::{self, baseline, baseline::Preview};
 
 #[derive(Debug, clap::Subcommand)]
 pub enum ShimCommand {
@@ -265,32 +267,56 @@ struct Planned {
     seed: Seed,
 }
 
-/// Whether a build here starts its target dir as a clone of the main
-/// checkout's, and if not, why not.
+/// Whether a build here starts its target dir as a clone of another
+/// checkout's build, from which, and if not, why not.
 #[derive(Debug, Clone, PartialEq)]
 enum Seed {
     Off,
     NothingRouted,
     TargetHasFiles,
+    /// No other worktree has built under the namespace directory yet.
     SourceMissing(PathBuf),
-    Yes(PathBuf),
+    /// From this build directory, and why it's the one.
+    Yes {
+        from: PathBuf,
+        why: String,
+    },
+    /// Builds hold every candidate; seeding waits for one.
+    AllBusy,
     NotLinked,
 }
 
 impl Seed {
-    fn of(config: &config::Config, plan: &Plan) -> Seed {
+    fn of(config: &config::Config, paths: Option<&Paths>, plan: &Plan) -> Seed {
         if !config.seed {
-            Seed::Off
-        } else if plan.skip.is_some() || plan.target.is_none() {
-            Seed::NothingRouted
-        } else if let Some(from) = &plan.seed_from {
-            match &plan.target {
-                Some(target) if !is_empty(target) => Seed::TargetHasFiles,
-                _ if !from.is_dir() => Seed::SourceMissing(from.clone()),
-                _ => Seed::Yes(from.clone()),
+            return Seed::Off;
+        }
+        if plan.skip.is_some() || plan.target.is_none() {
+            return Seed::NothingRouted;
+        }
+        let (Some(target), Some(namespace)) = (&plan.target, &plan.seed_from) else {
+            return Seed::NotLinked;
+        };
+        if !is_empty(target) {
+            return Seed::TargetHasFiles;
+        }
+        let registry = paths.map(ledger::peek).unwrap_or_default();
+        let candidates = baseline::namespace_candidates(namespace, &plan.namespace.key, &registry);
+        match baseline::preview(target, &candidates) {
+            Preview::Nothing => Seed::SourceMissing(namespace.clone()),
+            Preview::Ready { pick, busy } => {
+                let mut why = candidates[pick].about();
+                if !busy.is_empty() {
+                    let labels: Vec<&str> =
+                        busy.iter().map(|&i| candidates[i].label.as_str()).collect();
+                    why.push_str(&format!("; busy: {}", labels.join(", ")));
+                }
+                Seed::Yes {
+                    from: candidates[pick].dir.clone(),
+                    why,
+                }
             }
-        } else {
-            Seed::NotLinked
+            Preview::AllBusy => Seed::AllBusy,
         }
     }
 
@@ -300,8 +326,16 @@ impl Seed {
             Seed::NothingRouted => "nothing_routed",
             Seed::TargetHasFiles => "target_not_empty",
             Seed::SourceMissing(_) => "source_missing",
-            Seed::Yes(_) => "will_seed",
+            Seed::Yes { .. } => "will_seed",
+            Seed::AllBusy => "all_busy",
             Seed::NotLinked => "not_linked_worktree",
+        }
+    }
+
+    fn from(&self) -> Option<&Path> {
+        match self {
+            Seed::Yes { from, .. } => Some(from),
+            _ => None,
         }
     }
 
@@ -310,8 +344,15 @@ impl Seed {
             Seed::Off => "off".into(),
             Seed::NothingRouted => "no: nothing routed".into(),
             Seed::TargetHasFiles => "no: the target dir already has files".into(),
-            Seed::SourceMissing(from) => format!("no: {} doesn't exist yet", from.display()),
-            Seed::Yes(from) => format!("yes, from {}", from.display()),
+            Seed::SourceMissing(namespace) => format!(
+                "no: no other worktree has built in {} yet",
+                namespace.display()
+            ),
+            Seed::Yes { from, why } => format!("yes, from {} ({why})", from.display()),
+            Seed::AllBusy => format!(
+                "not now: builds are using every build to seed from; it waits up to {} s for one",
+                seed::LOCK_WAIT.as_secs()
+            ),
             Seed::NotLinked => "no: only builds in a linked worktree are seeded".into(),
         }
     }
@@ -359,7 +400,7 @@ impl Explanation {
         let cwd = env::current_dir()?;
         let plan = Plan::new(&config, &cwd, &args)
             .map(|plan| Planned {
-                seed: Seed::of(&config, &plan),
+                seed: Seed::of(&config, paths.as_ref(), &plan),
                 plan,
             })
             .map_err(|e| format!("{e:#}"));
@@ -466,8 +507,8 @@ impl Explanation {
             tmp_dir: plan.map(|p| RoutedDoc::of(p, &p.tmp, "tmp-root")),
             seed: planned.map(|p| SeedDoc {
                 status: p.seed.id(),
-                will_seed: matches!(p.seed, Seed::Yes(_)),
-                from: p.plan.seed_from.as_deref().map(json::path),
+                will_seed: matches!(p.seed, Seed::Yes { .. }),
+                from: p.seed.from().map(json::path),
                 message: p.seed.describe(),
             }),
             route: self.route.as_deref().map(json::path),
@@ -571,11 +612,11 @@ impl RoutedDoc {
 
 #[derive(Serialize)]
 struct SeedDoc {
-    /// "will_seed", "off", "nothing_routed", "target_not_empty",
-    /// "source_missing" or "not_linked_worktree".
+    /// "will_seed", "all_busy", "off", "nothing_routed",
+    /// "target_not_empty", "source_missing" or "not_linked_worktree".
     status: &'static str,
     will_seed: bool,
-    /// The main checkout's target dir, for a linked worktree.
+    /// The build directory it would clone, when it will seed.
     from: Option<String>,
     message: String,
 }

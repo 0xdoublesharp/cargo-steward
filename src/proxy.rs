@@ -11,7 +11,7 @@
 mod gate;
 mod hold;
 mod real;
-mod route;
+pub(crate) mod route;
 mod shim;
 
 use std::env;
@@ -249,8 +249,9 @@ pub struct Plan {
     pub target: Option<PathBuf>,
     /// `TMPDIR`, `TMP` and `TEMP`, when `tmp-root` is set.
     pub tmp: Option<PathBuf>,
-    /// For a build in a linked worktree with `seed` on: the main checkout's
-    /// target directory, to seed a new one from.
+    /// For a build in a linked worktree with `seed` on: the repository's
+    /// namespace directory (`<target-root>/<repo>-<hash>`), whose other
+    /// target directories a new one is seeded from.
     pub seed_from: Option<PathBuf>,
     /// The build limit that applies, and which set of slots it counts.
     pub max_builds: Option<u32>,
@@ -319,7 +320,7 @@ impl Plan {
                     && git.worktree.is_some()
                     && gate::is_build(args) =>
             {
-                Some(r.join(&namespace.repo).join("main"))
+                Some(r.join(&namespace.repo))
             }
             _ => None,
         };
@@ -416,11 +417,10 @@ fn route_env(plan: &Plan, me: Option<&Path>) -> Result<Vec<(OsString, OsString)>
         let fresh = is_empty(target);
         fs::create_dir_all(target)?;
         if fresh
-            && let (Some(from), Some(git), Some(me)) = (&plan.seed_from, &plan.namespace.git, me)
-            && let Some(worktree) = &git.worktree
-            && from.is_dir()
+            && let (Some(namespace), Some(me)) = (&plan.seed_from, me)
+            && crate::seed::baseline::has_namespace_candidates(namespace, &plan.namespace.key)
         {
-            seed(me, target, from, worktree);
+            seed(me, target, &plan.dir);
         }
         if plan.link_target {
             link_workspace_target(&plan.dir, target, plan.namespace.git.is_some());
@@ -489,17 +489,17 @@ fn is_empty(dir: &Path) -> bool {
     }
 }
 
-/// Runs `cargo-steward seed` for a new worktree's target directory and
-/// waits for it. Best effort: a failed seed only means a cold build.
-fn seed(me: &Path, target: &Path, from: &Path, worktree: &Path) {
+/// Runs `cargo-steward seed` for a new worktree's target directory (and
+/// its build-dir, when `build.build-dir` sets one) and waits for it. `seed`
+/// picks the directory to clone. Best effort: a failed seed only means a
+/// cold build.
+fn seed(me: &Path, target: &Path, dir: &Path) {
     let _ = Command::new(me)
         .arg("seed")
         .arg("--target-dir")
         .arg(target)
-        .arg("--from")
-        .arg(from)
         .arg("--worktree")
-        .arg(worktree)
+        .arg(dir)
         .arg("--quiet")
         .stdin(Stdio::null())
         // Cargo's stdout may be machine-read (`--message-format json`).
@@ -976,7 +976,7 @@ mod tests {
     }
 
     #[test]
-    fn a_new_linked_worktree_is_seeded_from_main() {
+    fn a_new_linked_worktree_is_seeded_from_another() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().canonicalize().unwrap();
@@ -1006,24 +1006,34 @@ mod tests {
         };
         let build = os(&["build"]);
         let plan = Plan::new(&config, &wt, &build).unwrap();
-        let from = plan.seed_from.clone().unwrap();
-        assert!(from.ends_with("main"));
+        let namespace = plan.seed_from.clone().unwrap();
+        let target = plan.target.clone().unwrap();
+        assert_eq!(target.parent(), Some(namespace.as_path()));
 
-        // Main hasn't built yet: nothing to seed from.
+        // No other worktree has built yet: nothing to seed from, not even
+        // the target dir the proxy just made, or a clone being made.
         let vars = vars_of(&config, None, Ok(wt.clone()), &build, Some(&me));
         assert!(var(&vars, "CARGO_TARGET_DIR").is_some());
-        assert!(!log.exists());
-
-        // Main has built, and the worktree's target dir is new: seeded once.
-        fs::create_dir_all(&from).unwrap();
-        let target = plan.target.clone().unwrap();
+        fs::create_dir_all(namespace.join(".other.steward-seed-1")).unwrap();
         fs::remove_dir(&target).unwrap();
         vars_of(&config, None, Ok(wt.clone()), &build, Some(&me));
+        assert!(!log.exists());
+
+        // Another worktree has built (not necessarily the main checkout),
+        // and this one's target dir is new: seeded once.
+        fs::create_dir_all(namespace.join("other")).unwrap();
+        fs::create_dir_all(wt.join("src")).unwrap();
+        fs::remove_dir(&target).unwrap();
+        vars_of(&config, None, Ok(wt.join("src")), &build, Some(&me));
         let logged = fs::read_to_string(&log).unwrap();
-        assert!(logged.starts_with("seed --target-dir "), "{logged}");
-        assert!(logged.contains(&format!("--from {}", from.display())));
-        assert!(logged.contains(&format!("--worktree {}", wt.display())));
-        assert!(logged.trim_end().ends_with("--quiet"));
+        assert_eq!(
+            logged.trim_end(),
+            format!(
+                "seed --target-dir {} --worktree {} --quiet",
+                target.display(),
+                wt.join("src").display()
+            )
+        );
 
         // A target dir with files isn't seeded again.
         fs::write(target.join("keep"), "").unwrap();

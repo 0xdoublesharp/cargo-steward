@@ -463,11 +463,20 @@ fn gc_json_lists_removals_kept_dirs_and_the_space_freed() {
     let idle = fx.build_dir("idle", 60 * DAY);
     // A program running from a build dir keeps it.
     let busy = fx.build_dir("busy", 60 * DAY);
+    // A copy of this test binary, kept running by `sleeper` (a copied system
+    // binary such as `sleep` can be killed on start by code-signing policy).
     let program = busy.join("debug/sleeper");
-    fs::copy("/bin/sleep", &program).unwrap();
+    fs::copy(std::env::current_exe().unwrap(), &program).unwrap();
     age(&busy, 60 * DAY);
-    let mut child = Command::new(&program).arg("60").spawn().unwrap();
+    let mut child = Command::new(&program)
+        .args(["--exact", "sleeper", "--test-threads=1", "-q"])
+        .env(SLEEP_VAR, "1")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
     std::thread::sleep(Duration::from_millis(200));
+    assert!(child.try_wait().unwrap().is_none(), "the copy didn't start");
 
     let (preview, _) = fx.steward_json(&["gc"]);
     let (applied, _) = fx.steward_json(&["gc", "--apply"]);
@@ -633,4 +642,16 @@ fn dedup_json_lists_each_group_of_identical_files() {
     assert_eq!(doc["applied"], true, "{doc}");
     assert_eq!(doc["files"], 2, "{doc}");
     assert!(doc["freed_on_disk_bytes"].is_i64(), "{doc}");
+}
+
+/// Set for a copy of this test binary started as [`sleeper`]'s program.
+const SLEEP_VAR: &str = "CARGO_STEWARD_TEST_SLEEP";
+
+/// Does nothing in a normal run. Started with [`SLEEP_VAR`] set, it is a
+/// program that keeps running until killed.
+#[test]
+fn sleeper() {
+    if std::env::var_os(SLEEP_VAR).is_some() {
+        std::thread::sleep(Duration::from_secs(120));
+    }
 }

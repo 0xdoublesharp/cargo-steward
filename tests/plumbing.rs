@@ -606,19 +606,51 @@ fn explain_describes_worktrees_and_seeding() {
 
     let out = explain(&wt, &[]);
     assert!(out.contains("(linked worktree; git dir "), "{out}");
-    assert!(out.contains("doesn't exist yet"), "{out}");
     let seed_line = out.lines().find(|l| l.starts_with("seed:")).unwrap();
-    let from = seed_line
-        .trim_start_matches("seed:         no: ")
-        .trim_end_matches(" doesn't exist yet");
-    fs::create_dir_all(from).unwrap();
-    let out = explain(&wt, &[]);
-    assert!(
-        out.contains(&format!("seed:         yes, from {from}")),
-        "{out}"
-    );
+    let namespace = seed_line
+        .strip_prefix("seed:         no: no other worktree has built in ")
+        .and_then(|rest| rest.strip_suffix(" yet"))
+        .unwrap_or_else(|| panic!("{out}"));
     let target_line = out.lines().find(|l| l.starts_with("target dir:")).unwrap();
     let target = target_line.trim_start_matches("target dir:   ");
+    assert_eq!(Path::new(target).parent(), Some(Path::new(namespace)));
+
+    // A build directory in the namespace, as cargo leaves one.
+    let built = |key: &str| {
+        let dir = Path::new(namespace).join(key);
+        fs::create_dir_all(dir.join("debug/.fingerprint")).unwrap();
+        fs::write(dir.join(".rustc_info.json"), "{}").unwrap();
+        dir
+    };
+    let main = built("main");
+    let out = explain(&wt, &[]);
+    assert!(
+        out.contains(&format!(
+            "seed:         yes, from {} (the main checkout)",
+            main.display()
+        )),
+        "{out}"
+    );
+    // A build is using the main checkout's: another worktree's is used.
+    let other = built("other");
+    let lock = fs::File::create(main.join("debug/.cargo-lock")).unwrap();
+    lock.lock().unwrap();
+    let out = explain(&wt, &[]);
+    assert!(
+        out.contains(&format!(
+            "seed:         yes, from {} (worktree other, last used 0m ago; busy: the main checkout)",
+            other.display()
+        )),
+        "{out}"
+    );
+    let lock_other = fs::File::create(other.join("debug/.cargo-lock")).unwrap();
+    lock_other.lock().unwrap();
+    let out = explain(&wt, &[]);
+    assert!(
+        out.contains("seed:         not now: builds are using every build to seed from"),
+        "{out}"
+    );
+    drop((lock, lock_other));
     fs::create_dir_all(target).unwrap();
     fs::write(Path::new(target).join("x"), "").unwrap();
     let out = explain(&wt, &[]);
@@ -732,13 +764,18 @@ fn explain_json_says_whether_a_worktree_seeds() {
     assert_eq!(doc["checkout"]["linked"], true, "{doc}");
     assert_eq!(doc["seed"]["status"], "source_missing", "{doc}");
     assert_eq!(doc["seed"]["will_seed"], false, "{doc}");
-    let from = doc["seed"]["from"].as_str().unwrap().to_owned();
-    fs::create_dir_all(&from).unwrap();
+    assert_eq!(doc["seed"]["from"], serde_json::Value::Null, "{doc}");
+    // Once the main checkout has built, a new worktree starts from it.
+    let repo_ns = doc["namespace"]["repo"].as_str().unwrap().to_owned();
+    let main = targets.join(&repo_ns).join("main");
+    fs::create_dir_all(main.join("debug/.fingerprint")).unwrap();
+    let from = main.display().to_string();
     let doc = env.explain_json(&wt, &[]);
     assert_eq!(doc["seed"]["status"], "will_seed", "{doc}");
     assert_eq!(doc["seed"]["will_seed"], true, "{doc}");
     assert_eq!(doc["seed"]["from"], from, "{doc}");
-    assert_eq!(doc["seed"]["message"], format!("yes, from {from}"));
+    let message = doc["seed"]["message"].as_str().unwrap();
+    assert!(message.starts_with(&format!("yes, from {from} (")), "{doc}");
 
     // A target dir on the command line wins over routing.
     let doc = env.explain_json(&wt, &["build", "--target-dir", "/x"]);

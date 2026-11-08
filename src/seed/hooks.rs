@@ -126,7 +126,7 @@ fn script(exe: &str, chained: &Path) -> String {
         r#"#!/bin/sh
 {MARKER}
 # (`cargo steward hooks`). When git creates a worktree, start its build
-# directory as a copy-on-write clone of the main worktree's. Never fails git.
+# directory as a copy-on-write clone of another worktree's. Never fails git.
 # `cargo steward hooks uninstall` removes this and restores {CHAINED}.
 status=0
 if [ -x {chained} ]; then

@@ -4,9 +4,10 @@ A new git worktree normally starts with an empty build directory and compiles
 every dependency from scratch, then keeps its own full copy of each. On a
 filesystem with copy-on-write clones, cargo-steward avoids both:
 
-- **`seed`** starts a new worktree's build directory as a clone of the main
-  worktree's. The clone takes well under a second and no disk space, and cargo
-  finds the dependencies already built.
+- **`seed`** starts a new worktree's build directory as a clone of another
+  worktree's: the main checkout's, or another worktree's when the main
+  checkout has no build or a build is using it. The clone takes well under a
+  second and no disk space, and cargo finds the dependencies already built.
 - **`hooks`** installs a git hook that seeds each new worktree as git creates
   it.
 - **`dedup`** finds files that are byte-for-byte identical across build
@@ -24,28 +25,62 @@ to copying bytes.
 cargo steward seed [--target-dir DIR] [--from DIR] [--worktree DIR] [--quiet]
 ```
 
-Clones the main worktree's build directory into this worktree's, if this one
-hasn't built anything yet.
+Clones another worktree's build directory into this worktree's, if this one
+hasn't built anything yet, and prints which one it used:
+
+```
+Seeded /src/app-fix/target from /src/app-docs/target (worktree app-docs, last used 4m ago; busy: the main checkout; 0.31 s, copy-on-write)
+```
 
 | Option | Default |
 |---|---|
 | `--worktree DIR` | The current directory |
-| `--target-dir DIR` | The worktree's build directory, as `cargo metadata` reports it there (so `CARGO_TARGET_DIR`, `build.target-dir` and `build.build-dir` are respected) |
-| `--from DIR` | The build directory of the repository's main worktree, found the same way |
+| `--target-dir DIR` | The worktree's target directory, as `cargo metadata` reports it there (so `CARGO_TARGET_DIR`, `build.target-dir` and `build.build-dir` are respected) |
+| `--from DIR` | The best of the repository's other worktrees' build directories (below) |
 | `--quiet` | Print nothing |
 
-With `build.build-dir` set, both the build directory and the target directory
-(final artifacts) are seeded.
+`--from` can be given more than once. The first is used unless a build is
+using it, then the most recently used of the others.
+
+With `build.build-dir` set, the worktree's build directory (intermediate
+artifacts) is seeded from another worktree's build directory, and its target
+directory (final artifacts) from the same worktree's target directory.
+
+### Which build it clones
+
+The candidates are the build directories of the main checkout and of each of
+the repository's other worktrees (`git worktree list`). Each is found without
+running cargo there:
+
+- A build directory inside the worktree (`target/`, or a relative
+  `build.target-dir` or `build.build-dir`) is at the same place in every
+  other worktree.
+- Under the [`cargo` proxy](proxy.md), every worktree's target directory is
+  in the repository's directory under `target-root`, including those of
+  worktrees since deleted.
+- Otherwise, the wrapper's records say which build directories each
+  worktree's packages compiled into.
+
+If none of these locates the main checkout's, `seed` runs `cargo metadata`
+there.
+
+The main checkout's build is used whenever it holds one and no build is using
+it. Otherwise the others are tried from the most recently used (by the
+wrapper's records, or the times cargo last wrote into each), skipping any
+that hold no build or are on another volume. A candidate a build is using
+gets half a second to come free before the next is tried; if builds are
+using all of them, they're tried in turn until 5 seconds have passed, and
+then the worktree builds cold.
 
 It does nothing, and exits 0, when:
 
 - `seed = false` is set in the settings;
 - the target already holds a build, or exists and isn't empty;
-- there is no build to clone from yet;
+- no other worktree has a build to clone from yet;
 - the target and the source are the same directory (for example, a shared
   `CARGO_TARGET_DIR`);
-- a build kept the source directory busy for 5 seconds;
-- the filesystem can't clone, or the two directories are on different volumes.
+- builds kept every source directory busy for 5 seconds;
+- the filesystem can't clone, or the directories are on different volumes.
 
 ### What cargo rebuilds afterwards
 
@@ -137,7 +172,7 @@ With `dedup = true` (the default), automatic cleanup also deduplicates.
 In `~/.cargo/steward/config.toml`:
 
 ```toml
-seed = true     # let `seed` (and the hook) clone build directories
+seed = true     # let `seed` (the hook and the proxy) clone build directories
 dedup = true    # let automatic cleanup deduplicate build directories
 ```
 

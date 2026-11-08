@@ -252,9 +252,11 @@ directory. Put `--json` before the cargo arguments:
 | `real_cargo` | string or null | the cargo the proxy runs; null when it can't find one |
 | `build_slot` | object | `{status, limit, dir, message}`, below |
 
-`seed.status` is one of `will_seed`, `off` (`seed = false`), `nothing_routed`,
-`target_not_empty`, `source_missing` (the main checkout's target dir, `from`,
-doesn't exist yet) or `not_linked_worktree`. `build_slot.status` is one of
+`seed.status` is one of `will_seed` (`from` is the build directory it clones),
+`all_busy` (builds hold every build it could clone; seeding waits for one),
+`off` (`seed = false`), `nothing_routed`, `target_not_empty`, `source_missing`
+(no other checkout of the repository has built yet) or `not_linked_worktree`.
+`from` is null unless it will seed. `build_slot.status` is one of
 `takes_slot` (with `limit` and the slot directory `dir`), `no_limit`
 (`max-builds` isn't set) or `not_a_build`.
 
@@ -283,7 +285,7 @@ doesn't exist yet) or `not_linked_worktree`. `build_slot.status` is one of
     "status": "will_seed",
     "will_seed": true,
     "from": "/Volumes/Scratch/cargo/app-3f9a1c0b2e/main",
-    "message": "yes, from /Volumes/Scratch/cargo/app-3f9a1c0b2e/main"
+    "message": "yes, from /Volumes/Scratch/cargo/app-3f9a1c0b2e/main (the main checkout, last used 2h ago)"
   },
   "route": null,
   "real_cargo": "/Users/me/.cargo/bin/cargo",

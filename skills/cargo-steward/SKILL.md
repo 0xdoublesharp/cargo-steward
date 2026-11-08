@@ -59,7 +59,7 @@ ids for kinds and statuses. Read that instead of parsing the text.
    repository's tree when the project keeps them there (for example
    `<repo>/.worktrees/<name>`). A worktree outside the tree misses the
    project's `.cargo/config.toml`, so it builds with different settings,
-   can't start from the main checkout's build, and recompiles everything.
+   can't start from another checkout's build, and recompiles everything.
    After creating one, `cargo steward shim explain --json` (in it) should
    report `"seed": {"status": "will_seed", ...}`.
 4. **Retire a worktree's build output with it.** Before deleting a worktree
@@ -124,7 +124,7 @@ on the target directory you know. If it's low, run
 | `cargo steward remove (--worktree DIR \| BUILD_DIR...) [--apply] [--json]` | Remove whole build directories safely |
 | `cargo steward pin DIR` / `unpin DIR` | Keep, or stop keeping, a build directory |
 | `cargo steward dedup [--apply] [--json]` | Share identical files across build directories |
-| `cargo steward seed --worktree DIR` | Start a worktree's build directory from the main checkout's |
+| `cargo steward seed --worktree DIR` | Start a worktree's build directory from the main checkout's, or the most recently used idle worktree's |
 | `cargo steward hooks install\|status` | Seed every new worktree of a repository (git hook) |
 | `cargo steward shim explain [--json] [-- ARGS]` | Where a build here goes, which route applies, whether it seeds, free space there |
 | `cargo steward ci start\|trim` | Trim a CI job's build output to what it used |

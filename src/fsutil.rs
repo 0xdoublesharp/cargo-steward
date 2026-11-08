@@ -235,6 +235,10 @@ pub enum Lock {
     Busy,
 }
 
+/// The lock files cargo keeps in a profile directory, as [`lock_profile`]
+/// takes them.
+pub const LOCK_FILES: [&str; 3] = [".cargo-build-lock", ".cargo-artifact-lock", ".cargo-lock"];
+
 /// Takes every lock cargo uses on a profile directory without waiting.
 ///
 /// Cargo before 1.96 holds `.cargo-lock` exclusively while it builds. Later
@@ -244,7 +248,7 @@ pub enum Lock {
 /// them exclusively excludes every version.
 pub fn lock_profile(profile: &Path) -> Lock {
     let mut held = Vec::new();
-    for name in [".cargo-build-lock", ".cargo-artifact-lock", ".cargo-lock"] {
+    for name in LOCK_FILES {
         let Ok(file) = OpenOptions::new()
             .read(true)
             .write(true)
