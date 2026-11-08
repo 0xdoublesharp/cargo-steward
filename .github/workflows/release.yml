@@ -1,8 +1,14 @@
 name: Release
 
-# Builds a binary per platform on a native runner when a `v*` tag is pushed,
-# and attaches `cargo-steward-<target>.tar.gz` and its `.sha256` to the
-# GitHub release, which `scripts/install.sh --release` downloads.
+# When a `v*` tag is pushed: builds a binary per platform on a native runner,
+# publishes the crate to crates.io, and attaches
+# `cargo-steward-<target>.tar.gz` and its `.sha256` to the GitHub release,
+# which `scripts/install.sh --release` downloads.
+#
+# crates.io trusts this workflow (Trusted Publishing): the crate's settings
+# there name repository `0xdoublesharp/cargo-steward`, workflow `release.yml`
+# and environment `release`, and the job exchanges GitHub's OIDC token for a
+# short-lived publish token. No API token is stored in the repository.
 
 on:
   push:
@@ -62,9 +68,39 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  release:
-    name: Publish
+  crate:
+    name: Publish to crates.io
     needs: build
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - name: Check whether this version is on crates.io already
+        id: published
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          status=$(curl -s -o /dev/null -w '%{http_code}' \
+            -A "cargo-steward release workflow" \
+            "https://crates.io/api/v1/crates/cargo-steward/$version")
+          if [ "$status" = 200 ]; then
+            echo "cargo-steward $version is on crates.io already"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: rust-lang/crates-io-auth-action@v1
+        if: steps.published.outputs.skip != 'true'
+        id: auth
+      - run: cargo publish --locked
+        if: steps.published.outputs.skip != 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+  release:
+    name: GitHub release
+    needs: [build, crate]
     runs-on: ubuntu-latest
     permissions:
       contents: write
