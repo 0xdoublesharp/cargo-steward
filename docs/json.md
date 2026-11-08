@@ -88,7 +88,7 @@ fields that only one of them fills are empty in the other's.
 
 | Field | Type | |
 |---|---|---|
-| `command` | string | `"gc"` or `"remove"` |
+| `command` | string | `"gc"`, `"remove"`, or `"remove --orphaned"` |
 | `applied` | bool | `--apply`: removed; otherwise a preview |
 | `busy` | bool | `gc --apply` found another cleanup running and did nothing |
 | `worktrees` | array | `remove --worktree`: `{worktree, build_dir, exists}` per worktree; a `build_dir` that doesn't exist has nothing to remove |
@@ -120,6 +120,7 @@ Kind ids, cheapest to rebuild first:
 | `low_space` | build directories removed because a disk was low on space |
 | `requested` | build directories `remove` was asked to remove |
 | `routed_tmp` | the TMPDIRs the `cargo` proxy routed for removed build directories |
+| `leftover_tmp` | TMPDIRs the proxy routed whose build directory was already gone |
 
 ```json
 {

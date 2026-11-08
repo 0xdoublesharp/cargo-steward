@@ -71,8 +71,9 @@ ids for kinds and statuses. Read that instead of parsing the text.
    git worktree remove <path>
    ```
 
-   If the worktree is already gone, cleanup removes its build directory a
-   couple of days later on its own. Never remove build directories, or
+   If the worktree is already gone, cleanup removes its build directory on
+   its own: right away once `git worktree remove` (or `prune`) has removed
+   it, otherwise a couple of days later. Never remove build directories, or
    worktrees, that another task or person owns.
 5. **Protect a build directory a long run depends on** (a benchmark baseline,
    a node under test) with `cargo steward pin <build dir>`, and
@@ -121,7 +122,7 @@ on the target directory you know. If it's low, run
 | `cargo steward doctor [--json]` | Check the setup; says what to change |
 | `cargo steward status [--sizes] [--json]` | Build directories, last use, layout, size, unshared size |
 | `cargo steward gc [--apply] [-v] [--json]` | Preview, or run, a cleanup |
-| `cargo steward remove (--worktree DIR \| BUILD_DIR...) [--apply] [--json]` | Remove whole build directories safely |
+| `cargo steward remove (--worktree DIR \| BUILD_DIR... \| --orphaned) [--apply] [--json]` | Remove whole build directories safely; `--orphaned`: every one whose worktrees were deleted |
 | `cargo steward pin DIR` / `unpin DIR` | Keep, or stop keeping, a build directory |
 | `cargo steward dedup [--apply] [--json]` | Share identical files across build directories |
 | `cargo steward seed --worktree DIR` | Start a worktree's build directory from the main checkout's, or the most recently used idle worktree's |

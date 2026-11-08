@@ -106,6 +106,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   last used: `gc` goes by the saved times, and the next `ci start` (or
   `ci trim`) puts them back.
 
+### Changed
+
+- Cleanup lists each profile's units, incremental caches and fingerprints
+  once, when it inspects the build directory, and checks again under cargo's
+  locks only what it is about to remove; it reads fingerprints to find the
+  units builds still need only when some unit is idle enough to go. On 40
+  build directories, a cleanup that removes nothing takes about a third of
+  the time it did.
+- The deduplication after each automatic cleanup looks only at files
+  created or replaced since its last pass (recorded in `dedup.stamp` in the
+  steward home) and at the files at the same path in the other build
+  directories, instead of reading every build directory again;
+  `cargo steward dedup` still looks at every file, and reads build
+  directories in parallel.
+- While a disk is below `min-free` and cleanups free nothing on it, the
+  wrapper waits longer before starting the next (5 minutes, doubling up to
+  `gc-interval`), instead of starting one every 5 minutes; the wait resets
+  once a cleanup frees space or the disk recovers.
+
 ### Added
 
 - `--json` for `status`, `gc`, `remove`, `dedup`, `doctor` and
@@ -117,6 +136,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   many compiles run at once, machine-wide. The wrapper holds one of N lock
   file slots for as long as rustc runs, so concurrent builds from many
   worktrees stop oversubscribing CPU and memory. `doctor` shows the limit.
+- Cleanup removes the build directory of a deleted worktree at once, without
+  waiting out `orphan-grace`, when git confirms it: every workspace that built
+  there was in a linked worktree whose admin directory git has removed. The
+  wrapper records each workspace's worktree in the ledger for this; older
+  ledgers and registries still read, and their directories keep the grace.
+- `cargo steward remove --orphaned [--apply]` previews, then removes, every
+  build directory whose recorded workspaces were all deleted, without waiting
+  out `orphan-grace`, with the TMPDIRs the proxy routed for them. It takes
+  cargo's locks and keeps directories a program runs from, as `remove` does;
+  pinned ones need `--force`.
+- Cleanup removes TMPDIRs the proxy routed (`<tmp-root>/<repo>/<worktree>`,
+  under each configured `tmp-root`) whose build directory is gone, once
+  nothing in them has changed for `orphan-grace`, such as those of worktrees
+  deleted before cleanup removed them along with the build directory.
 - `link-target` setting for the `cargo` proxy: when it routes a workspace's
   build output, it also points a missing `<workspace>/target` at the routed
   directory (only where git ignores `target`), so `./target` paths and builds

@@ -47,9 +47,21 @@ impl Paths {
         self.home.join("gc.stamp")
     }
 
+    /// How long to wait after a cleanup before low free space starts
+    /// another, while cleanups free nothing (seconds).
+    pub fn gc_backoff(&self) -> PathBuf {
+        self.home.join("gc.backoff")
+    }
+
     /// Held by the running cleanup so only one runs at a time.
     pub fn gc_lock(&self) -> PathBuf {
         self.home.join("gc.lock")
+    }
+
+    /// When the last applied deduplication started: the next one after a
+    /// cleanup only looks at what changed since.
+    pub fn dedup_stamp(&self) -> PathBuf {
+        self.home.join("dedup.stamp")
     }
 
     /// Output of automatic cleanups.

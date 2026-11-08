@@ -16,6 +16,9 @@ For each `cargo ...` it:
    its own directory under it.
 2. **Routes temporary files.** With `tmp-root` set, it sets `TMPDIR` (with
    a trailing slash), `TMP` and `TEMP` to `<tmp-root>/<repo>-<hash>/<worktree>`.
+   Cleanup removes that directory with the worktree's build directory, and
+   one whose build directory is gone otherwise once nothing in it has
+   changed for `orphan-grace`.
 3. **Seeds new worktrees.** When a build runs in a linked worktree whose
    target directory is new or empty, and another checkout of the repository
    has a target directory in `<target-root>/<repo>-<hash>/`, it first runs

@@ -321,6 +321,20 @@ fn gc_apply_shares_duplicates_across_the_dirs_it_keeps() {
         "{out}"
     );
     assert!(a.exists() && b.exists(), "{out}");
+    assert!(fx.home.join("dedup.stamp").exists());
+
+    // Nothing new: nothing to share. A new worktree's build of the same
+    // dependency: shared with the copies already there.
+    let out = fx.steward(&["gc", "--apply"]);
+    assert!(!out.contains("identical files"), "{out}");
+    let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    let c = fx.build_dir("c", Duration::ZERO);
+    fs::write(c.join("debug/deps/libdup-0123456789abcdef.rlib"), &data).unwrap();
+    let out = fx.steward(&["gc", "--apply"]);
+    assert!(
+        out.contains("identical files now shared across build dirs (2 files)"),
+        "{out}"
+    );
 }
 
 #[test]
@@ -654,4 +668,104 @@ fn sleeper() {
     if std::env::var_os(SLEEP_VAR).is_some() {
         std::thread::sleep(Duration::from_secs(120));
     }
+}
+
+/// Records `workspaces` as what built into `dir`.
+fn record(fx: &Fixture, entries: &[(&Path, &[PathBuf])]) {
+    let roots: Vec<String> = entries
+        .iter()
+        .map(|(dir, workspaces)| {
+            let list: Vec<String> = workspaces
+                .iter()
+                .map(|w| format!("{:?}", w.display().to_string()))
+                .collect();
+            format!(
+                "{:?}:{{\"last_used\":{},\"workspaces\":[{}],\"compile_ms\":0}}",
+                dir.display().to_string(),
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+                list.join(",")
+            )
+        })
+        .collect();
+    fs::write(
+        fx.home.join("registry.json"),
+        format!("{{\"roots\":{{{}}}}}", roots.join(",")),
+    )
+    .unwrap();
+}
+
+#[test]
+fn remove_orphaned_takes_every_dir_of_deleted_workspaces_now() {
+    let fx = Fixture::new("process-guard = false\n");
+    let settings = fs::read_to_string(fx.home.join("config.toml")).unwrap();
+    fs::write(
+        fx.home.join("config.toml"),
+        format!(
+            "{settings}target-root = {:?}\ntmp-root = {:?}\n",
+            fx.root.join("cargo").display().to_string(),
+            fx.root.join("tmp").display().to_string()
+        ),
+    )
+    .unwrap();
+    let orphan = fx.build_dir("cargo/repo-0123456789/gone", Duration::ZERO);
+    let tmp = fx.root.join("tmp/repo-0123456789/gone");
+    fs::create_dir_all(&tmp).unwrap();
+    fs::write(tmp.join("scratch"), "x").unwrap();
+    let pinned = fx.build_dir("pinned", Duration::ZERO);
+    fs::write(pinned.join(".cargo-steward-keep"), "").unwrap();
+    let live = fx.build_dir("live", Duration::ZERO);
+    let unknown = fx.build_dir("unknown", Duration::ZERO);
+    let deleted = [fx.root.join("deleted-worktree")];
+    let existing = [fx.root.clone()];
+    record(
+        &fx,
+        &[(&orphan, &deleted), (&pinned, &deleted), (&live, &existing)],
+    );
+
+    let preview = fx.steward(&["remove", "--orphaned"]);
+    assert!(preview.contains(&orphan.display().to_string()), "{preview}");
+    assert!(preview.contains(&tmp.display().to_string()), "{preview}");
+    assert!(preview.contains("pinned (use --force"), "{preview}");
+    assert!(
+        preview.contains("cargo steward remove --orphaned --apply"),
+        "{preview}"
+    );
+    assert!(orphan.exists() && tmp.exists());
+
+    let out = fx.steward(&["remove", "--orphaned", "--apply"]);
+    assert!(!orphan.exists() && !tmp.exists(), "{out}");
+    assert!(
+        pinned.exists() && live.exists() && unknown.exists(),
+        "{out}"
+    );
+    let registry = fs::read_to_string(fx.home.join("registry.json")).unwrap();
+    assert!(!registry.contains("gone"), "{registry}");
+
+    let out = fx.steward(&["remove", "--orphaned", "--apply", "--force"]);
+    assert!(!pinned.exists(), "{out}");
+    let out = fx.steward(&["remove", "--orphaned"]);
+    assert!(out.contains("Nothing to clean up."), "{out}");
+}
+
+#[test]
+fn low_space_cleanups_that_free_nothing_back_off() {
+    let fx = Fixture::new("dedup = false\nmin-free = \"1000000T\"\ntarget-free = \"1000000T\"\n");
+    // Used today: low space doesn't remove it, so the cleanup frees nothing.
+    let dir = fx.build_dir("target", Duration::ZERO);
+    fx.steward(&["gc", "--apply"]);
+    assert!(dir.exists());
+    let backoff = fx.home.join("gc.backoff");
+    assert_eq!(fs::read_to_string(&backoff).unwrap().trim(), "600");
+    fx.steward(&["gc", "--apply"]);
+    assert_eq!(fs::read_to_string(&backoff).unwrap().trim(), "1200");
+
+    // Space recovered: back to the shortest wait.
+    let config = fx.home.join("config.toml");
+    let settings = fs::read_to_string(&config).unwrap();
+    fs::write(&config, settings.replace("1000000T", "0")).unwrap();
+    fx.steward(&["gc", "--apply"]);
+    assert!(!backoff.exists());
 }

@@ -472,6 +472,7 @@ mod tests {
             last_used: secs,
             workspaces: workspaces.iter().map(PathBuf::from).collect(),
             compile_ms: 0,
+            ..RootInfo::default()
         };
         let mut registry = Registry::default();
         registry
@@ -621,6 +622,7 @@ mod tests {
                 last_used: 1,
                 workspaces: [a.clone()].into(),
                 compile_ms: 0,
+                ..RootInfo::default()
             },
         );
         let mine = Dirs::one(&root.join("cache/b-hash"));

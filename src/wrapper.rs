@@ -37,10 +37,6 @@ const TIMESTAMP_SLACK: Duration = Duration::from_secs(2);
 /// a build over a typo; `gc` reports the bad setting.
 const DEFAULT_OBJECT_GRACE: Duration = Duration::from_secs(600);
 
-/// After this long since the last cleanup, low free space triggers another
-/// even before `gc-interval` has passed.
-const LOW_SPACE_RECHECK: Duration = Duration::from_secs(300);
-
 pub fn run(argv: Vec<OsString>) -> ! {
     let paths = Paths::resolve();
     let config = settings(paths.as_ref());
@@ -380,13 +376,21 @@ fn after_compile(paths: &Paths, config: &Config, out_dir: &Path, took: Duration)
     let Some(root) = scan::find_root(out_dir) else {
         return;
     };
+    let workspace = env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from);
+    // A few stat calls up to the worktree's `.git`: lets cleanup ask git
+    // whether the worktree was removed, once it's gone.
+    let linked = workspace
+        .as_deref()
+        .and_then(crate::proxy::linked_worktree)
+        .map(|(admin, worktree)| ledger::Linked { admin, worktree });
     ledger::append(
         paths,
         &ledger::Record {
             ts: ledger::now_secs(),
             root,
-            workspace: env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from),
+            workspace,
             ms: took.as_millis().try_into().unwrap_or(u64::MAX),
+            linked,
         },
     );
     if config.auto_gc && gc_due(paths, config, out_dir) {
@@ -405,8 +409,11 @@ fn gc_due(paths: &Paths, config: &Config, out_dir: &Path) -> bool {
     match since {
         None => true,
         Some(age) if age >= policy.gc_interval => true,
+        // Low free space starts one sooner: after 5 minutes, or longer while
+        // cleanups have been freeing nothing.
         Some(age) => {
-            age >= LOW_SPACE_RECHECK
+            age >= gc::LOW_SPACE_RECHECK
+                && age >= gc::low_space_recheck(paths, &policy)
                 && crate::fsutil::free_space(out_dir).is_some_and(|free| free < policy.min_free)
         }
     }
@@ -862,6 +869,13 @@ mod tests {
         // Low on space and past the recheck: due.
         set_age(Duration::from_secs(400));
         assert!(gc_due(&paths, &config, tmp.path()));
+        // Unless cleanups have been freeing nothing: then it waits longer.
+        fs::write(paths.gc_backoff(), "1200\n").unwrap();
+        assert!(!gc_due(&paths, &config, tmp.path()));
+        set_age(Duration::from_secs(1300));
+        assert!(gc_due(&paths, &config, tmp.path()));
+        fs::remove_file(paths.gc_backoff()).unwrap();
+        set_age(Duration::from_secs(400));
         config.min_free = "0".into();
         assert!(!gc_due(&paths, &config, tmp.path()));
         // Past the interval: due.

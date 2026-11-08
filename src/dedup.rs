@@ -19,6 +19,7 @@ use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -75,11 +76,15 @@ pub fn run(apply: bool, verbose: bool, as_json: bool) -> Result<()> {
         println!("No build directories found yet.");
         return Ok(());
     }
+    let started = SystemTime::now();
     let summary = if dirs.is_empty() {
         Summary::default()
     } else {
-        dedup(&dirs, apply)?
+        dedup(&dirs, apply, None)?
     };
+    if apply && summary.busy == 0 {
+        record_pass(&paths, started);
+    }
     if as_json {
         return json::print(&Document::new(&summary, dirs.len(), apply));
     }
@@ -231,18 +236,57 @@ struct Candidate {
 /// data (pure clones of each other), or a single file.
 type Cluster = Vec<Candidate>;
 
+/// Deduplicates what changed in `dirs` since the last applied pass, as
+/// cleanup does after it runs: files created or replaced since then, and the
+/// files at the same place in the other build directories on their volume,
+/// where the same unit's outputs are ([`dedup`] with `since`). The first
+/// pass, with none recorded, is a full one. A pass that a build kept from
+/// replacing anything isn't recorded, so the next one looks again.
+pub fn after_cleanup(paths: &Paths, dirs: &[BuildDir]) -> Result<Summary> {
+    let started = SystemTime::now();
+    let summary = dedup(dirs, true, last_pass(paths))?;
+    if summary.busy == 0 {
+        record_pass(paths, started);
+    }
+    Ok(summary)
+}
+
+/// When the last applied pass started. `None` before the first, or when the
+/// record can't be read or is in the future (the clock went back).
+pub fn last_pass(paths: &Paths) -> Option<SystemTime> {
+    let secs: u64 = fs::read_to_string(paths.dedup_stamp())
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    let when = UNIX_EPOCH + Duration::from_secs(secs);
+    (when <= SystemTime::now()).then_some(when)
+}
+
+/// Records that an applied pass started at `started`. Best effort: without
+/// it the next pass is a full one.
+fn record_pass(paths: &Paths, started: SystemTime) {
+    let secs = started
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let _ = config::write_atomic(&paths.dedup_stamp(), format!("{secs}\n").as_bytes());
+}
+
 /// Finds identical files of at least [`MIN_SIZE`] across the profiles of
 /// `dirs`, on the same volume, and with `apply` replaces each duplicate with
 /// a clone of one kept copy. Each replacement holds cargo's locks on the
 /// profiles of both files; one a build is using is skipped. Files that are
 /// already clones of the kept copy (known on APFS) are left alone.
-pub fn dedup(dirs: &[BuildDir], apply: bool) -> Result<Summary> {
+///
+/// With `since`, only files created or replaced since then are looked for
+/// (in directories changed since then), with the files at the same path in
+/// the other build directories; otherwise every file is.
+pub fn dedup(dirs: &[BuildDir], apply: bool, since: Option<SystemTime>) -> Result<Summary> {
     let mut summary = Summary::default();
     // Volume → a build directory on it, for volumes that can clone.
     let mut volumes: BTreeMap<u64, PathBuf> = BTreeMap::new();
     let mut unsupported: HashSet<u64> = HashSet::new();
-    let mut by_key: HashMap<(u64, OsString, u64), Vec<Candidate>> = HashMap::new();
-    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut eligible: Vec<&BuildDir> = Vec::new();
     for dir in dirs {
         let Some(device) = dir.device else {
             continue;
@@ -257,20 +301,33 @@ pub fn dedup(dirs: &[BuildDir], apply: bool) -> Result<Summary> {
             }
             entry.insert(dir.root.clone());
         }
-        for profile in &dir.profiles {
-            for candidate in collect(&profile.path) {
-                if !seen.insert(candidate.path.clone()) {
-                    continue;
-                }
-                let Some(name) = candidate.path.file_name() else {
-                    continue;
-                };
-                let key = (dev(&candidate.meta), name.to_owned(), candidate.meta.len());
-                by_key.entry(key).or_default().push(candidate);
-            }
-        }
+        eligible.push(dir);
     }
     summary.unsupported_volumes = unsupported.len();
+    let found = match since {
+        None => fsutil::parallel_map(&eligible, |dir| {
+            dir.profiles
+                .iter()
+                .flat_map(|p| collect(&p.path))
+                .collect::<Vec<_>>()
+        })
+        .into_iter()
+        .flatten()
+        .collect(),
+        Some(since) => changed_and_counterparts(&eligible, since),
+    };
+    let mut by_key: HashMap<(u64, OsString, u64), Vec<Candidate>> = HashMap::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    for candidate in found {
+        if !seen.insert(candidate.path.clone()) {
+            continue;
+        }
+        let Some(name) = candidate.path.file_name() else {
+            continue;
+        };
+        let key = (dev(&candidate.meta), name.to_owned(), candidate.meta.len());
+        by_key.entry(key).or_default().push(candidate);
+    }
 
     let before: BTreeMap<u64, u64> = if apply {
         volumes
@@ -432,10 +489,7 @@ fn collect(profile: &Path) -> Vec<Candidate> {
     let mut stack = vec![profile.to_path_buf()];
     while let Some(dir) = stack.pop() {
         for (name, path) in fsutil::entries(&dir) {
-            if name.starts_with(fsutil::TRASH_PREFIX)
-                || name.contains(TEMP_MARK)
-                || (dir == profile && name == "incremental")
-            {
+            if skipped(&name, dir == profile) {
                 continue;
             }
             let Ok(meta) = fs::symlink_metadata(&path) else {
@@ -443,17 +497,131 @@ fn collect(profile: &Path) -> Vec<Candidate> {
             };
             if meta.is_dir() {
                 stack.push(path);
-            } else if meta.is_file() && meta.len() >= MIN_SIZE && links(&meta) == 1 {
-                found.push(Candidate {
-                    clone_id: clone::clone_id(&path),
-                    path,
-                    profile: profile.to_path_buf(),
-                    meta,
-                });
+            } else if let Some(candidate) = candidate(path, profile, meta) {
+                found.push(candidate);
             }
         }
     }
     found
+}
+
+/// Entries never looked at: what's being deleted or replaced, and the
+/// incremental caches (`top`: directly in the profile).
+fn skipped(name: &str, top: bool) -> bool {
+    name.starts_with(fsutil::TRASH_PREFIX)
+        || name.contains(TEMP_MARK)
+        || (top && name == "incremental")
+}
+
+/// The file at `path` in `profile`, if it may have duplicates worth
+/// replacing: a regular file of at least [`MIN_SIZE`] with a single link.
+fn candidate(path: PathBuf, profile: &Path, meta: fs::Metadata) -> Option<Candidate> {
+    (meta.is_file() && meta.len() >= MIN_SIZE && links(&meta) == 1).then(|| Candidate {
+        clone_id: clone::clone_id(&path),
+        path,
+        profile: profile.to_path_buf(),
+        meta,
+    })
+}
+
+/// [`collect`], only for files created or replaced since `since`. Those
+/// change their directory, so only directories changed since then are
+/// listed in full; every directory is still visited for its subdirectories.
+fn collect_changed(profile: &Path, since: SystemTime) -> Vec<Candidate> {
+    let mut found = Vec::new();
+    let Ok(meta) = fs::symlink_metadata(profile) else {
+        return found;
+    };
+    let mut stack = vec![(profile.to_path_buf(), changed_since(&meta, since))];
+    while let Some((dir, changed)) = stack.pop() {
+        for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let name = entry.file_name();
+            if skipped(&name.to_string_lossy(), dir == profile) {
+                continue;
+            }
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                if let Ok(meta) = entry.metadata() {
+                    stack.push((entry.path(), changed_since(&meta, since)));
+                }
+            } else if changed
+                && kind.is_file()
+                && let Ok(meta) = entry.metadata()
+                && changed_since(&meta, since)
+                && let Some(candidate) = candidate(entry.path(), profile, meta)
+            {
+                found.push(candidate);
+            }
+        }
+    }
+    found
+}
+
+/// Files changed since `since` in `dirs` ([`collect_changed`]), and the
+/// files at the same path in the other build directories on the same
+/// volume: where the same unit's outputs are, which may be older.
+fn changed_and_counterparts(dirs: &[&BuildDir], since: SystemTime) -> Vec<Candidate> {
+    let changed = fsutil::parallel_map(dirs, |dir| {
+        dir.profiles
+            .iter()
+            .flat_map(|p| collect_changed(&p.path, since))
+            .collect::<Vec<_>>()
+    });
+    let mut found = Vec::new();
+    // Each path is looked up once per volume, however many directories it
+    // changed in.
+    let mut looked_up: HashSet<(Option<u64>, &Path)> = HashSet::new();
+    for (dir, files) in dirs.iter().zip(&changed) {
+        for file in files {
+            let (Ok(path), Ok(profile)) = (
+                file.path.strip_prefix(&dir.root),
+                file.profile.strip_prefix(&dir.root),
+            ) else {
+                continue;
+            };
+            if !looked_up.insert((dir.device, path)) {
+                continue;
+            }
+            for other in dirs
+                .iter()
+                .filter(|o| o.device == dir.device && o.root != dir.root)
+            {
+                let at = other.root.join(path);
+                if let Ok(meta) = fs::symlink_metadata(&at)
+                    && let Some(candidate) = candidate(at, &other.root.join(profile), meta)
+                {
+                    found.push(candidate);
+                }
+            }
+        }
+    }
+    found.extend(changed.into_iter().flatten());
+    found
+}
+
+/// Whether a file's status changed at or after `since` (less a second for
+/// coarse timestamps). Its change time, unlike its modification time,
+/// can't be set back, and moves when it's written, created or renamed.
+fn changed_since(meta: &fs::Metadata, since: SystemTime) -> bool {
+    changed(meta)
+        >= since
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or(UNIX_EPOCH)
+}
+
+#[cfg(unix)]
+fn changed(meta: &fs::Metadata) -> SystemTime {
+    use std::os::unix::fs::MetadataExt;
+    let secs = u64::try_from(meta.ctime()).unwrap_or(0);
+    let nanos = u32::try_from(meta.ctime_nsec()).unwrap_or(0);
+    UNIX_EPOCH + Duration::new(secs, nanos)
+}
+
+#[cfg(not(unix))]
+fn changed(meta: &fs::Metadata) -> SystemTime {
+    meta.modified().unwrap_or(UNIX_EPOCH)
 }
 
 /// Groups files that are pure clones of each other. Files whose clone ID
@@ -627,6 +795,8 @@ mod tests {
             pinned: false,
             device: fsutil::device(root),
             compile_ms: 0,
+            linked: Default::default(),
+            scans: Vec::new(),
         }
     }
 
@@ -651,7 +821,7 @@ mod tests {
         let before = [ino(&a.join(DEP)), ino(&b.join(DEP)), ino(&b.join(DIFF))];
         let b_mtime = fs::metadata(b.join(DEP)).unwrap().modified().unwrap();
 
-        let preview = dedup(&dirs, false).unwrap();
+        let preview = dedup(&dirs, false, None).unwrap();
         if preview.unsupported_volumes > 0 {
             // This filesystem can't clone: nothing to find or do.
             assert_eq!(preview.files, 0);
@@ -667,7 +837,7 @@ mod tests {
             "a preview changes nothing"
         );
 
-        let applied = dedup(&dirs, true).unwrap();
+        let applied = dedup(&dirs, true, None).unwrap();
         assert_eq!(applied.files, 1, "{applied:?}");
         assert!(applied.freed.is_some());
         let group = &applied.groups[0];
@@ -701,21 +871,79 @@ mod tests {
             // to do.
             assert!(clone::clone_id(&b.join(DEP)).is_some());
             assert_eq!(clone::clone_id(&b.join(DEP)), clone::clone_id(&a.join(DEP)));
-            assert_eq!(dedup(&dirs, true).unwrap().files, 0);
+            assert_eq!(dedup(&dirs, true, None).unwrap().files, 0);
         }
+    }
+
+    #[test]
+    fn after_a_pass_only_what_changed_since_is_looked_at() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut dirs = fixture(tmp.path());
+        if dedup(&dirs, false, None).unwrap().unsupported_volumes > 0 {
+            return; // This filesystem can't clone.
+        }
+        let ctime = |path: &Path| changed(&fs::metadata(path).unwrap());
+        let old = ctime(&tmp.path().join("a/target").join(DEP));
+        // Nothing changed since: the duplicate pair isn't looked at.
+        let later = old + Duration::from_secs(5);
+        assert_eq!(dedup(&dirs, false, Some(later)).unwrap().files, 0);
+
+        // A new build directory: its new file is looked at, and found to
+        // duplicate the files at the same place in the others, however old.
+        while SystemTime::now() < old + Duration::from_millis(1200) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let since = old + Duration::from_millis(1100);
+        let c = tmp.path().join("c/target");
+        dirs.push(build_dir(&c, 3, Duration::ZERO));
+        let preview = dedup(&dirs, false, Some(since)).unwrap();
+        assert_eq!(preview.files, 2, "{preview:?}");
+        let mut paths: Vec<&PathBuf> = preview
+            .groups
+            .iter()
+            .flat_map(|g| g.replaced.iter().chain([&g.kept]))
+            .collect();
+        paths.sort();
+        let expected = ["a", "b", "c"].map(|d| tmp.path().join(d).join("target").join(DEP));
+        assert_eq!(paths, expected.iter().collect::<Vec<_>>());
+        // A full pass finds the same.
+        assert_eq!(dedup(&dirs, false, None).unwrap().files, 2);
+    }
+
+    #[test]
+    fn records_when_the_last_pass_started() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            home: tmp.path().to_path_buf(),
+        };
+        assert_eq!(last_pass(&paths), None);
+        let started = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        record_pass(&paths, started);
+        assert_eq!(last_pass(&paths), Some(started));
+        // In the future (the clock went back), or unreadable: a full pass.
+        record_pass(&paths, SystemTime::now() + Duration::from_secs(3600));
+        assert_eq!(last_pass(&paths), None);
+        fs::write(paths.dedup_stamp(), "soon\n").unwrap();
+        assert_eq!(last_pass(&paths), None);
+
+        // A cleanup's pass records itself.
+        let dirs = fixture(tmp.path());
+        let before = SystemTime::now() - Duration::from_secs(1);
+        after_cleanup(&paths, &dirs).unwrap();
+        assert!(last_pass(&paths).is_some_and(|t| t >= before));
     }
 
     #[test]
     fn skips_files_a_build_is_using() {
         let tmp = tempfile::tempdir().unwrap();
         let dirs = fixture(tmp.path());
-        if dedup(&dirs, false).unwrap().unsupported_volumes > 0 {
+        if dedup(&dirs, false, None).unwrap().unsupported_volumes > 0 {
             return;
         }
         let b = tmp.path().join("b/target");
         let before = ino(&b.join(DEP));
         let held = fsutil::lock_profile(&b.join("debug"));
-        let applied = dedup(&dirs, true).unwrap();
+        let applied = dedup(&dirs, true, None).unwrap();
         assert_eq!((applied.files, applied.busy), (0, 1), "{applied:?}");
         assert_eq!(ino(&b.join(DEP)), before);
         drop(held);
@@ -723,7 +951,7 @@ mod tests {
         // lock, so allow a few tries.
         let mut replaced = 0;
         for _ in 0..30 {
-            replaced = dedup(&dirs, true).unwrap().files;
+            replaced = dedup(&dirs, true, None).unwrap().files;
             if replaced > 0 {
                 break;
             }
@@ -837,7 +1065,7 @@ mod tests {
         for dir in &mut dirs {
             dir.device = None;
         }
-        let summary = dedup(&dirs, false).unwrap();
+        let summary = dedup(&dirs, false, None).unwrap();
         assert_eq!(summary.files, 0);
         assert_eq!(summary.unsupported_volumes, 0);
     }
@@ -848,7 +1076,7 @@ mod tests {
         let dirs = fixture(tmp.path());
         // The same build dir twice: every file is seen twice.
         let twice = vec![dirs[0].clone(), dirs[0].clone()];
-        let summary = dedup(&twice, false).unwrap();
+        let summary = dedup(&twice, false, None).unwrap();
         assert_eq!(summary.files, 0);
     }
 
@@ -875,7 +1103,7 @@ mod tests {
         for dir in &mut dirs {
             dir.root = gone.clone();
         }
-        let summary = dedup(&dirs, false).unwrap();
+        let summary = dedup(&dirs, false, None).unwrap();
         assert_eq!(summary.unsupported_volumes, 1);
         assert_eq!(summary.files, 0);
     }

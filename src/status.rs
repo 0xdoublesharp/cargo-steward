@@ -218,6 +218,8 @@ mod tests {
             pinned: false,
             device: None,
             compile_ms: 0,
+            linked: Default::default(),
+            scans: Vec::new(),
         }
     }
 

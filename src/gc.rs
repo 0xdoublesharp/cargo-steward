@@ -9,15 +9,18 @@
 //! 5. when a disk runs low, whole directories, those whose bytes cost least
 //!    to rebuild first.
 //!
-//! When applying, each profile directory is examined and cleaned while
-//! holding cargo's own locks, so a running build is never touched and the
-//! decision can't go stale between looking and deleting. Nothing a running
-//! program was started from is removed ([`guard`]). Build directories are
-//! worked on in parallel, each by one thread.
+//! Each profile is listed once, when its build directory is inspected
+//! ([`ProfileScan`]). When applying, each profile directory is cleaned while
+//! holding cargo's own locks, and whatever the listing shows unused is dated
+//! again under them before it goes, so a running build is never touched and
+//! the decision can't go stale between looking and deleting. Nothing a
+//! running program was started from is removed ([`guard`]). Build
+//! directories are worked on in parallel, each by one thread.
 
 pub mod document;
 mod guard;
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, OpenOptions};
@@ -33,7 +36,7 @@ pub use guard::{Running, UnitExe};
 
 use crate::config::{self, Paths, Policy};
 use crate::fsutil::{self, Lock, human};
-use crate::ledger::{self, Registry, RootInfo};
+use crate::ledger::{self, Linked, Registry, RootInfo};
 use crate::scan::{self, Dated, Profile};
 
 /// A file a pinned build directory carries: only stale objects are removed
@@ -60,6 +63,8 @@ pub enum Kind {
     /// The TMPDIR the `cargo` proxy routed for a build directory removed
     /// whole.
     RoutedTmp,
+    /// A TMPDIR the `cargo` proxy routed for a build directory that is gone.
+    LeftoverTmp,
 }
 
 impl Kind {
@@ -75,6 +80,7 @@ impl Kind {
             Kind::LowSpace => "build dirs removed for free space",
             Kind::Requested => "build dirs removed on request",
             Kind::RoutedTmp => "temporary dirs the proxy routed for them",
+            Kind::LeftoverTmp => "temporary dirs of build dirs already gone",
         }
     }
 
@@ -91,6 +97,7 @@ impl Kind {
             Kind::LowSpace => "low_space",
             Kind::Requested => "requested",
             Kind::RoutedTmp => "routed_tmp",
+            Kind::LeftoverTmp => "leftover_tmp",
         }
     }
 }
@@ -141,30 +148,54 @@ pub struct BuildDir {
     /// Compile time the wrapper has recorded here, in milliseconds: a rough
     /// measure of what rebuilding it costs. 0 when none is recorded.
     pub compile_ms: u64,
+    /// The linked git worktree each of `workspaces` was in, for those in one.
+    pub linked: BTreeMap<PathBuf, Linked>,
+    /// What inspecting each of `profiles` found, in the same order: cleanup
+    /// works from these rather than listing every profile again.
+    pub scans: Vec<ProfileScan>,
+}
+
+/// One listing of a profile's units and incremental caches, with when builds
+/// last used each. Cleanup decides from it, and checks again, under cargo's
+/// locks, only what it is about to remove.
+#[derive(Debug, Clone, Default)]
+pub struct ProfileScan {
+    /// When an old-layout build last used the profile.
+    pub legacy_last_used: Option<SystemTime>,
+    /// New-layout units ([`scan::v2_units`]).
+    pub units: Vec<Dated>,
+    /// Incremental caches ([`scan::incremental_dirs`]).
+    pub incremental: Vec<Dated>,
+}
+
+impl ProfileScan {
+    pub fn read(profile: &Profile) -> ProfileScan {
+        ProfileScan {
+            legacy_last_used: scan::legacy_last_used(&profile.path),
+            units: scan::v2_units(&profile.path),
+            incremental: scan::incremental_dirs(&profile.path),
+        }
+    }
+
+    /// The latest use of anything in it.
+    fn last_used(&self) -> Option<SystemTime> {
+        self.legacy_last_used
+            .into_iter()
+            .chain(self.units.iter().map(|u| u.last_used))
+            .chain(self.incremental.iter().map(|d| d.last_used))
+            .max()
+    }
 }
 
 impl BuildDir {
     fn inspect(root: &Path, info: Option<&RootInfo>) -> BuildDir {
         let profiles = scan::profiles(root);
+        let scans: Vec<ProfileScan> = profiles.iter().map(ProfileScan::read).collect();
         let mut last_used = info.map_or(UNIX_EPOCH, |i| {
             UNIX_EPOCH + Duration::from_secs(i.last_used)
         });
-        for profile in &profiles {
-            let times = scan::legacy_last_used(&profile.path)
-                .into_iter()
-                .chain(
-                    scan::v2_units(&profile.path)
-                        .into_iter()
-                        .map(|u| u.last_used),
-                )
-                .chain(
-                    scan::incremental_dirs(&profile.path)
-                        .into_iter()
-                        .map(|d| d.last_used),
-                );
-            for t in times {
-                last_used = last_used.max(t);
-            }
+        for t in scans.iter().filter_map(ProfileScan::last_used) {
+            last_used = last_used.max(t);
         }
         // A CI job's start reset fingerprint access times here and saved them.
         if let Some(t) = crate::ci::saved_last_use(root).into_values().max() {
@@ -184,13 +215,43 @@ impl BuildDir {
             pinned: root.join(PIN_FILE).exists(),
             device: fsutil::device(root),
             compile_ms: info.map_or(0, |i| i.compile_ms),
+            linked: info.map(|i| i.linked.clone()).unwrap_or_default(),
+            scans,
         }
+    }
+
+    /// Each profile with what inspecting it found, listing any it has no
+    /// scan for.
+    fn scanned(&self) -> Vec<(&Profile, Cow<'_, ProfileScan>)> {
+        self.profiles
+            .iter()
+            .enumerate()
+            .map(|(i, profile)| {
+                let scan = match self.scans.get(i) {
+                    Some(scan) => Cow::Borrowed(scan),
+                    None => Cow::Owned(ProfileScan::read(profile)),
+                };
+                (profile, scan)
+            })
+            .collect()
     }
 
     /// Every workspace that built here is gone. Directories never seen by the
     /// wrapper have no recorded workspaces and are never orphans.
     pub fn orphaned(&self) -> bool {
         !self.workspaces.is_empty() && self.workspaces.iter().all(|w| !w.exists())
+    }
+
+    /// Orphaned, and git confirms it: every workspace was in a linked
+    /// worktree that git no longer has ([`crate::proxy::worktree_dropped`]).
+    /// Nothing will build here again, so there's no grace to wait out.
+    pub fn dropped_by_git(&self) -> bool {
+        self.orphaned()
+            && self.workspaces.iter().all(|w| {
+                self.linked
+                    .get(w)
+                    .is_some_and(|l| crate::proxy::worktree_dropped(&l.admin, &l.worktree))
+            })
     }
 
     fn idle_for(&self, now: SystemTime) -> Duration {
@@ -323,15 +384,13 @@ pub fn run(options: Options) -> Result<()> {
     } else {
         Vec::new()
     };
-    let mut cleanup = clean(
-        &dirs,
-        Sweep {
-            policy: &policy,
-            running: &running,
-            now: SystemTime::now(),
-            apply: options.apply,
-        },
-    );
+    let sweep = Sweep {
+        policy: &policy,
+        running: &running,
+        now: SystemTime::now(),
+        apply: options.apply,
+    };
+    let mut cleanup = clean(&dirs, sweep);
     let freed: Vec<(PathBuf, i128)> = volumes
         .iter()
         .filter(|v| {
@@ -345,6 +404,7 @@ pub fn run(options: Options) -> Result<()> {
 
     let tmp = remove_routed_tmp_dirs(&config, &cleanup.actions, options.apply);
     cleanup.actions.extend(tmp);
+    cleanup.absorb(remove_leftover_tmp_dirs(&config, sweep));
     for action in cleanup.actions.iter().filter(|a| a.kind >= Kind::Orphaned) {
         registry.roots.remove(&action.path);
     }
@@ -371,7 +431,7 @@ pub fn run(options: Options) -> Result<()> {
             .filter(|d| !removed.contains(&d.root))
             .cloned()
             .collect();
-        match crate::dedup::dedup(&remaining, true) {
+        match crate::dedup::after_cleanup(&paths, &remaining) {
             Ok(summary) if options.json => shared = Some(summary),
             Ok(summary) if summary.files > 0 => println!(
                 "{:>12} {:>10}  identical files now shared across build dirs ({} files)",
@@ -383,6 +443,20 @@ pub fn run(options: Options) -> Result<()> {
             Err(e) => eprintln!("warning: cargo-steward: dedup: {e:#}"),
         }
     }
+    if options.apply {
+        // Low on space before, and not one low disk gained any or recovered.
+        let low: Vec<&Volume> = volumes
+            .iter()
+            .filter(|v| v.before < policy.min_free)
+            .collect();
+        let freed = low.iter().any(|v| {
+            v.freed().is_some_and(|gained| {
+                gained >= i128::from(STALL_FLOOR)
+                    || i128::from(v.before) + gained >= i128::from(policy.min_free)
+            })
+        });
+        note_low_space(&paths, &policy, !low.is_empty(), freed);
+    }
     if options.json {
         let mut doc = Document::new(&cleanup, &freed, options);
         doc.shared = shared.map(|s| document::Shared {
@@ -392,6 +466,50 @@ pub fn run(options: Options) -> Result<()> {
         crate::json::print(&doc)?;
     }
     Ok(())
+}
+
+/// The shortest wait between cleanups the wrapper starts because a disk is
+/// below `min-free`, before `gc-interval` has passed.
+pub const LOW_SPACE_RECHECK: Duration = Duration::from_secs(300);
+
+/// How long after the last cleanup low free space starts another:
+/// [`LOW_SPACE_RECHECK`], or longer while cleanups find nothing to free
+/// ([`note_low_space`]), up to `gc-interval`.
+pub fn low_space_recheck(paths: &Paths, policy: &Policy) -> Duration {
+    let backoff = fs::read_to_string(paths.gc_backoff())
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .map_or(LOW_SPACE_RECHECK, Duration::from_secs);
+    backoff.min(policy.gc_interval).max(LOW_SPACE_RECHECK)
+}
+
+/// Records how a cleanup went for [`low_space_recheck`]: one that started
+/// with a disk below `min-free` (`low`) and freed nothing on it doubles the
+/// wait before the next, up to `gc-interval`; one that freed space, or found
+/// none low, resets it. Best effort.
+fn note_low_space(paths: &Paths, policy: &Policy, low: bool, freed: bool) {
+    match next_recheck(low_space_recheck(paths, policy), low, freed, policy) {
+        Some(wait) => {
+            let _ = config::write_atomic(
+                &paths.gc_backoff(),
+                format!("{}\n", wait.as_secs()).as_bytes(),
+            );
+        }
+        None => {
+            let _ = fs::remove_file(paths.gc_backoff());
+        }
+    }
+}
+
+/// The wait before the next low-space cleanup after one that waited
+/// `previous`; `None` for the shortest.
+fn next_recheck(previous: Duration, low: bool, freed: bool, policy: &Policy) -> Option<Duration> {
+    (low && !freed).then(|| {
+        previous
+            .saturating_mul(2)
+            .min(policy.gc_interval)
+            .max(LOW_SPACE_RECHECK)
+    })
 }
 
 /// A volume holding build directories, and its free space before cleanup.
@@ -490,6 +608,14 @@ fn clean_dir(dir: &BuildDir, sweep: Sweep) -> (Cleanup, bool) {
                     fsutil::ago(dir.last_used)
                 ),
             ))
+        } else if dir.dropped_by_git() {
+            Some((
+                Kind::Orphaned,
+                format!(
+                    "worktrees removed from git, unused for {}",
+                    fsutil::ago(dir.last_used)
+                ),
+            ))
         } else if idle >= sweep.policy.dir_idle {
             Some((
                 Kind::Idle,
@@ -508,14 +634,29 @@ fn clean_dir(dir: &BuildDir, sweep: Sweep) -> (Cleanup, bool) {
         }
     }
     let saved = crate::ci::saved_last_use(&dir.root);
+    let scanned = dir.scanned();
+    // Which units builds still need is only worth working out (it reads
+    // every fingerprint) when some unit is idle enough to go.
+    let idle_unit = scanned
+        .iter()
+        .flat_map(|(_, scan)| &scan.units)
+        .any(|unit| {
+            let last_used = saved
+                .get(&unit.path.join("fingerprint"))
+                .map_or(unit.last_used, |t| unit.last_used.max(*t));
+            sweep.now.duration_since(last_used).unwrap_or_default() >= sweep.policy.unit_idle
+        });
     let live = if dir.pinned {
         None
-    } else {
+    } else if idle_unit {
         live_units(&dir.profiles, &saved, sweep)
+    } else {
+        Some(BTreeSet::new())
     };
-    for profile in &dir.profiles {
+    for (profile, scan) in &scanned {
         out.absorb(clean_profile(
             profile,
+            scan,
             &dir.root,
             dir.pinned,
             live.as_ref(),
@@ -587,13 +728,16 @@ fn live_units(
     )
 }
 
-/// `live`: the new-layout units builds still need ([`live_units`]); `None`
-/// keeps every unit. `saved`: when units were last used before a CI job's
-/// start reset their fingerprints' access times
+/// `scan`: what inspecting the profile found. What it shows idle is checked
+/// again (under the locks, when applying) before it goes: a build may have
+/// used it since. `live`: the new-layout units builds still need
+/// ([`live_units`]); `None` keeps every unit. `saved`: when units were last
+/// used before a CI job's start reset their fingerprints' access times
 /// ([`crate::ci::saved_last_use`]). What's removed is renamed aside into
 /// `root`, the build directory, first.
 fn clean_profile(
     profile: &Profile,
+    scan: &ProfileScan,
     root: &Path,
     pinned: bool,
     live: Option<&BTreeSet<PathBuf>>,
@@ -614,7 +758,7 @@ fn clean_profile(
     let idle = |t: SystemTime, limit: Duration| now.duration_since(t).unwrap_or_default() >= limit;
     let keep_after = now.checked_sub(policy.object_grace).unwrap_or(UNIX_EPOCH);
 
-    for dir in scan::object_dirs(profile) {
+    for dir in scan::object_dirs_of(profile, &scan.units) {
         // Older objects within the grace stay only for programs that may
         // need them; with the process guard off, for the whole grace.
         let started = |unit: &str| {
@@ -653,11 +797,15 @@ fn clean_profile(
 
     // Old-layout files, once the new layout is in use here and no old-layout
     // build (an older pinned toolchain) has run for a while.
-    if profile.legacy
-        && profile.v2
-        && scan::legacy_last_used(&profile.path)
+    let legacy_idle = |last_used: Option<SystemTime>| {
+        last_used
             .max(saved_under(saved, &profile.path.join(".fingerprint")))
             .is_none_or(|t| idle(t, policy.legacy_idle))
+    };
+    if profile.legacy
+        && profile.v2
+        && legacy_idle(scan.legacy_last_used)
+        && legacy_idle(scan::legacy_last_used(&profile.path))
     {
         for path in scan::legacy_paths(&profile.path) {
             remove_dir(
@@ -672,18 +820,39 @@ fn clean_profile(
         }
     }
     if let Some(live) = live {
-        for mut unit in scan::v2_units(&profile.path) {
-            if let Some(t) = saved.get(&unit.path.join("fingerprint")) {
-                unit.last_used = unit.last_used.max(*t);
+        for unit in &scan.units {
+            let saved = saved.get(&unit.path.join("fingerprint"));
+            let with_saved = |t: SystemTime| saved.map_or(t, |s| t.max(*s));
+            if !idle(with_saved(unit.last_used), policy.unit_idle) || live.contains(&unit.path) {
+                continue;
             }
-            if idle(unit.last_used, policy.unit_idle) && !live.contains(&unit.path) {
+            let Some(now_used) = scan::unit_last_used(&unit.path).map(with_saved) else {
+                continue;
+            };
+            if idle(now_used, policy.unit_idle) {
+                let unit = Dated {
+                    path: unit.path.clone(),
+                    last_used: now_used,
+                };
                 remove_dated(Kind::IdleUnit, &unit, root, sweep, &mut out);
             }
         }
     }
     let mut sessions: Vec<PathBuf> = Vec::new();
-    for cache in scan::incremental_dirs(&profile.path) {
-        if idle(cache.last_used, policy.incremental_idle) {
+    for cache in &scan.incremental {
+        let now_used = if idle(cache.last_used, policy.incremental_idle) {
+            match scan::cache_last_used(&cache.path) {
+                Some(t) => t,
+                None => continue,
+            }
+        } else {
+            cache.last_used
+        };
+        if idle(now_used, policy.incremental_idle) {
+            let cache = Dated {
+                path: cache.path.clone(),
+                last_used: now_used,
+            };
             remove_dated(Kind::IdleIncremental, &cache, root, sweep, &mut out);
         } else {
             sessions.extend(scan::superseded_sessions(&cache.path));
@@ -804,35 +973,41 @@ fn remove_build_dir(
     if !sweep.apply {
         return remove_dir(kind, &dir.root, note, bytes, trash, sweep, out);
     }
-    // The profiles seen when the directory was inspected, and any a build
-    // has started since (`--release`, another `--target`): list again after
-    // locking until no new one turns up.
+    let Some(locks) = lock_build_dir(&dir.root, &dir.profiles) else {
+        return Removal::Busy;
+    };
+    let removal = remove_dir(kind, &dir.root, note, bytes, trash, sweep, out);
+    drop(locks);
+    removal
+}
+
+/// Takes cargo's locks on every profile of the build directory at `root`:
+/// those in `known` (seen when it was inspected), and any a build has started
+/// since (`--release`, another `--target`), listing again after locking
+/// until no new one turns up. `None` when a build holds one.
+fn lock_build_dir(root: &Path, known: &[Profile]) -> Option<Vec<Lock>> {
     let mut locks = Vec::new();
     let mut locked: BTreeSet<PathBuf> = BTreeSet::new();
     loop {
         // A set: a second lock on the same file conflicts with the first,
         // even in one process.
-        let listed: BTreeSet<PathBuf> = dir
-            .profiles
+        let listed: BTreeSet<PathBuf> = known
             .iter()
             .map(|p| p.path.clone())
-            .chain(scan::profiles(&dir.root).into_iter().map(|p| p.path))
+            .chain(scan::profiles(root).into_iter().map(|p| p.path))
             .filter(|p| !locked.contains(p))
             .collect();
         if listed.is_empty() {
-            break;
+            return Some(locks);
         }
         for profile in listed {
             match fsutil::lock_profile(&profile) {
-                Lock::Busy => return Removal::Busy,
+                Lock::Busy => return None,
                 held => locks.push(held),
             }
             locked.insert(profile);
         }
     }
-    let removal = remove_dir(kind, &dir.root, note, bytes, trash, sweep, out);
-    drop(locks);
-    removal
 }
 
 /// Removes the TMPDIRs the `cargo` proxy routed for build directories that
@@ -878,13 +1053,130 @@ pub struct Requested {
     pub cleanup: Cleanup,
     /// Paths that aren't cargo build directories, and why.
     pub refused: Vec<(PathBuf, String)>,
+    /// The command, for the report's closing hint and the document.
+    pub command: &'static str,
+}
+
+/// Removes the TMPDIRs the `cargo` proxy routed for build directories that
+/// are gone some other way (deleted by hand, or before cleanup removed
+/// routed TMPDIRs with their build directories) once nothing in them has
+/// been modified for `orphan-grace` ([`crate::proxy::orphaned_tmp_dirs`]). A
+/// cargo build directory inside one (a test's) is locked like any other
+/// before it goes.
+fn remove_leftover_tmp_dirs(config: &config::Config, sweep: Sweep) -> Cleanup {
+    let mut out = Cleanup::default();
+    let cutoff = sweep
+        .now
+        .checked_sub(sweep.policy.orphan_grace)
+        .unwrap_or(UNIX_EPOCH);
+    for (tmp, build) in crate::proxy::orphaned_tmp_dirs(config) {
+        let Some(contents) = TmpContents::read(&tmp, cutoff) else {
+            continue;
+        };
+        if let Some(process) = sweep.running.inside(&tmp) {
+            out.skipped.push(Skipped {
+                kind: Kind::LeftoverTmp,
+                path: tmp,
+                reason: format!(
+                    "{} is running from it (pid {})",
+                    process.exe.display(),
+                    process.pid
+                ),
+            });
+            continue;
+        }
+        let mut locks = Vec::new();
+        if sweep.apply {
+            let mut busy = false;
+            for root in &contents.build_dirs {
+                match lock_build_dir(root, &[]) {
+                    Some(held) => locks.extend(held),
+                    None => busy = true,
+                }
+            }
+            if busy {
+                continue;
+            }
+            if let Err(e) = fsutil::remove(&tmp) {
+                eprintln!(
+                    "warning: cargo-steward: failed to remove {}: {e}",
+                    tmp.display()
+                );
+                continue;
+            }
+        }
+        drop(locks);
+        out.actions.push(Action {
+            kind: Kind::LeftoverTmp,
+            path: tmp,
+            files: 0,
+            bytes: contents.bytes,
+            note: format!(
+                "unmodified for {}; {} is gone",
+                fsutil::ago(contents.modified),
+                build.display()
+            ),
+        });
+    }
+    out
+}
+
+/// What a leftover TMPDIR holds.
+struct TmpContents {
+    /// The newest modification time in it, its own included.
+    modified: SystemTime,
+    bytes: u64,
+    /// Cargo build directories inside it.
+    build_dirs: Vec<PathBuf>,
+}
+
+impl TmpContents {
+    /// Reads `dir`'s tree, without following symlinks. `None` if anything in
+    /// it was modified after `cutoff`, or it can't be read.
+    fn read(dir: &Path, cutoff: SystemTime) -> Option<TmpContents> {
+        let meta = fs::symlink_metadata(dir).ok()?;
+        let mut contents = TmpContents {
+            modified: meta.modified().ok()?,
+            bytes: 0,
+            build_dirs: Vec::new(),
+        };
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(current) = stack.pop() {
+            for entry in fs::read_dir(&current).ok()?.flatten() {
+                let meta = entry.metadata().ok()?;
+                contents.modified = contents.modified.max(meta.modified().ok()?);
+                if contents.modified > cutoff {
+                    return None;
+                }
+                contents.bytes += fsutil::allocated(&meta);
+                let name = entry.file_name();
+                if meta.is_dir() {
+                    stack.push(entry.path());
+                } else if ((name == ".rustc_info.json" || name == ".rustc-info.json")
+                    || (name == "CACHEDIR.TAG" && scan::is_cargo_root(&current)))
+                    && !contents.build_dirs.contains(&current)
+                {
+                    contents.build_dirs.push(current.clone());
+                }
+            }
+        }
+        (contents.modified <= cutoff).then_some(contents)
+    }
 }
 
 /// Removes whole build directories on request (`cargo steward remove`), the
 /// way cleanup removes them: while holding cargo's locks, not while a running
 /// program was started from inside, and renamed aside first. Anything that
 /// isn't a cargo build directory is refused, and pinned ones need `force`.
-pub fn remove_requested(roots: &[PathBuf], apply: bool, force: bool) -> Result<Requested> {
+///
+/// With `orphaned`, also every known build directory whose recorded
+/// workspaces are all gone, without waiting out `orphan-grace`.
+pub fn remove_requested(
+    roots: &[PathBuf],
+    orphaned: bool,
+    apply: bool,
+    force: bool,
+) -> Result<Requested> {
     let paths = Paths::resolve().context("cannot locate the home directory")?;
     let config = config::load_warning(&paths);
     let policy = config.policy()?;
@@ -893,10 +1185,18 @@ pub fn remove_requested(roots: &[PathBuf], apply: bool, force: bool) -> Result<R
     } else {
         Running::default()
     };
-    let mut registry = if apply {
-        ledger::compact(&paths)?
+    let (mut registry, mut targets) = if orphaned {
+        let (registry, dirs) = inventory(&paths, &config.scan_roots, apply)?;
+        let orphans = dirs
+            .into_iter()
+            .filter(BuildDir::orphaned)
+            .map(|dir| (Kind::Orphaned, dir))
+            .collect();
+        (registry, orphans)
+    } else if apply {
+        (ledger::compact(&paths)?, Vec::new())
     } else {
-        ledger::peek(&paths)
+        (ledger::peek(&paths), Vec::new())
     };
     let sweep = Sweep {
         policy: &policy,
@@ -923,24 +1223,35 @@ pub fn remove_requested(roots: &[PathBuf], apply: bool, force: bool) -> Result<R
             ));
             continue;
         }
-        let dir = BuildDir::inspect(&root, registry.roots.get(&root));
+        if !targets.iter().any(|(_, d)| d.root == root) {
+            let dir = BuildDir::inspect(&root, registry.roots.get(&root));
+            targets.push((Kind::Requested, dir));
+        }
+    }
+    for (kind, dir) in &targets {
         if dir.pinned && !force {
             out.skipped.push(Skipped {
-                kind: Kind::Requested,
-                path: root,
+                kind: *kind,
+                path: dir.root.clone(),
                 reason: "pinned (use --force to remove it anyway)".into(),
             });
             continue;
         }
-        let note = format!("last used {} ago", fsutil::ago(dir.last_used));
-        match remove_build_dir(&dir, Kind::Requested, note, None, sweep, &mut out) {
+        let note = match kind {
+            Kind::Orphaned => format!(
+                "workspaces deleted, last used {} ago",
+                fsutil::ago(dir.last_used)
+            ),
+            _ => format!("last used {} ago", fsutil::ago(dir.last_used)),
+        };
+        match remove_build_dir(dir, *kind, note, None, sweep, &mut out) {
             Removal::Busy => out.skipped.push(Skipped {
-                kind: Kind::Requested,
-                path: root.clone(),
+                kind: *kind,
+                path: dir.root.clone(),
                 reason: "a cargo build is using it; try again when it finishes".into(),
             }),
             Removal::Done if apply => {
-                registry.roots.remove(&root);
+                registry.roots.remove(&dir.root);
             }
             _ => {}
         }
@@ -953,12 +1264,17 @@ pub fn remove_requested(roots: &[PathBuf], apply: bool, force: bool) -> Result<R
     for (path, reason) in &refused {
         eprintln!("refusing to remove {}: {reason}", path.display());
     }
-    if refused.len() == roots.len() {
+    if !roots.is_empty() && refused.len() == roots.len() && !orphaned {
         anyhow::bail!("nothing to remove");
     }
     Ok(Requested {
         cleanup: out,
         refused,
+        command: if orphaned && roots.is_empty() {
+            "remove --orphaned"
+        } else {
+            "remove"
+        },
     })
 }
 
@@ -970,7 +1286,7 @@ pub fn report_requested(requested: &Requested, apply: bool) {
         Options {
             apply,
             verbose: true,
-            command: "remove",
+            command: requested.command,
             ..Options::default()
         },
     );
@@ -1432,6 +1748,48 @@ mod tests {
     }
 
     #[test]
+    fn keeps_what_a_build_used_after_inspection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = build_dir(tmp.path(), "target");
+        let debug = root.join("debug");
+        let unit = debug.join("build/old/0123456789abcdef");
+        make(&unit.join("fingerprint/lib-old"));
+        make(&debug.join("build/gone/fedcba9876543210/fingerprint/lib-gone"));
+        make(&debug.join("incremental/old-1a2b/s-abc/dep-graph.bin"));
+        make(&debug.join(".fingerprint/old-0123456789abcdef/lib-old"));
+        age(&root, 15 * DAY);
+        let dir = BuildDir::inspect(&root, None);
+        assert_eq!(run_clean(std::slice::from_ref(&dir), false).len(), 4);
+
+        // Builds since: one unit and the cache are used again, the
+        // old-layout files too, and the other unit is gone.
+        make(&unit.join("fingerprint/lib-old"));
+        make(&debug.join("incremental/old-1a2b/s-abc/dep-graph.bin"));
+        make(&debug.join(".fingerprint/old-0123456789abcdef/lib-old"));
+        fs::remove_dir_all(debug.join("build/gone")).unwrap();
+        let actions = run_clean(&[dir], true);
+        assert!(actions.is_empty(), "{actions:?}");
+        assert!(unit.exists() && debug.join("incremental/old-1a2b").exists());
+        assert!(debug.join(".fingerprint").exists());
+    }
+
+    #[test]
+    fn cleans_a_build_dir_inspected_without_scans() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = build_dir(tmp.path(), "target");
+        make(&root.join("debug/incremental/old-1a2b/s-abc/dep-graph.bin"));
+        make(&root.join("debug/build/new/fedcba9876543210/fingerprint/lib-new"));
+        age(&root.join("debug/incremental"), 30 * DAY);
+        let mut dir = BuildDir::inspect(&root, None);
+        dir.scans.clear();
+        let actions = run_clean(&[dir], true);
+        assert_eq!(
+            actions.iter().map(|a| a.kind).collect::<Vec<_>>(),
+            [Kind::IdleIncremental]
+        );
+    }
+
+    #[test]
     fn goes_by_the_access_times_a_ci_job_saved_until_they_are_back() {
         let tmp = tempfile::tempdir().unwrap();
         let root = build_dir(tmp.path(), "target");
@@ -1539,6 +1897,7 @@ mod tests {
             last_used: ledger::now_secs() - 3 * 86_400,
             workspaces: BTreeSet::from([tmp.path().join("deleted-worktree")]),
             compile_ms: 0,
+            linked: BTreeMap::new(),
         };
         let dirs = vec![
             BuildDir::inspect(&orphan, Some(&info)),
@@ -1561,6 +1920,61 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    #[test]
+    fn removes_at_once_a_build_dir_whose_worktrees_git_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let common = base.join("repo/.git");
+        for dir in ["objects", "refs", "worktrees/listed"] {
+            fs::create_dir_all(common.join(dir)).unwrap();
+        }
+        fs::write(common.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        // Deleted, and git still lists it: prunable, not certain.
+        fs::write(
+            common.join("worktrees/listed/gitdir"),
+            format!("{}\n", base.join("wts/listed/.git").display()),
+        )
+        .unwrap();
+        let linked = |name: &str| Linked {
+            admin: common.join("worktrees").join(name),
+            worktree: base.join("wts").join(name),
+        };
+        let info = |names: &[&str], unknown: bool| {
+            let mut info = RootInfo {
+                last_used: ledger::now_secs(),
+                ..RootInfo::default()
+            };
+            for name in names {
+                let workspace = base.join("wts").join(name).join("crate");
+                info.workspaces.insert(workspace.clone());
+                info.linked.insert(workspace, linked(name));
+            }
+            if unknown {
+                info.workspaces.insert(base.join("loose"));
+            }
+            info
+        };
+        let mut dirs = Vec::new();
+        for (name, info) in [
+            ("removed", info(&["a", "b"], false)),
+            ("mixed", info(&["c"], true)),
+            ("listed", info(&["listed"], false)),
+        ] {
+            let root = build_dir(&base, name);
+            make(&root.join("debug/.fingerprint/a-0123456789abcdef/lib-a"));
+            dirs.push(BuildDir::inspect(&root, Some(&info)));
+        }
+        assert!(dirs[0].dropped_by_git());
+        assert!(!dirs[1].dropped_by_git() && dirs[1].orphaned());
+        assert!(!dirs[2].dropped_by_git() && dirs[2].orphaned());
+        let actions = run_clean(&dirs, true);
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        assert_eq!(actions[0].kind, Kind::Orphaned);
+        assert!(actions[0].note.starts_with("worktrees removed from git"));
+        assert!(!base.join("removed").exists());
+        assert!(base.join("mixed").exists() && base.join("listed").exists());
     }
 
     #[test]
@@ -1746,6 +2160,8 @@ mod tests {
             pinned: false,
             device: None,
             compile_ms,
+            linked: Default::default(),
+            scans: Vec::new(),
         }
     }
 
@@ -1839,6 +2255,7 @@ mod tests {
                     last_used: ledger::now_secs() - u64::from(idle_days) * 86_400,
                     workspaces: BTreeSet::new(),
                     compile_ms,
+                    linked: BTreeMap::new(),
                 },
             );
             dirs.push(BuildDir::inspect(&root, info.get(name)));
@@ -1883,9 +2300,104 @@ mod tests {
             Kind::Idle,
             Kind::LowSpace,
             Kind::Requested,
+            Kind::RoutedTmp,
+            Kind::LeftoverTmp,
         ];
         let described: BTreeSet<&str> = kinds.iter().map(|k| k.describe()).collect();
         assert_eq!(described.len(), kinds.len());
+    }
+
+    #[test]
+    fn removes_routed_tmp_dirs_left_without_their_build_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let config = config::Config {
+            target_root: Some(base.join("{label}/cargo")),
+            tmp_root: Some(base.join("{label}/tmp")),
+            ..config::Config::default()
+        };
+        let repo = "proj-0123456789";
+        let tmp_of = |key: &str| base.join("proj/tmp").join(repo).join(key);
+        fs::create_dir_all(base.join("proj/cargo").join(repo).join("live")).unwrap();
+        for key in ["live", "old", "recent", "built", "busy"] {
+            make(&tmp_of(key).join("t/file"));
+        }
+        // Tests' cargo build directories inside two of them, one of which a
+        // build holds.
+        for key in ["built", "busy"] {
+            let inner = tmp_of(key).join("case/target");
+            make(&inner.join(".rustc_info.json"));
+            make(&inner.join("debug/.cargo-lock"));
+        }
+        let held = fsutil::lock_profile(&tmp_of("busy").join("case/target/debug"));
+        assert!(matches!(held, Lock::Held(_)));
+        for key in ["live", "old", "built", "busy"] {
+            age(&tmp_of(key), 3 * DAY);
+        }
+        let policy = policy();
+        let running = Running::default();
+        let listed = |cleanup: &Cleanup| {
+            let mut paths: Vec<PathBuf> = cleanup.actions.iter().map(|a| a.path.clone()).collect();
+            paths.sort();
+            paths
+        };
+
+        let preview = remove_leftover_tmp_dirs(&config, sweep(&policy, &running, false));
+        assert_eq!(
+            listed(&preview),
+            [tmp_of("built"), tmp_of("busy"), tmp_of("old")]
+        );
+        assert!(preview.actions[0].note.contains(" is gone"));
+        assert!(tmp_of("old").exists());
+
+        let applied = remove_leftover_tmp_dirs(&config, sweep(&policy, &running, true));
+        assert_eq!(listed(&applied), [tmp_of("built"), tmp_of("old")]);
+        assert!(!tmp_of("old").exists() && !tmp_of("built").exists());
+        // Its build dir exists, it changed lately, or a build holds what's
+        // inside it: kept.
+        assert!(tmp_of("live").exists() && tmp_of("recent").exists());
+        assert!(tmp_of("busy").exists());
+        drop(held);
+    }
+
+    #[test]
+    fn backs_off_while_low_space_cleanups_free_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            home: tmp.path().to_path_buf(),
+        };
+        let policy = policy();
+        let minute = Duration::from_secs(60);
+        assert_eq!(low_space_recheck(&paths, &policy), 5 * minute);
+        let mut waits = Vec::new();
+        for _ in 0..5 {
+            note_low_space(&paths, &policy, true, false);
+            waits.push(low_space_recheck(&paths, &policy));
+        }
+        // Doubling, up to `gc-interval`.
+        assert_eq!(
+            waits,
+            [
+                10 * minute,
+                20 * minute,
+                40 * minute,
+                60 * minute,
+                60 * minute
+            ]
+        );
+        // A cleanup that freed space, or found none low, starts over.
+        note_low_space(&paths, &policy, true, true);
+        assert_eq!(low_space_recheck(&paths, &policy), 5 * minute);
+        note_low_space(&paths, &policy, true, false);
+        note_low_space(&paths, &policy, false, false);
+        assert!(!paths.gc_backoff().exists());
+        // What can't be read, or is out of range, is taken in range.
+        fs::write(paths.gc_backoff(), "later\n").unwrap();
+        assert_eq!(low_space_recheck(&paths, &policy), 5 * minute);
+        fs::write(paths.gc_backoff(), "999999\n").unwrap();
+        assert_eq!(low_space_recheck(&paths, &policy), policy.gc_interval);
+        fs::write(paths.gc_backoff(), "1\n").unwrap();
+        assert_eq!(low_space_recheck(&paths, &policy), 5 * minute);
     }
 
     #[test]
@@ -1921,6 +2433,7 @@ mod tests {
                 last_used: 5,
                 workspaces: [base.join("gone")].into(),
                 compile_ms: 7,
+                linked: BTreeMap::new(),
             },
         );
         recorded.roots.insert(
@@ -1929,6 +2442,7 @@ mod tests {
                 last_used: 9,
                 workspaces: Default::default(),
                 compile_ms: 1,
+                linked: BTreeMap::new(),
             },
         );
         // An entry whose directory is gone is dropped.
@@ -2354,6 +2868,7 @@ mod tests {
             last_used: 5,
             workspaces: [base.join("ws")].into(),
             compile_ms: 7,
+            linked: BTreeMap::new(),
         };
         let mut recorded = Registry::default();
         // Its volume isn't mounted: kept.

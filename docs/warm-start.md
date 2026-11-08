@@ -165,7 +165,12 @@ Things it leaves alone:
 - Any file in a profile a build is using, or that changed after it was
   compared. These are counted and skipped until the next run.
 
-With `dedup = true` (the default), automatic cleanup also deduplicates.
+With `dedup = true` (the default), automatic cleanup on macOS also
+deduplicates, looking only at what changed since its last pass: files
+created or replaced since then (found through the directories they changed),
+and the files at the same path in the other build directories, where the same
+unit's outputs are. Its first pass, and `cargo steward dedup`, look at every
+file.
 
 ## Settings
 

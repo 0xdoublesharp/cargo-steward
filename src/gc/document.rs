@@ -165,7 +165,7 @@ impl Document {
             &[],
             Options {
                 apply,
-                command: "remove",
+                command: requested.command,
                 ..Options::default()
             },
         );
