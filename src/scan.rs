@@ -29,7 +29,7 @@ use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use crate::fsutil::{entries, freed_by, subdirs, touched};
+use crate::fsutil::{entries, freed_by, open_quietly, read_quietly, subdirs, touched};
 
 /// Suffixes of the codegen-unit object files that unpacked debug info keeps:
 /// `.o` on macOS, `.dwo` on ELF platforms.
@@ -63,7 +63,8 @@ fn has_rustc_info(dir: &Path) -> bool {
 }
 
 fn has_cargo_tag(dir: &Path) -> bool {
-    fs::read_to_string(dir.join("CACHEDIR.TAG")).is_ok_and(|t| t.contains("created by cargo"))
+    read_quietly(&dir.join("CACHEDIR.TAG"))
+        .is_ok_and(|t| String::from_utf8_lossy(&t).contains("created by cargo"))
 }
 
 /// The build directory containing `path`: the nearest ancestor holding
@@ -272,8 +273,9 @@ pub fn v2_unit_nodes(profile: &Path) -> Vec<UnitNode> {
                 } else if !name.starts_with("dep-")
                     && !name.starts_with("output-")
                     && name != "invoked.timestamp"
-                    && let Some(hash) = fs::read_to_string(&path)
+                    && let Some(hash) = read_quietly(&path)
                         .ok()
+                        .and_then(|bytes| String::from_utf8(bytes).ok())
                         .and_then(|text| fingerprint_hash(text.trim()))
                 {
                     node.hashes.push(hash);
@@ -298,7 +300,7 @@ fn fingerprint_hash(text: &str) -> Option<u64> {
 
 /// The dependency hashes in a fingerprint record; `None` if it doesn't parse.
 fn fingerprint_deps(path: &Path) -> Option<Vec<u64>> {
-    let value: serde_json::Value = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&read_quietly(path).ok()?).ok()?;
     let deps = value.get("deps")?.as_array()?;
     deps.iter()
         .map(|dep| dep.as_array()?.get(3)?.as_u64())
@@ -607,7 +609,7 @@ pub fn stale_objects_in(
 /// is searched in full.
 pub fn named_objects(output: &Path) -> HashSet<String> {
     let mut names = HashSet::new();
-    let Ok(file) = File::open(output) else {
+    let Ok(file) = open_quietly(output) else {
         return names;
     };
     let len = file.metadata().map_or(u64::MAX, |m| m.len());

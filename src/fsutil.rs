@@ -29,6 +29,38 @@ pub fn touched(meta: &fs::Metadata) -> SystemTime {
     meta.accessed().map_or(modified, |a| a.max(modified))
 }
 
+/// Opens `path` to read without the read counting as a use of the file.
+///
+/// Linux's default `relatime` moves a file's access time on a read when it's
+/// no newer than the modification time or more than a day old, so reading a
+/// unit's fingerprint to decide whether it's idle would itself make the unit
+/// look used. `O_NOATIME` prevents that for files we own; anyone else's file
+/// is read plainly. APFS needs nothing: it leaves an access time alone once
+/// it's at least the modification time.
+pub fn open_quietly(path: &Path) -> io::Result<File> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOATIME)
+            .open(path)
+        {
+            Err(e) if e.raw_os_error() == Some(libc::EPERM) => {}
+            opened => return opened,
+        }
+    }
+    File::open(path)
+}
+
+/// Reads all of `path` without the read counting as a use ([`open_quietly`]).
+pub fn read_quietly(path: &Path) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    open_quietly(path)?.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
 /// Disk space a file takes up, as `du` counts it. Blocks shared with APFS or
 /// btrfs clones are counted in full, so this can overstate what removing the
 /// file gives back; free space on the volume is the measure that can't lie.
@@ -458,6 +490,27 @@ pub fn ago(time: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reading_quietly_leaves_an_old_access_time_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("fingerprint");
+        fs::write(&file, "0123456789abcdef").unwrap();
+        // As cargo leaves it: never read since it was written, long ago.
+        let old = SystemTime::now() - std::time::Duration::from_secs(30 * 86_400);
+        let times = fs::FileTimes::new().set_accessed(old).set_modified(old);
+        File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_times(times)
+            .unwrap();
+
+        assert_eq!(read_quietly(&file).unwrap(), b"0123456789abcdef");
+        let mut buf = [0u8; 4];
+        io::Read::read_exact(&mut open_quietly(&file).unwrap(), &mut buf).unwrap();
+        assert_eq!(fs::metadata(&file).unwrap().accessed().unwrap(), old);
+    }
 
     #[test]
     fn removes_directories_without_leaving_trash() {

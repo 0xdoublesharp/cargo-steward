@@ -669,8 +669,8 @@ fn partition(mut clusters: Vec<Cluster>) -> Vec<Vec<Cluster>> {
 /// Whether two files hold the same bytes, read side by side.
 fn same_contents(a: &Path, b: &Path) -> io::Result<bool> {
     const CHUNK: usize = 256 * 1024;
-    let mut a = File::open(a)?;
-    let mut b = File::open(b)?;
+    let mut a = fsutil::open_quietly(a)?;
+    let mut b = fsutil::open_quietly(b)?;
     let mut buf_a = vec![0u8; CHUNK];
     let mut buf_b = vec![0u8; CHUNK];
     loop {
@@ -1167,7 +1167,11 @@ mod tests {
         fs::create_dir(&dup).unwrap();
         fs::write(dup.join("inside"), b"x").unwrap();
         let replaced = replace(&candidate(&kept, tmp.path()), &candidate(&dup, tmp.path()));
-        assert!(matches!(replaced, Replaced::Skipped));
+        if clone::may_clone(tmp.path()) {
+            assert!(matches!(replaced, Replaced::Skipped));
+        } else {
+            assert!(matches!(replaced, Replaced::Unsupported));
+        }
         assert!(dup.join("inside").exists());
         assert!(
             fsutil::entries(tmp.path()).all(|(n, _)| !n.contains(TEMP_MARK)),

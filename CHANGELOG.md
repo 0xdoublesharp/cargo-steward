@@ -30,6 +30,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- On Linux, cleanup's own reads no longer count as a build using what it
+  reads. Under `relatime`, reading a unit's fingerprint to see whether it's
+  idle moved its access time, so idle units and caches always looked used and
+  were never removed. Cleanup and `dedup` now read build output with
+  `O_NOATIME`.
 - The `cargo` proxy seeds from target directories it created itself. Cargo
   doesn't tag a directory it didn't create, and without its rustc cache file
   such a directory wasn't recognized as a build to clone, so the new worktree
