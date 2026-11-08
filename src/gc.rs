@@ -9,11 +9,13 @@
 //! 5. when a disk runs low, whole directories, those whose bytes cost least
 //!    to rebuild first.
 //!
-//! When applying, each profile directory is examined and cleaned while
-//! holding cargo's own locks, so a running build is never touched and the
-//! decision can't go stale between looking and deleting. Nothing a running
-//! program was started from is removed ([`guard`]). Build directories are
-//! worked on in parallel, each by one thread.
+//! Each profile is listed once, when its build directory is inspected
+//! ([`ProfileScan`]). When applying, each profile directory is cleaned while
+//! holding cargo's own locks, and whatever the listing shows unused is dated
+//! again under them before it goes, so a running build is never touched and
+//! the decision can't go stale between looking and deleting. Nothing a
+//! running program was started from is removed ([`guard`]). Build
+//! directories are worked on in parallel, each by one thread.
 
 mod guard;
 
