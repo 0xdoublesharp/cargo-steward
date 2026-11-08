@@ -56,6 +56,11 @@ impl Paths {
     pub fn log(&self) -> PathBuf {
         self.home.join("gc.log")
     }
+
+    /// The lock files compiles hold while `max-compiles` limits them.
+    pub fn compile_slots(&self) -> PathBuf {
+        self.home.join("compile-slots")
+    }
 }
 
 /// `$CARGO_HOME`, defaulting to `~/.cargo` as cargo does.
@@ -129,12 +134,17 @@ pub struct Config {
     /// none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub previous_build_dir: Option<String>,
-    /// Keep replaced object files this long, so binaries that are still
-    /// running keep readable backtraces.
+    /// Keep replaced object files at most this long while a program
+    /// started from their unit's executable runs, so it keeps readable
+    /// backtraces.
     pub object_grace: String,
     /// Before removing a whole build directory, check that no running
-    /// process was started from it.
+    /// process was started from it; and keep replaced object files within
+    /// `object-grace` only for running programs (when off, for all of it).
     pub process_guard: bool,
+    /// Run at most this many compiles at once, machine-wide. Unset or 0 for
+    /// no limit.
+    pub max_compiles: Option<u32>,
     /// Start a new worktree's build directory as a clone of its repository's
     /// main build directory (copy-on-write; APFS, btrfs, XFS).
     pub seed: bool,
@@ -206,6 +216,7 @@ impl Default for Config {
             previous_build_dir: None,
             object_grace: "10m".into(),
             process_guard: true,
+            max_compiles: None,
             seed: true,
             dedup: true,
             target_root: None,
@@ -512,6 +523,7 @@ mod tests {
         assert_eq!(paths.stamp(), PathBuf::from("/s/gc.stamp"));
         assert_eq!(paths.gc_lock(), PathBuf::from("/s/gc.lock"));
         assert_eq!(paths.log(), PathBuf::from("/s/gc.log"));
+        assert_eq!(paths.compile_slots(), PathBuf::from("/s/compile-slots"));
     }
 
     #[test]
@@ -665,6 +677,31 @@ mod tests {
             home: tmp.path().to_path_buf(),
         };
         assert_eq!(load_lenient(&paths), (Config::default(), Vec::new()));
+    }
+
+    #[test]
+    fn the_compile_limit_round_trips_and_loads_leniently() {
+        let config = Config {
+            max_compiles: Some(4),
+            ..Config::default()
+        };
+        let text = toml::to_string_pretty(&config).unwrap();
+        assert!(text.contains("max-compiles = 4"), "{text}");
+        assert_eq!(toml::from_str::<Config>(&text).unwrap(), config);
+        assert_eq!(Config::default().max_compiles, None);
+
+        let (config, problems) = lenient_str("max-compiles = 2\n");
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(config.max_compiles, Some(2));
+        // Zero means no limit, and is still a known setting.
+        let (config, problems) = lenient_str("max-compiles = 0\n");
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(config.max_compiles, Some(0));
+        let (config, problems) = lenient_str("max-compiles = -1\nauto-gc = true\n");
+        assert_eq!(config.max_compiles, None);
+        assert!(config.auto_gc);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].starts_with("max-compiles:"), "{problems:?}");
     }
 
     /// A symlinked config stays a link to the file it names, and a private

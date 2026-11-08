@@ -110,7 +110,7 @@ Cheapest-to-rebuild first. Every threshold is a setting.
 
 | What | When | Rebuild cost |
 |---|---|---|
-| Object files a later compile replaced | Right after the compile, by the wrapper, once older than `object-grace` (10 minutes); any left over, by cleanup | None. Nothing reads them. |
+| Object files a later compile replaced | Right after the compile, by the wrapper (while a program started from that unit's binary or test runs, once older than `object-grace`, 10 minutes); any left over, by cleanup | None. Nothing reads them. |
 | Old-layout files (`deps/`, `.fingerprint/`, `build/<pkg>-<hash>/`) | Once Cargo 1.100's layout is in use in that directory and no older toolchain has built there for `legacy-idle` (3 days) | None |
 | A crate's incremental cache | Unused for `incremental-idle` (7 days) | That crate compiles from scratch once |
 | A build unit (new layout) | Unused for `unit-idle` (14 days), and no unit used since was built from it (cargo's fingerprints link them) | That unit rebuilds if needed again |
@@ -125,8 +125,11 @@ Safety:
   skipped until next time.
 - A directory a running program was started from (a test node, a server) is
   kept, whatever its age (`process-guard`).
-- Replaced object files are kept for `object-grace`, so a binary that's still
-  running keeps symbolized backtraces.
+- Replaced object files are kept while a program started from their unit's
+  binary or test executable (in the build directory, or the copy cargo puts
+  in the profile directory) still runs, for up to `object-grace`, so it keeps
+  symbolized backtraces. With `process-guard = false` they're kept for
+  `object-grace` whether or not anything runs.
 - Directories are renamed aside before they're deleted, so nothing ever sees
   one half removed. What an interrupted cleanup leaves is finished by the
   next `gc --apply`, never by a preview.
@@ -161,8 +164,9 @@ orphan-grace = "2d"
 recent-guard = "1d"
 min-free = "50GiB"
 target-free = "100GiB"
-object-grace = "10m"          # keep replaced object files this long, so running binaries keep backtraces
+object-grace = "10m"          # keep replaced object files up to this long while a binary built from them runs
 process-guard = true          # don't remove a build directory a running process was started from
+# max-compiles = 8            # at most this many compiles at once, machine-wide; unset or 0 for no limit
 seed = true                   # start new worktrees' build directories as clones (`seed`)
 dedup = true                  # let cleanup replace identical files with clones (`dedup`)
 
@@ -178,7 +182,8 @@ dedup = true                  # let cleanup replace identical files with clones 
 # max-builds = 3
 ```
 
-`CARGO_STEWARD_INNER` overrides `inner-wrapper` (empty for none).
+`CARGO_STEWARD_INNER` overrides `inner-wrapper` (empty for none), and
+`CARGO_STEWARD_MAX_COMPILES` overrides `max-compiles` (`0` for no limit).
 
 Automatic cleanups log to `~/.cargo/steward/gc.log`.
 
@@ -192,6 +197,27 @@ incremental cache, so anything with an old name and an old timestamp belongs
 to an earlier compile. Calls that compile nothing (`rustc -vV`, `--print`) are
 handed straight to rustc. Measured overhead is under a millisecond per
 compile, and about 4 ms on cargo's cached version probe.
+
+A program still running from the unit's binary or test executable may have
+been linked from the objects a compile replaced, and its backtraces need
+them. When some of those objects are from within `object-grace`, the wrapper
+looks for such a program, first by the short process names the system keeps
+(about half a millisecond on macOS), then by path, file identity, or the name
+and size of the copy cargo uplifts into the profile directory. It keeps them
+while one runs and removes them otherwise. Cleanup applies the same rule to
+what's left over. Libraries have no executable, so their replaced objects
+never need the lookup.
+
+With `max-compiles = N`, at most N compiles run at once on the machine,
+however many builds start them: several agents each running cargo with a
+job per core share N rustc processes instead of oversubscribing CPU and
+memory. Each compile holds one of N slots while its rustc runs: an exclusive
+lock on a file in `compile-slots/` in the steward home, which rustc and what
+it starts never inherit and the system releases however the compile ends. A
+compile that finds every slot taken waits for one without printing anything
+(cargo reads rustc's output), and one started from inside another compile,
+such as by a proc macro, doesn't wait. Calls that compile nothing take no
+slot. The `cargo` proxy's `max-builds` limits whole builds instead.
 
 For workspace members, the wrapper also appends one line to a ledger: which
 build directory, which package, how long the compile took. Cleanup compacts it

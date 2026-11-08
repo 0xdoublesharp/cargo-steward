@@ -389,6 +389,21 @@ fn check_wrapper(out: &mut Report, settings: &config::Config, configured: Option
             "No inner wrapper (such as sccache) is configured",
         ),
     }
+    let from = if env::var_os(wrapper::MAX_COMPILES_VAR).is_some() {
+        wrapper::MAX_COMPILES_VAR
+    } else {
+        "max-compiles"
+    };
+    match wrapper::compile_limit(settings) {
+        Some(limit) => out.say(
+            Level::Ok,
+            format!("At most {limit} compile(s) run at once, machine-wide ({from})"),
+        ),
+        None => out.say(
+            Level::Info,
+            format!("Compiles run as many at once as Cargo starts ({from} is unset)"),
+        ),
+    }
 }
 
 /// The toolchain each recorded package's project pins, and the projects

@@ -132,6 +132,10 @@ fn bare_machine_reports_what_is_missing() {
     assert!(out.contains("No rustc-wrapper is set"), "{out}");
     assert!(out.contains("cargo-steward isn't on PATH"), "{out}");
     assert!(out.contains("No inner wrapper"), "{out}");
+    assert!(
+        out.contains("  -- Compiles run as many at once as Cargo starts (max-compiles is unset)"),
+        "{out}"
+    );
     assert!(out.contains("rustup isn't installed"), "{out}");
     assert!(out.contains("No builds recorded yet"), "{out}");
     assert!(out.contains("sccache isn't installed"), "{out}");
@@ -241,7 +245,13 @@ Cache size                           3 GiB\\nMax cache size                     
     fx.set("SCCACHE_CACHE_SIZE", "20G");
     fx.set("XDG_CONFIG_HOME", root.join("xdg"));
 
+    // The limit can come from the environment.
+    fx.set("CARGO_STEWARD_MAX_COMPILES", "2");
     let out = fx.doctor();
+    assert!(
+        out.contains("At most 2 compile(s) run at once, machine-wide (CARGO_STEWARD_MAX_COMPILES)"),
+        "{out}"
+    );
     // Wrapper
     assert!(
         out.contains(&format!("is 0.0.1, but this binary is {VERSION}")),
@@ -352,7 +362,8 @@ fn healthy_settings_are_reported_ok() {
     write(
         &fx.steward.join("config.toml"),
         &format!(
-            "scan-roots = [{:?}]\ninner-wrapper = \"not-installed-wrapper\"\nmin-free = \"0B\"\n",
+            "scan-roots = [{:?}]\ninner-wrapper = \"not-installed-wrapper\"\nmin-free = \"0B\"\n\
+             max-compiles = 4\n",
             scan.display().to_string()
         ),
     );
@@ -388,6 +399,10 @@ esac"#,
     assert!(out.contains("The wrapper is this binary"), "{out}");
     assert!(
         out.contains("Inner wrapper not-installed-wrapper isn't installed"),
+        "{out}"
+    );
+    assert!(
+        out.contains("  ok At most 4 compile(s) run at once, machine-wide (max-compiles)"),
         "{out}"
     );
     assert!(

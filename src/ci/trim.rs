@@ -296,7 +296,7 @@ fn trim(options: &Options, tracking: Tracking) -> Report {
             // The job is over: nothing it built is still running and
             // needs old objects for backtraces, so no grace applies.
             let no_grace = SystemTime::now() + Duration::from_secs(86_400);
-            let files: Vec<PathBuf> = scan::stale_objects_in(&dir, no_grace)
+            let files: Vec<PathBuf> = scan::stale_objects_in(&dir, no_grace, None)
                 .into_iter()
                 .flat_map(|s| s.files)
                 .filter(|f| !out.is_gone(f))

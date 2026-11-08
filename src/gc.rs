@@ -29,7 +29,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 
 pub use document::Document;
-pub use guard::Running;
+pub use guard::{Running, UnitExe};
 
 use crate::config::{self, Paths, Policy};
 use crate::fsutil::{self, Lock, human};
@@ -615,7 +615,19 @@ fn clean_profile(
     let keep_after = now.checked_sub(policy.object_grace).unwrap_or(UNIX_EPOCH);
 
     for dir in scan::object_dirs(profile) {
-        let stale = scan::stale_objects_in(&dir, keep_after);
+        // Older objects within the grace stay only for programs that may
+        // need them; with the process guard off, for the whole grace.
+        let started = |unit: &str| {
+            sweep
+                .running
+                .started_from(&UnitExe::new(&dir, unit))
+                .is_some()
+        };
+        let running = sweep
+            .running
+            .listed()
+            .then_some(&started as &dyn Fn(&str) -> bool);
+        let stale = scan::stale_objects_in(&dir, keep_after, running);
         if stale.is_empty() {
             continue;
         }
@@ -1632,6 +1644,45 @@ mod tests {
         let running = Running::default();
         let cleanup = clean(&dirs, sweep(&policy, &running, true));
         assert_eq!(cleanup.actions.len(), 1);
+        assert!(!out.join("app.x.0five.rcgu.o").exists());
+        assert!(out.join("app.x.0now.rcgu.o").exists());
+    }
+
+    #[test]
+    fn keeps_stale_objects_within_the_grace_only_for_running_programs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = build_dir(tmp.path(), "target");
+        let unit = root.join("debug/build/app/0123456789abcdef");
+        let out = unit.join("out");
+        make(&unit.join("fingerprint/bin-app"));
+        make(&out.join("app"));
+        let minute = Duration::from_secs(60);
+        let replaced = |invocation: &str, age: Duration| {
+            let path = out.join(format!("app.x.{invocation}.rcgu.o"));
+            make(&path);
+            set_modified(&path, age);
+        };
+        replaced("0five", 5 * minute);
+        replaced("0now", minute / 60);
+        let dirs = vec![BuildDir::inspect(&root, None)];
+        let policy = policy();
+
+        // The binary runs: its objects stay for the grace.
+        let running = Running::of(vec![guard::Process {
+            pid: 7,
+            exe: out.join("app"),
+        }]);
+        let cleanup = clean(&dirs, sweep(&policy, &running, true));
+        assert!(cleanup.actions.is_empty(), "{:?}", cleanup.actions);
+        assert!(out.join("app.x.0five.rcgu.o").exists());
+
+        // Nothing runs from it: only the newest compile's objects stay.
+        let running = Running::of(vec![guard::Process {
+            pid: 7,
+            exe: root.join("debug/other"),
+        }]);
+        let cleanup = clean(&dirs, sweep(&policy, &running, true));
+        assert_eq!(cleanup.actions.len(), 1, "{:?}", cleanup.actions);
         assert!(!out.join("app.x.0five.rcgu.o").exists());
         assert!(out.join("app.x.0now.rcgu.o").exists());
     }

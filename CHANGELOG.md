@@ -85,6 +85,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   times and stable ids for kinds and statuses, so scripts and agents don't
   parse text. `shim explain --json` includes the free space where the target
   directory goes. [docs/json.md](docs/json.md) describes each document.
+- `max-compiles` setting (or `CARGO_STEWARD_MAX_COMPILES`): at most that
+  many compiles run at once, machine-wide. The wrapper holds one of N lock
+  file slots for as long as rustc runs, so concurrent builds from many
+  worktrees stop oversubscribing CPU and memory. `doctor` shows the limit.
 - `link-target` setting for the `cargo` proxy: when it routes a workspace's
   build output, it also points a missing `<workspace>/target` at the routed
   directory (only where git ignores `target`), so `./target` paths and builds
@@ -132,3 +136,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   until that crate's next compile.
 - `scripts/install.sh` for new machines (from source, git, or a release
   binary) and a release workflow building macOS and Linux binaries.
+
+### Changed
+
+- `object-grace` keeps replaced object files only while a program started
+  from their unit's binary or test executable (or the copy cargo uplifts)
+  runs, for up to that long; otherwise a rebuild keeps only the newest
+  generation, so an edit-test loop no longer keeps every generation from the
+  last 10 minutes. The wrapper and cleanup look for running programs only
+  when there are replaced objects within the grace. With
+  `process-guard = false`, the grace applies to every replaced object as
+  before.

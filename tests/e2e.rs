@@ -3,7 +3,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -399,4 +399,115 @@ fn remove_takes_only_build_dirs_and_previews_first() {
 
     fx.steward(&["remove", "--apply", "--force", &target]);
     assert!(!fx.target.exists());
+}
+
+/// Two worktrees' builds started at once through the wrapper, sharing one
+/// cargo-steward home whose settings add `settings`. The inner wrapper is a
+/// script that marks each compile as running while it runs, and records an
+/// overlap when one starts while another runs. With `wait_for_peer`, each
+/// compile waits (up to a few seconds) for the other to start. Returns the
+/// steward home and the recorded log directory.
+fn concurrent_builds(settings: &str, wait_for_peer: bool) -> (tempfile::TempDir, PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let home = root.join("steward-home");
+    let log = root.join("log");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&log).unwrap();
+    fs::write(home.join("config.toml"), settings).unwrap();
+    let pause = if wait_for_peer {
+        "i=0; while [ \"$(ls \"$log\" | grep -c '^started')\" -lt 2 ] && [ $i -lt 100 ]; do \
+         sleep 0.1; i=$((i+1)); done"
+    } else {
+        "sleep 1"
+    };
+    let script = root.join("inner.sh");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\n\
+             case \" $* \" in *\" --out-dir \"*) ;; *) exec \"$@\" ;; esac\n\
+             log={log:?}\n\
+             mkdir \"$log/busy\" 2>/dev/null || echo overlap >> \"$log/overlaps\"\n\
+             : > \"$log/started.$$\"\n\
+             {pause}\n\
+             \"$@\"; status=$?\n\
+             rmdir \"$log/busy\" 2>/dev/null\n\
+             exit $status\n",
+            log = log.display().to_string()
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let cargo = std::env::var_os("STEWARD_TEST_CARGO").unwrap_or_else(|| env!("CARGO").into());
+    let builds: Vec<_> = ["one", "two"]
+        .iter()
+        .map(|name| {
+            let project = root.join(name);
+            fs::create_dir_all(project.join("src")).unwrap();
+            fs::write(
+                project.join("Cargo.toml"),
+                format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+            )
+            .unwrap();
+            fs::write(project.join("src/main.rs"), "fn main() {}\n").unwrap();
+            Command::new(&cargo)
+                .arg("build")
+                .current_dir(&project)
+                .env("CARGO_TARGET_DIR", project.join("target"))
+                .env("CARGO_STEWARD_HOME", &home)
+                .env("CARGO_STEWARD_INNER", &script)
+                .env_remove("CARGO_STEWARD_MAX_COMPILES")
+                .env("CARGO_TERM_COLOR", "never")
+                .env("RUSTC_WRAPPER", BIN)
+                .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for build in builds {
+        let out = build.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let started = fs::read_dir(&log)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("started"))
+        .count();
+    assert_eq!(started, 2, "each build compiles once");
+    (tmp, home)
+}
+
+#[test]
+fn max_compiles_runs_one_compile_at_a_time_across_builds() {
+    let (tmp, home) = concurrent_builds("max-compiles = 1\n", false);
+    let log = tmp.path().canonicalize().unwrap().join("log");
+    assert!(
+        !log.join("overlaps").exists(),
+        "two compiles ran at once despite max-compiles = 1"
+    );
+    // One slot, released: nothing holds it now.
+    let slot = home.join("compile-slots/0.lock");
+    let file = fs::File::options().write(true).open(&slot).unwrap();
+    file.try_lock().unwrap();
+}
+
+#[test]
+fn without_max_compiles_compiles_run_at_once() {
+    let (tmp, home) = concurrent_builds("", true);
+    let log = tmp.path().canonicalize().unwrap().join("log");
+    assert!(
+        log.join("overlaps").exists(),
+        "the compiles should have run at the same time"
+    );
+    assert!(!home.join("compile-slots").exists());
 }
