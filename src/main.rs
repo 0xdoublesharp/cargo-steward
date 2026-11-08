@@ -51,7 +51,11 @@ enum Cmd {
     /// Make cargo-steward Cargo's rustc-wrapper and turn on automatic cleanup
     Setup(setup::Args),
     /// Check the setup and report what to change
-    Doctor,
+    Doctor {
+        /// Print one JSON document instead of text
+        #[arg(long)]
+        json: bool,
+    },
     /// List the build directories cargo-steward manages
     Status {
         /// Measure each directory's size (slower)
@@ -167,7 +171,7 @@ fn main() -> ExitCode {
     let json = cli.command.json();
     let result = match cli.command {
         Cmd::Setup(args) => setup::run(&args),
-        Cmd::Doctor => doctor::run(),
+        Cmd::Doctor { json } => doctor::run(json),
         Cmd::Status { sizes, json } => status::run(sizes, json),
         Cmd::Gc {
             apply,
@@ -226,7 +230,8 @@ impl Cmd {
     /// Whether the command was asked for a JSON document.
     fn json(&self) -> bool {
         match self {
-            Cmd::Status { json, .. }
+            Cmd::Doctor { json }
+            | Cmd::Status { json, .. }
             | Cmd::Gc { json, .. }
             | Cmd::Dedup { json, .. }
             | Cmd::Remove { json, .. } => *json,

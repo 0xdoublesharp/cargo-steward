@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use super::{Level, cmd, say};
+use super::{Level, Report, cmd};
 use crate::setup::shell_quote;
 
 /// One line of `tmutil isexcluded`: `[Excluded]  /path` or `[Included]  /path`.
@@ -90,9 +90,9 @@ fn indexing(root: &Path) -> Indexing {
     }
 }
 
-pub fn report_root(status: &RootStatus) {
+pub fn report_root(out: &mut Report, status: &RootStatus) {
     for (level, message) in root_findings(status) {
-        say(level, message);
+        out.say(level, message);
     }
 }
 
@@ -126,12 +126,12 @@ fn root_findings(status: &RootStatus) -> Vec<(Level, String)> {
 /// Build directories on the system disk that Time Machine still backs up.
 /// Cargo excludes target directories it creates itself; ones a script
 /// created first aren't.
-pub fn report_build_dirs(on_system_disk: usize, statuses: &[Exclusion]) {
+pub fn report_build_dirs(out: &mut Report, on_system_disk: usize, statuses: &[Exclusion]) {
     if !cfg!(target_os = "macos") || on_system_disk == 0 {
         return;
     }
     let included: Vec<&Exclusion> = statuses.iter().filter(|e| !e.excluded).collect();
-    say(
+    out.say(
         Level::Info,
         format!(
             "{on_system_disk} build directories are on the system disk, where local snapshots keep deleted files\n\
@@ -140,7 +140,7 @@ pub fn report_build_dirs(on_system_disk: usize, statuses: &[Exclusion]) {
     );
     if included.is_empty() {
         if !statuses.is_empty() {
-            say(Level::Ok, "Time Machine excludes all of them");
+            out.say(Level::Ok, "Time Machine excludes all of them");
         }
         return;
     }
@@ -152,7 +152,7 @@ pub fn report_build_dirs(on_system_disk: usize, statuses: &[Exclusion]) {
         .iter()
         .map(|e| format!("tmutil addexclusion {}", shell_quote(&e.path)))
         .collect();
-    say(
+    out.say(
         Level::Warn,
         format!(
             "Time Machine backs up {} of them (created before cargo could exclude them):\n{}\n\

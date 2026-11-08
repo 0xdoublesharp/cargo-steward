@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::{Level, say};
+use super::{Level, Report};
 
 const TARGET_DIR_KEY: &str = "rust-analyzer.cargo.targetDir";
 
@@ -116,7 +116,7 @@ pub fn separate_target_dir(settings_text: &str) -> Option<String> {
 
 /// Checks the user's editor settings and each workspace's
 /// `.vscode/settings.json`.
-pub fn report(home: Option<&Path>, workspace_roots: &BTreeSet<PathBuf>) {
+pub fn report(out: &mut Report, home: Option<&Path>, workspace_roots: &BTreeSet<PathBuf>) {
     let files: Vec<PathBuf> = home
         .map(user_settings_files)
         .unwrap_or_default()
@@ -142,7 +142,7 @@ pub fn report(home: Option<&Path>, workspace_roots: &BTreeSet<PathBuf>) {
         }
     }
     if !found.is_empty() {
-        say(
+        out.say(
             Level::Info,
             format!(
                 "{}\nrust-analyzer then checks into its own target directory, so every project's\n\
@@ -152,12 +152,12 @@ pub fn report(home: Option<&Path>, workspace_roots: &BTreeSet<PathBuf>) {
             ),
         );
     } else if read > 0 {
-        say(
+        out.say(
             Level::Ok,
             "rust-analyzer shares each project's target directory (no cargo.targetDir set)",
         );
     } else {
-        say(Level::Info, "No VS Code or Cursor settings found");
+        out.say(Level::Info, "No VS Code or Cursor settings found");
     }
 }
 

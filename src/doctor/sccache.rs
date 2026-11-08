@@ -7,7 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use super::{Level, cmd, say};
+use super::{Level, Report, cmd};
 use crate::config;
 use crate::fsutil::{self, human};
 use crate::wrapper;
@@ -146,9 +146,9 @@ fn user_config_dir() -> Option<PathBuf> {
     env_sccache_dir(&text, home.parent()?)
 }
 
-pub fn report(probe: &Probe, workspaces: &BTreeSet<PathBuf>) {
+pub fn report(out: &mut Report, probe: &Probe, workspaces: &BTreeSet<PathBuf>) {
     let Some(program) = &probe.program else {
-        say(
+        out.say(
             Level::Info,
             "sccache isn't installed. It shares compiled dependencies between build directories\n\
              (worktrees, toolchains' rebuilds); cargo-steward runs it as the inner wrapper if you\n\
@@ -166,7 +166,7 @@ pub fn report(probe: &Probe, workspaces: &BTreeSet<PathBuf>) {
                 .clone()
                 .or_else(|| probe.measured.map(human))
                 .unwrap_or_else(|| "size unknown".to_owned());
-            say(
+            out.say(
                 Level::Ok,
                 format!(
                     "sccache ({}): {}\n{size} used of {} (the running server's limit).\n\
@@ -187,7 +187,7 @@ pub fn report(probe: &Probe, workspaces: &BTreeSet<PathBuf>) {
                 env::var_os("SCCACHE_DIR").filter(|v| !v.is_empty()),
             ) && Path::new(&here) != server
             {
-                say(
+                out.say(
                     Level::Warn,
                     format!(
                         "SCCACHE_DIR here is {}, but the running sccache server uses {}:\n\
@@ -199,7 +199,7 @@ pub fn report(probe: &Probe, workspaces: &BTreeSet<PathBuf>) {
                 );
             }
         }
-        None => say(
+        None => out.say(
             Level::Warn,
             format!(
                 "sccache is installed at {}, but `sccache --show-stats` failed or timed out",
@@ -234,7 +234,7 @@ pub fn report(probe: &Probe, workspaces: &BTreeSet<PathBuf>) {
             || "a larger size".to_owned(),
             |max| format!("about {}", human(max * caches.len() as u64)),
         );
-    say(
+    out.say(
         Level::Warn,
         format!(
             "{} sccache directories are in use, so dependency builds aren't shared between them:\n{}\n\

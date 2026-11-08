@@ -60,8 +60,21 @@ impl Fixture {
     }
 
     fn doctor(&self) -> String {
+        self.run(&["doctor"])
+    }
+
+    /// `doctor --json`, parsed: stdout must be exactly one JSON document.
+    fn doctor_json(&self) -> serde_json::Value {
+        let out = self.run(&["doctor", "--json"]);
+        let doc: serde_json::Value = serde_json::from_str(&out)
+            .unwrap_or_else(|e| panic!("stdout isn't one JSON document ({e}):\n{out}"));
+        assert_eq!(doc["version"], 1, "{doc}");
+        doc
+    }
+
+    fn run(&self, args: &[&str]) -> String {
         let mut command = Command::new(BIN);
-        command.arg("doctor").env_clear();
+        command.args(args).env_clear();
         // Keep coverage instrumentation's output location, if any.
         if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
             command.env("LLVM_PROFILE_FILE", profile);
@@ -660,4 +673,108 @@ fn reads_the_legacy_cargo_config_cargo_reads() {
         out.contains("Debug info in dev builds is reduced for every project"),
         "{out}"
     );
+}
+
+/// The checks of section `id` in a `doctor --json` document.
+fn checks<'a>(doc: &'a serde_json::Value, id: &str) -> &'a Vec<serde_json::Value> {
+    doc["sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == id)
+        .unwrap_or_else(|| panic!("no {id} section: {doc}"))["checks"]
+        .as_array()
+        .unwrap()
+}
+
+#[test]
+fn doctor_json_groups_the_checks_text_reports_by_section() {
+    let fx = Fixture::new();
+    script(&fx.bin.join("tmutil"), "exit 1");
+    script(&fx.bin.join("mdutil"), "exit 1");
+    write(&fx.steward.join("config.toml"), "dir-idle = \"soon\"\n");
+    let doc = fx.doctor_json();
+    let ids: Vec<&str> = doc["sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            "settings",
+            "wrapper",
+            "toolchains",
+            "projects",
+            "compiler_cache",
+            "editors",
+            "disks",
+            "cleanup"
+        ]
+    );
+    let settings = checks(&doc, "settings");
+    assert_eq!(settings[0]["level"], "warn", "{doc}");
+    assert!(
+        settings[0]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("Settings: dir-idle:"),
+        "{doc}"
+    );
+    assert!(
+        settings[0]["fix"].as_str().unwrap().starts_with("edit "),
+        "{doc}"
+    );
+    let wrapper = checks(&doc, "wrapper");
+    let unset = wrapper
+        .iter()
+        .find(|c| c["message"] == "No rustc-wrapper is set in Cargo's user config.")
+        .unwrap_or_else(|| panic!("{doc}"));
+    assert_eq!(unset["level"], "warn");
+    assert_eq!(unset["fix"], "cargo steward setup");
+    let info = checks(&doc, "cleanup")
+        .iter()
+        .find(|c| c["level"] == "info")
+        .unwrap();
+    assert!(info.get("fix").is_none(), "{doc}");
+
+    // The text says the same, check for check.
+    let text = fx.doctor();
+    let warn = doc["counts"]["warn"].as_u64().unwrap() as usize;
+    let ok = doc["counts"]["ok"].as_u64().unwrap() as usize;
+    let info = doc["counts"]["info"].as_u64().unwrap() as usize;
+    assert_eq!(text.matches("  !! ").count(), warn, "{text}");
+    assert_eq!(text.matches("  ok ").count(), ok, "{text}");
+    assert_eq!(text.matches("  -- ").count(), info, "{text}");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn doctor_json_notes_when_a_fix_applies() {
+    let fx = Fixture::new();
+    let scan = fx.root.join("scratch");
+    fs::create_dir_all(&scan).unwrap();
+    script(&fx.bin.join("tmutil"), "exit 1");
+    script(&fx.bin.join("mdutil"), "echo 'Indexing enabled.'");
+    write(
+        &fx.steward.join("config.toml"),
+        &format!("scan-roots = [{:?}]\n", scan.display().to_string()),
+    );
+    let doc = fx.doctor_json();
+    let spotlight = checks(&doc, "disks")
+        .iter()
+        .find(|c| {
+            c["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("Spotlight indexes")
+        })
+        .unwrap_or_else(|| panic!("{doc}"));
+    assert_eq!(spotlight["level"], "warn");
+    assert_eq!(
+        spotlight["fix"],
+        format!("sudo mdutil -i off {}", scan.display())
+    );
+    assert_eq!(spotlight["fix_note"], "volume roots");
 }

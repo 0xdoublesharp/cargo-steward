@@ -6,7 +6,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::{Level, say};
+use super::{Level, Report};
 use crate::config;
 
 /// How much debug info a `[profile.dev]` asks for.
@@ -85,7 +85,7 @@ pub fn workspace_roots(packages: &BTreeSet<PathBuf>) -> BTreeSet<PathBuf> {
 /// Mentions `debug = "line-tables-only"` for workspaces whose dev profile
 /// keeps full debug info, unless the environment or the user-wide Cargo
 /// config already reduces it everywhere.
-pub fn report(roots: &BTreeSet<PathBuf>) {
+pub fn report(out: &mut Report, roots: &BTreeSet<PathBuf>) {
     if roots.is_empty() {
         return;
     }
@@ -96,7 +96,7 @@ pub fn report(roots: &BTreeSet<PathBuf>) {
         .and_then(|h| fs::read_to_string(config::user_cargo_config(&h)).ok())
         .map_or(Debug::Unset, |t| dev_debug(&t));
     if from_env == Debug::Reduced || (from_env == Debug::Unset && from_user == Debug::Reduced) {
-        say(
+        out.say(
             Level::Ok,
             "Debug info in dev builds is reduced for every project (environment or ~/.cargo/config.toml)",
         );
@@ -111,7 +111,7 @@ pub fn report(roots: &BTreeSet<PathBuf>) {
         .map(|root| root.display().to_string())
         .collect();
     if full.is_empty() {
-        say(
+        out.say(
             Level::Ok,
             "Every recorded workspace reduces debug info in dev builds",
         );
@@ -122,7 +122,7 @@ pub fn report(roots: &BTreeSet<PathBuf>) {
     if full.len() > SHOWN {
         list.push(format!("and {} more", full.len() - SHOWN));
     }
-    say(
+    out.say(
         Level::Info,
         format!(
             "{} of {} recorded workspaces build with full debug info in the dev profile:\n{}\n\
