@@ -426,6 +426,7 @@ fn concurrent_builds(settings: &str, wait_for_peer: bool) -> (tempfile::TempDir,
         &script,
         format!(
             "#!/bin/sh\n\
+             set -x\n\
              case \" $* \" in *\" --out-dir \"*) ;; *) exec \"$@\" ;; esac\n\
              log={log:?}\n\
              mkdir \"$log/busy\" 2>/dev/null || echo overlap >> \"$log/overlaps\"\n\
@@ -472,6 +473,9 @@ fn concurrent_builds(settings: &str, wait_for_peer: bool) -> (tempfile::TempDir,
         .collect();
     for build in builds {
         let out = build.wait_with_output().unwrap();
+        // The harness shows successful child output only if the enclosing
+        // test fails, so concurrency failures retain the shell's timeline.
+        eprintln!("{}", String::from_utf8_lossy(&out.stderr));
         assert!(
             out.status.success(),
             "{}",
