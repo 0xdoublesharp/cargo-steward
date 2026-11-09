@@ -27,7 +27,10 @@ use crate::config::{self, Config, Paths};
 use route::Namespace;
 pub use route::{linked_worktree, worktree_dropped};
 
-pub use gate::{ancestor_pids, descendant_pids, is_ancestor, process_ids};
+pub use gate::{ancestor_pids, descendant_pids, is_ancestor};
+// Cleanup lists processes this way only on macOS.
+#[cfg(target_os = "macos")]
+pub use gate::process_ids;
 
 /// `cargo steward shim`.
 #[derive(Debug, clap::Args)]
