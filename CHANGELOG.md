@@ -4,6 +4,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-08
+
+### Changed
+
+- The GitHub Action downloads a checksum-verified prebuilt release by
+  default and reuses a matching binary restored by rust-cache. Set
+  `install-from-source: true` to build a development checkout or crates.io
+  release; source mode always rebuilds, even with a matching version cached.
+
+### Fixed
+
+- Release archive and checksum downloads retry transient HTTP errors,
+  including 504, with connection and request timeouts.
+
 ## [0.2.0] - 2026-11-08
 
 ### Added

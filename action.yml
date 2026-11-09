@@ -49,10 +49,17 @@ inputs:
     default: '.'
   version:
     description: >-
-      For `start`, the cargo-steward release to install from crates.io. Empty to build
-      the version this action was checked out at.
+      For `start`, the exact cargo-steward release to install. Empty uses the
+      version this action was checked out at. Downloads a checksum-verified binary.
     required: false
     default: ''
+  install-from-source:
+    description: >-
+      For `start`, compile instead of downloading a release binary. With `version`,
+      builds that crates.io release; otherwise builds this action's checkout.
+      Use for development refs. Always rebuilds, even if the version is installed.
+    required: false
+    default: 'false'
 
 runs:
   using: composite
@@ -64,30 +71,52 @@ runs:
       working-directory: ${{ runner.temp }}
       env:
         STEWARD_VERSION: ${{ inputs.version }}
+        STEWARD_FROM_SOURCE: ${{ inputs.install-from-source }}
         CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-steward-install
+        TMPDIR: ${{ runner.temp }}
         # A wrapper set for the job (possibly cargo-steward itself) mustn't
         # build cargo-steward.
         RUSTC_WRAPPER: ''
         CARGO_BUILD_RUSTC_WRAPPER: ''
       run: |
         set -eo pipefail
-        want="$STEWARD_VERSION"
+        want="${STEWARD_VERSION#v}"
         if [ -z "$want" ]; then
           want="$(sed -n 's/^version = "\(.*\)"/\1/p' "$GITHUB_ACTION_PATH/Cargo.toml" | head -n 1)"
         fi
-        if command -v cargo-steward >/dev/null 2>&1; then
-          have="$(cargo-steward --version | awk '{print $NF}')"
-          if [ "$have" = "$want" ]; then
-            echo "cargo-steward $have is installed"
-            exit 0
-          fi
+        case "$STEWARD_FROM_SOURCE" in
+          false)
+            if command -v cargo-steward >/dev/null 2>&1; then
+              have="$(cargo-steward --version | awk '{print $NF}')"
+              if [ "$have" = "$want" ]; then
+                echo "cargo-steward $have is installed"
+                exit 0
+              fi
+            fi
+            sh "$GITHUB_ACTION_PATH/scripts/install.sh" --release "$want" \
+              --repo 0xdoublesharp/cargo-steward --no-setup
+            bin_dir="${CARGO_HOME:-$HOME/.cargo}/bin"
+            ;;
+          true)
+            if [ -n "$STEWARD_VERSION" ]; then
+              cargo install --locked --force cargo-steward --version "$want"
+            else
+              cargo install --locked --force --path "$GITHUB_ACTION_PATH"
+            fi
+            rm -rf "$CARGO_TARGET_DIR"
+            bin_dir="${CARGO_INSTALL_ROOT:-${CARGO_HOME:-$HOME/.cargo}}/bin"
+            ;;
+          *)
+            echo "::error::cargo-steward: install-from-source must be 'true' or 'false'"
+            exit 1
+            ;;
+        esac
+        have="$("$bin_dir/cargo-steward" --version | awk '{print $NF}')"
+        if [ "$have" != "$want" ]; then
+          echo "::error::cargo-steward: expected version $want, installed $have"
+          exit 1
         fi
-        if [ -n "$STEWARD_VERSION" ]; then
-          cargo install --locked --force cargo-steward --version "$STEWARD_VERSION"
-        else
-          cargo install --locked --force --path "$GITHUB_ACTION_PATH"
-        fi
-        rm -rf "$CARGO_TARGET_DIR"
+        echo "$bin_dir" >> "$GITHUB_PATH"
 
     - name: cargo steward ci ${{ inputs.mode }}
       shell: bash

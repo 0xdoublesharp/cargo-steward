@@ -388,17 +388,20 @@ then run `mode: trim` before the cache is saved:
 
 ```yaml
 - uses: Swatinem/rust-cache@v2
-- uses: 0xdoublesharp/cargo-steward@v0.2.0
+- uses: 0xdoublesharp/cargo-steward@v0.2.1
   with:
     mode: start
 - run: cargo test --locked
   env:
     RUSTC_WRAPPER: cargo-steward
-- uses: 0xdoublesharp/cargo-steward@v0.2.0
+- uses: 0xdoublesharp/cargo-steward@v0.2.1
   with:
     mode: trim
     budget: 6GiB
 ```
+
+`start` reuses a matching cached binary or downloads a checksum-verified
+prebuilt release. Use `install-from-source: true` for development checkouts.
 
 The wrapper records direct-compiler CPU samples for cost-aware retention.
 An inner cache wrapper such as sccache keeps working, but its client timings

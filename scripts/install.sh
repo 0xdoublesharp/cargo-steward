@@ -20,7 +20,7 @@
 #
 # Anything else is passed to `cargo steward setup`, for example
 #   scripts/install.sh --scan-root /Volumes/Scratch
-#   scripts/install.sh --release 0.2.0 --repo OWNER/cargo-steward -- --volume Scratch
+#   scripts/install.sh --release 0.2.1 --repo OWNER/cargo-steward -- --volume Scratch
 #
 # CARGO_STEWARD_RELEASE_URL replaces https://github.com/OWNER/NAME/releases
 # (for a mirror).
@@ -156,9 +156,12 @@ detect_target() {
 
 download() {
     if command -v curl >/dev/null 2>&1; then
-        curl --proto '=https,file' --tlsv1.2 -fsSL -o "$2" "$1"
+        curl --proto '=https,file' --tlsv1.2 -fsSL \
+            --retry 5 --retry-max-time 180 --connect-timeout 15 --max-time 60 \
+            -o "$2" "$1"
     elif command -v wget >/dev/null 2>&1; then
-        wget -q -O "$2" "$1"
+        wget -q --tries=6 --timeout=30 \
+            --retry-on-http-error=429,500,502,503,504 -O "$2" "$1"
     else
         die "neither curl nor wget is installed"
     fi

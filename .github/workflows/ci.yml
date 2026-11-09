@@ -20,27 +20,22 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
-      - name: Install Cargo Steward v0.2.0
-        if: runner.os != 'Windows'
+      - name: Track Cargo build cache
+        uses: ./
+        with:
+          mode: start
+          # Bootstrap with a published binary before this checkout is released.
+          version: '0.2.0'
+      - name: Configure Cargo wrapper
         shell: bash
         run: |
-          installer="$RUNNER_TEMP/install-cargo-steward.sh"
-          curl --fail --silent --show-error --location --retry 3 https://raw.githubusercontent.com/0xdoublesharp/cargo-steward/v0.2.0/scripts/install.sh -o "$installer"
-          sh "$installer" --release 0.2.0 --repo 0xdoublesharp/cargo-steward --no-setup
-          echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
           if [[ -n "${RUSTC_WRAPPER:-}" && "$RUSTC_WRAPPER" != cargo-steward ]]; then
             printf 'CARGO_STEWARD_INNER=%s\n' "$RUSTC_WRAPPER" >> "$GITHUB_ENV"
           fi
           echo "RUSTC_WRAPPER=cargo-steward" >> "$GITHUB_ENV"
-      - name: Track Cargo build cache
-        if: runner.os != 'Windows'
-        uses: 0xdoublesharp/cargo-steward@v0.2.0
-        with:
-          mode: start
       - run: cargo test
       - name: Trim Cargo build cache
-        if: runner.os != 'Windows'
-        uses: 0xdoublesharp/cargo-steward@v0.2.0
+        uses: ./
         with:
           mode: trim
           budget: 4GiB
@@ -58,23 +53,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.99.0
       - run: rustup toolchain install ${{ matrix.toolchain }} --profile minimal
       - uses: Swatinem/rust-cache@v2
-      - name: Install Cargo Steward v0.2.0
-        if: runner.os != 'Windows'
+      - name: Track Cargo build cache
+        uses: ./
+        with:
+          mode: start
+          # Bootstrap with a published binary before this checkout is released.
+          version: '0.2.0'
+      - name: Configure Cargo wrapper
         shell: bash
         run: |
-          installer="$RUNNER_TEMP/install-cargo-steward.sh"
-          curl --fail --silent --show-error --location --retry 3 https://raw.githubusercontent.com/0xdoublesharp/cargo-steward/v0.2.0/scripts/install.sh -o "$installer"
-          sh "$installer" --release 0.2.0 --repo 0xdoublesharp/cargo-steward --no-setup
-          echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
           if [[ -n "${RUSTC_WRAPPER:-}" && "$RUSTC_WRAPPER" != cargo-steward ]]; then
             printf 'CARGO_STEWARD_INNER=%s\n' "$RUSTC_WRAPPER" >> "$GITHUB_ENV"
           fi
           echo "RUSTC_WRAPPER=cargo-steward" >> "$GITHUB_ENV"
-      - name: Track Cargo build cache
-        if: runner.os != 'Windows'
-        uses: 0xdoublesharp/cargo-steward@v0.2.0
-        with:
-          mode: start
       - name: End-to-end tests with the other cargo
         run: |
           STEWARD_TEST_CARGO="$(rustup +${{ matrix.toolchain }} which cargo)"
@@ -82,8 +73,7 @@ jobs:
           export STEWARD_TEST_CARGO RUSTC
           cargo test --test e2e --test ci --test warm_start
       - name: Trim Cargo build cache
-        if: runner.os != 'Windows'
-        uses: 0xdoublesharp/cargo-steward@v0.2.0
+        uses: ./
         with:
           mode: trim
           budget: 4GiB
@@ -97,30 +87,25 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      - name: Install Cargo Steward v0.2.0
-        if: runner.os != 'Windows'
+      - name: Track Cargo build cache
+        uses: ./
+        with:
+          mode: start
+          # Bootstrap with a published binary before this checkout is released.
+          version: '0.2.0'
+      - name: Configure Cargo wrapper
         shell: bash
         run: |
-          installer="$RUNNER_TEMP/install-cargo-steward.sh"
-          curl --fail --silent --show-error --location --retry 3 https://raw.githubusercontent.com/0xdoublesharp/cargo-steward/v0.2.0/scripts/install.sh -o "$installer"
-          sh "$installer" --release 0.2.0 --repo 0xdoublesharp/cargo-steward --no-setup
-          echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
           if [[ -n "${RUSTC_WRAPPER:-}" && "$RUSTC_WRAPPER" != cargo-steward ]]; then
             printf 'CARGO_STEWARD_INNER=%s\n' "$RUSTC_WRAPPER" >> "$GITHUB_ENV"
           fi
           echo "RUSTC_WRAPPER=cargo-steward" >> "$GITHUB_ENV"
-      - name: Track Cargo build cache
-        if: runner.os != 'Windows'
-        uses: 0xdoublesharp/cargo-steward@v0.2.0
-        with:
-          mode: start
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - name: Shellcheck
         run: shellcheck scripts/install.sh
       - name: Trim Cargo build cache
-        if: runner.os != 'Windows'
-        uses: 0xdoublesharp/cargo-steward@v0.2.0
+        uses: ./
         with:
           mode: trim
           budget: 4GiB
@@ -138,28 +123,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # `sh` is dash on Ubuntu, which keeps the script POSIX. Setup runs
       # against the runner's own Cargo config, which is thrown away after.
-      - name: Install Cargo Steward v0.2.0
-        if: runner.os != 'Windows'
+      - name: Track Cargo build cache
+        uses: ./
+        with:
+          mode: start
+          # Bootstrap with a published binary before this checkout is released.
+          version: '0.2.0'
+      - name: Configure Cargo wrapper
         shell: bash
         run: |
-          installer="$RUNNER_TEMP/install-cargo-steward.sh"
-          curl --fail --silent --show-error --location --retry 3 https://raw.githubusercontent.com/0xdoublesharp/cargo-steward/v0.2.0/scripts/install.sh -o "$installer"
-          sh "$installer" --release 0.2.0 --repo 0xdoublesharp/cargo-steward --no-setup
-          echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
           if [[ -n "${RUSTC_WRAPPER:-}" && "$RUSTC_WRAPPER" != cargo-steward ]]; then
             printf 'CARGO_STEWARD_INNER=%s\n' "$RUSTC_WRAPPER" >> "$GITHUB_ENV"
           fi
           echo "RUSTC_WRAPPER=cargo-steward" >> "$GITHUB_ENV"
-      - name: Track Cargo build cache
-        if: runner.os != 'Windows'
-        uses: 0xdoublesharp/cargo-steward@v0.2.0
-        with:
-          mode: start
       - run: sh scripts/install.sh --scan-root "$RUNNER_TEMP"
       - run: cargo steward --version
       - name: Trim Cargo build cache
-        if: runner.os != 'Windows'
-        uses: 0xdoublesharp/cargo-steward@v0.2.0
+        uses: ./
         with:
           mode: trim
           budget: 4GiB

@@ -1,7 +1,7 @@
 # Releasing Cargo Steward
 
 The crate, command-line binary and GitHub Action share the version in
-`Cargo.toml`. A release tag such as `v0.2.0` must match that version.
+`Cargo.toml`. A release tag such as `v0.2.1` must match that version.
 
 ## Prepare and validate
 
@@ -15,8 +15,8 @@ The crate, command-line binary and GitHub Action share the version in
 4. After CI passes, tag that commit and push the tag:
 
    ```sh
-   git tag -a v0.2.0 -m "Cargo Steward 0.2.0"
-   git push origin v0.2.0
+   git tag -a v0.2.1 -m "Cargo Steward 0.2.1"
+   git push origin v0.2.1
    ```
 
 Pushing the tag runs the release workflow. The main-branch CI workflow does
@@ -40,7 +40,7 @@ with its `tag` input. A manual run skips crate publication.
 ## GitHub Marketplace
 
 The versioned tag makes the Action usable as
-`0xdoublesharp/cargo-steward@v0.2.0`. To add that release to its Marketplace
+`0xdoublesharp/cargo-steward@v0.2.1`. To add that release to its Marketplace
 listing, edit the GitHub release, select **Publish this Action to the GitHub
 Marketplace**, confirm its categories and update the release. The account
 owner must have accepted GitHub's Marketplace Developer Agreement.
@@ -52,7 +52,7 @@ See GitHub's [Marketplace publishing guide](https://docs.github.com/en/actions/h
 - Check that crates.io reports the new version and that it is not yanked.
 - Check that the GitHub release has four binary archives and four checksum
   files, and that the Marketplace version selector offers the new version.
-- Install a prebuilt binary with `scripts/install.sh --release 0.2.0
+- Install a prebuilt binary with `scripts/install.sh --release 0.2.1
   --repo 0xdoublesharp/cargo-steward --no-setup` in an isolated Cargo home,
   then check `cargo-steward --version`.
 - Use the [CI guide](ci.md) to check the Action's start/build/trim order.

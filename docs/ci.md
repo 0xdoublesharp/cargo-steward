@@ -68,14 +68,14 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2           # restores here, saves in its post step
-      - uses: 0xdoublesharp/cargo-steward@v0.2.0
+      - uses: 0xdoublesharp/cargo-steward@v0.2.1
         with:
           mode: start                          # after the restore, before any build
       - run: cargo test --locked
         env:
           RUSTC_WRAPPER: cargo-steward            # records direct compiler costs
       - run: cargo steward stats
-      - uses: 0xdoublesharp/cargo-steward@v0.2.0
+      - uses: 0xdoublesharp/cargo-steward@v0.2.1
         with:
           mode: trim                           # last step: runs before rust-cache saves
           budget: 6GiB
@@ -111,7 +111,7 @@ crates and let cargo-steward select them:
   with:
     cache-workspace-crates: true
 # ... cargo-steward start, then build/test ...
-- uses: 0xdoublesharp/cargo-steward@v0.2.0
+- uses: 0xdoublesharp/cargo-steward@v0.2.1
   with:
     mode: trim
     budget: 6GiB
@@ -128,31 +128,30 @@ set `working-directory` on both Action steps and the Cargo run steps.
 
 ### Installing
 
-`mode: start` installs cargo-steward when the matching version isn't already
-on `PATH`. By default it builds the action's own checkout (the ref you wrote
-after `@`) with `cargo install --locked --path`, which takes about a minute.
-rust-cache caches binaries installed during a job (`cache-bin`, on by
-default), so later runs find it and skip the build. Set `version` to
-install that release from crates.io instead. To install it some other way,
-put it on `PATH` before the `start` step.
+`mode: start` reuses a matching cargo-steward on `PATH`. Otherwise it
+downloads the prebuilt release matching the Action's package version,
+verifies the archive's SHA-256, and adds the binary directory to `PATH`.
+Set `version` to select another exact release. Downloads retry transient
+errors, including HTTP 504; a failed download or checksum stops the job.
+The runner's Cargo configuration stays intact.
 
-To avoid compiling the CLI on a cold runner, install its prebuilt release
-before `mode: start`. The installer verifies the archive's SHA-256 and
-`--no-setup` keeps the runner's Cargo configuration intact:
+Put `Swatinem/rust-cache` before `start`: its `cache-bin` option is on by
+default, so it saves the installed binary and later runs can reuse it
+without downloading or compiling. The Action itself doesn't create a cache.
+
+To build a development ref, opt into compilation:
 
 ```yaml
-- name: Install prebuilt Cargo Steward
-  shell: bash
-  run: |
-    installer="$RUNNER_TEMP/install-cargo-steward.sh"
-    curl -fsSL https://raw.githubusercontent.com/0xdoublesharp/cargo-steward/v0.2.0/scripts/install.sh -o "$installer"
-    sh "$installer" --release 0.2.0 --repo 0xdoublesharp/cargo-steward --no-setup
+- uses: 0xdoublesharp/cargo-steward@main
+  with:
+    mode: start
+    install-from-source: true
 ```
 
-The Action detects the matching binary and skips its source build.
-
-The build uses the runner's default toolchain, not your workspace's
-`rust-toolchain.toml`, and needs Rust 1.89 or newer.
+Source mode always builds the checkout, including when a binary with the
+same version is cached. With `version`, it builds that release from
+crates.io instead. It uses the runner's default toolchain, not your
+workspace's `rust-toolchain.toml`, and needs Rust 1.89 or newer.
 
 ### Inputs
 
@@ -166,7 +165,8 @@ The build uses the runner's default toolchain, not your workspace's
 | `eviction` | `rebuild-cost` | `trim`: compiler cost and dependency impact per byte, or `lru` |
 | `target-dir` | from `cargo metadata` | the build directory |
 | `working-directory` | `.` | where the Cargo workspace is |
-| `version` | the action's ref | `start`: release to install from crates.io |
+| `version` | the Action's package version | `start`: exact release to install |
+| `install-from-source` | `false` | `start`: compile the checkout, or the crates.io release selected by `version` |
 
 Linux and macOS runners only.
 
