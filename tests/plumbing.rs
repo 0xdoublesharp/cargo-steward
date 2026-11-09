@@ -1169,6 +1169,161 @@ fn the_wrapper_records_the_peak_of_a_compiler_its_cache_wrapper_ran() {
     assert!(unmeasured["max_rss_bytes"].is_null(), "{unmeasured}");
 }
 
+/// Whether a process with this ID still runs. One that has exited but is
+/// not yet reaped does not.
+fn runs(pid: &str) -> bool {
+    let out = Command::new("ps")
+        .args(["-o", "stat=", "-p", pid])
+        .output()
+        .unwrap();
+    let state = String::from_utf8_lossy(&out.stdout);
+    !state.trim().is_empty() && !state.trim_start().starts_with('Z')
+}
+
+fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+    for _ in 0..600 {
+        if done() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!("timed out waiting until {what}");
+}
+
+/// A stand-in for cargo: starts the wrapper, records its process ID, and
+/// waits for it.
+fn fake_cargo(env: &Env, name: &str, rustc: &Path, out_dir: &Path) -> (Command, PathBuf) {
+    let cargo = env.root.join(name);
+    let pid = env.root.join(format!("{name}.wrapper-pid"));
+    script(
+        &cargo,
+        &format!(
+            "'{BIN}' '{}' --out-dir '{}' &\necho $! > '{}'\nwait",
+            rustc.display(),
+            out_dir.display(),
+            pid.display()
+        ),
+    );
+    // The same isolated environment the wrapper is otherwise run with.
+    let mut command = Command::new(&cargo);
+    command.current_dir(&env.root);
+    for (key, value) in env.cmd(&env.root, &[]).get_envs() {
+        match value {
+            Some(value) => command.env(key, value),
+            None => command.env_remove(key),
+        };
+    }
+    (command, pid)
+}
+
+/// Regression: cargo killed alone left its compiles running. Six orphaned
+/// fat-LTO links held 114 GB for 38 minutes, with nothing to use them.
+#[test]
+fn a_compile_ends_when_the_cargo_that_started_it_is_killed() {
+    let env = Env::new();
+    let out_dir = env.root.join("out");
+    fs::create_dir_all(&out_dir).unwrap();
+    let compiler_pid = env.root.join("compiler-pid");
+    // The compiler runs below a cache client, as an uncacheable unit does.
+    let rustc = fake_rustc(
+        &env.root,
+        &format!("echo $$ > '{}'\nexec sleep 600", compiler_pid.display()),
+    );
+    let inner = env.root.join("cache-client");
+    script(&inner, "\"$@\"\nexit $?");
+
+    // A compile outlasting several looks at a parent that is alive is left
+    // alone.
+    let quick = env.root.join("quick");
+    fs::create_dir_all(&quick).unwrap();
+    let quick = fake_rustc(&quick, "sleep 2.5\nexit 0");
+    env.ok(env
+        .cmd(
+            &env.root,
+            &[
+                quick.to_str().unwrap(),
+                "--out-dir",
+                out_dir.to_str().unwrap(),
+            ],
+        )
+        .env("CARGO_STEWARD_INNER", &inner));
+
+    let (mut cargo, wrapper_pid) = fake_cargo(&env, "cargo", &rustc, &out_dir);
+    let mut cargo = common::spawn_retrying(cargo.env("CARGO_STEWARD_INNER", &inner));
+    let written = |path: &Path| fs::read_to_string(path).is_ok_and(|pid| !pid.trim().is_empty());
+    wait_until("the compiler starts", || {
+        written(&compiler_pid) && written(&wrapper_pid)
+    });
+    let compiler = fs::read_to_string(&compiler_pid).unwrap();
+    let wrapper = fs::read_to_string(&wrapper_pid).unwrap();
+    assert!(runs(compiler.trim()) && runs(wrapper.trim()));
+
+    cargo.kill().unwrap();
+    cargo.wait().unwrap();
+    wait_until("the orphaned compiler ends", || !runs(compiler.trim()));
+    wait_until("the orphaned wrapper ends", || !runs(wrapper.trim()));
+}
+
+/// An orphaned wrapper still waiting for a compile slot leaves instead of
+/// starting its compile.
+#[test]
+fn a_queued_compile_never_starts_once_its_cargo_is_killed() {
+    let env = Env::new();
+    env.config("max-compiles = 1\ncompile-memory-budget = \"1GiB\"\nauto-gc = false\n");
+    let out_dir = env.root.join("out");
+    fs::create_dir_all(&out_dir).unwrap();
+
+    // Another build's compile holds the only slot and the whole budget.
+    let holding = env.root.join("holding");
+    fs::create_dir_all(&holding).unwrap();
+    let holder_pid = env.root.join("holder-pid");
+    let holder = fake_rustc(
+        &holding,
+        &format!("echo $$ > '{}'\nexec sleep 600", holder_pid.display()),
+    );
+    let mut holder = common::spawn_retrying(&mut env.cmd(
+        &env.root,
+        &[
+            holder.to_str().unwrap(),
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+        ],
+    ));
+    wait_until("the slot is held", || {
+        fs::read_to_string(&holder_pid).is_ok_and(|pid| !pid.trim().is_empty())
+    });
+
+    let ran = env.root.join("queued-ran");
+    let rustc = fake_rustc(&env.root, &format!(": > '{}'", ran.display()));
+    let (mut cargo, wrapper_pid) = fake_cargo(&env, "cargo", &rustc, &out_dir);
+    let mut cargo = common::spawn_retrying(&mut cargo);
+    // The first waiter holds the admission lock for as long as it waits.
+    let admission = fs::File::open(env.home.join("compile-slots/admission.lock")).unwrap();
+    wait_until("the wrapper waits for the slot", || {
+        match admission.try_lock() {
+            Ok(()) => {
+                admission.unlock().unwrap();
+                false
+            }
+            Err(_) => true,
+        }
+    });
+    wait_until("the wrapper's process ID is written", || {
+        fs::read_to_string(&wrapper_pid).is_ok_and(|pid| !pid.trim().is_empty())
+    });
+    let wrapper = fs::read_to_string(&wrapper_pid).unwrap();
+    cargo.kill().unwrap();
+    cargo.wait().unwrap();
+    wait_until("the queued wrapper leaves", || !runs(wrapper.trim()));
+
+    // The holder's parent, this test, is alive: its compile was left alone.
+    let holding = fs::read_to_string(&holder_pid).unwrap();
+    assert!(runs(holding.trim()));
+    Command::new("kill").arg(holding.trim()).status().unwrap();
+    holder.wait().unwrap();
+    assert!(!ran.exists(), "the orphaned compile started");
+}
+
 #[test]
 fn the_wrapper_records_workspace_compiles_in_the_ledger() {
     let env = Env::new();

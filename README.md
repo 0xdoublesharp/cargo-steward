@@ -304,6 +304,12 @@ wrapper first looks for a program started from it (or from the copy cargo
 puts in the profile directory), and keeps them while one runs. An inner
 wrapper that isn't installed is skipped, so builds keep working without it.
 
+When the process that started a compile exits first (Cargo killed alone by
+a supervisor's timeout, say), nothing will use that compile's output. The
+wrapper notices within a second and sends SIGTERM to the compile and every
+process below it. A wrapper still waiting for a compile slot leaves without
+starting its compile.
+
 **Compile slots.** With `max-compiles = N`, at most N compiles run at once
 on the machine, however many builds start them: several agents each running
 cargo with a job per core share N rustc processes. Each compile holds a lock

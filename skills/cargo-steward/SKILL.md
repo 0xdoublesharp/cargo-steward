@@ -37,6 +37,8 @@ rustc-wrapper is cargo-steward. Otherwise follow the project's own rules.
   measured; others use the fallback estimate. Reservations are not an RSS
   cap. Count and memory overrides are independent;
   `CARGO_STEWARD_MEMORY_BUDGET=0` disables memory admission.
+- **Orphaned compiles:** when the process that started a compile exits
+  first, such as a cargo killed alone, the wrapper ends that compile.
 - **Costs:** `cargo steward stats --json` shows per-unit execution and queue
   time, plus CPU/RSS for direct compiler children. CI trim uses recent CPU
   cost per byte where observed, with LRU fallback and `--eviction lru`.

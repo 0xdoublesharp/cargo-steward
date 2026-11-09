@@ -12,7 +12,8 @@
 //!
 //! Nothing here may fail or slow a build: every step is best effort, and
 //! invocations that compile nothing (`rustc -vV`, `--print`) are handed
-//! straight to rustc.
+//! straight to rustc. A compile is ended early only once the process that
+//! asked for it has exited ([`orphan`]).
 
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -24,6 +25,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::config::{self, Config, Paths};
 use crate::{costs, gc, ledger, scan};
 
+mod orphan;
 mod slots;
 
 /// Overrides `max-compiles`.
@@ -63,6 +65,8 @@ pub fn run(argv: Vec<OsString>) -> ! {
         .ok()
         .filter(|&n| n > 0)
         .unwrap_or(2 << 30);
+    // From before the wait for a slot: a build that is gone starts nothing.
+    let orphans = orphan::Guard::watch();
     let queued = Instant::now();
     let memory_budget = memory_budget(&config);
     let slot = match (&paths, compile_limit(&config), memory_budget) {
@@ -84,12 +88,15 @@ pub fn run(argv: Vec<OsString>) -> ! {
     };
     let queue_time = queued.elapsed();
     let started = Instant::now();
-    let mut child = Command::new(&command[0]);
-    child.args(&command[1..]);
+    let mut compile = Command::new(&command[0]);
+    compile.args(&command[1..]);
     if let Some(slot) = &slot {
-        slot.describe_child(&mut child);
+        slot.describe_child(&mut compile);
     }
-    let status = child.status();
+    let status = orphans
+        .spawn(&mut compile)
+        .and_then(|mut child| child.wait());
+    orphans.finished();
     drop(slot);
     let status = match status {
         Ok(status) => status,

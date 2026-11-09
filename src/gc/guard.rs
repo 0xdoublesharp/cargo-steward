@@ -103,16 +103,7 @@ fn list(wanted: Option<NameFilter>) -> Option<Vec<Process>> {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
 
-    // SAFETY: a null buffer of size 0 asks only for the number of processes.
-    let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
-    let count = usize::try_from(count).ok()?;
-    // Room for processes started between the two calls.
-    let mut pids: Vec<libc::pid_t> = vec![0; count + 64];
-    let bytes = libc::c_int::try_from(pids.len() * size_of::<libc::pid_t>()).ok()?;
-    // SAFETY: `pids` is writable for `bytes` bytes and outlives the call.
-    let found = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
-    pids.truncate(usize::try_from(found).ok()?);
-
+    let pids = crate::proxy::process_ids()?;
     let mut processes = Vec::with_capacity(pids.len());
     let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
     for pid in pids {
