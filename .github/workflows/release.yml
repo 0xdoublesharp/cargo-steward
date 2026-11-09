@@ -137,10 +137,10 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           {
-            echo '### Finish Marketplace publication'
+            echo '### Verify Marketplace publication'
             echo ''
-            printf -- '- [ ] Open the [release editor](https://github.com/%s/releases/edit/%s), select **Publish this Action to the GitHub Marketplace**, confirm categories and update the release.\n' "$GITHUB_REPOSITORY" "$RELEASE_TAG"
-            printf -- '- [ ] Verify **%s** is offered on the [Marketplace listing](https://github.com/marketplace/actions/cargo-steward).\n' "$RELEASE_TAG"
+            printf -- '- [ ] Verify **%s** is offered as latest on the [Marketplace listing](https://github.com/marketplace/actions/cargo-steward).\n' "$RELEASE_TAG"
             echo ''
-            echo 'GitHub and crates.io publication alone do not finish the release.'
+            printf 'The existing listing can pick up published releases automatically. If this version is missing, open the [release editor](https://github.com/%s/releases/edit/%s), select **Publish this Action to the GitHub Marketplace**, confirm categories and update the release.\n' "$GITHUB_REPOSITORY" "$RELEASE_TAG"
+            echo 'Verify the listing before reporting the release complete.'
           } >> "$GITHUB_STEP_SUMMARY"

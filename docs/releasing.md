@@ -18,13 +18,15 @@ The crate, command-line binary and GitHub Action share the version in
    git tag -a v0.2.1 -m "Cargo Steward 0.2.1"
    git push origin v0.2.1
    ```
-5. Wait for the release workflow to succeed, then publish the Action to
-   GitHub Marketplace using the release editor
-   (`https://github.com/0xdoublesharp/cargo-steward/releases/edit/v0.2.1`).
-   Select **Publish this Action to the GitHub Marketplace**, confirm the
-   categories and update the release. Verify `v0.2.1` is offered on the
+5. Wait for the release workflow to succeed, then verify `v0.2.1` is offered
+   as latest on the
    [Marketplace listing](https://github.com/marketplace/actions/cargo-steward).
-   GitHub and crates.io publication alone do not finish the release.
+   The existing listing can pick up published releases automatically. If the
+   version is missing, open the release editor
+   (`https://github.com/0xdoublesharp/cargo-steward/releases/edit/v0.2.1`),
+   select **Publish this Action to the GitHub Marketplace**, confirm the
+   categories and update the release. Verify the listing before reporting
+   the release complete.
 
 Pushing the tag runs the release workflow. The main-branch CI workflow does
 not run again for tags.
@@ -47,14 +49,21 @@ with its `tag` input. A manual run skips crate publication.
 ## GitHub Marketplace
 
 The versioned tag makes the Action usable as
-`0xdoublesharp/cargo-steward@v0.2.1`. To add that release to its Marketplace
-listing, edit the GitHub release, select **Publish this Action to the GitHub
-Marketplace**, confirm its categories and update the release. The account
-owner must have accepted GitHub's Marketplace Developer Agreement.
+`0xdoublesharp/cargo-steward@v0.2.1`. For this repository's existing listing,
+`v0.2.1` appeared as latest after the automated release without another
+manual update. Verify that each new version appears; do not assume indexing
+has completed just because the release workflow passed.
 
-The release workflow prints the release-editor link and a completion
-checklist in its job summary. Complete that checklist for every release;
-the workflow does not publish to Marketplace automatically.
+To create the listing or enable publication for a missing version, edit the
+GitHub release, select **Publish this Action to the GitHub Marketplace**,
+confirm its categories and update the release. The account owner must have
+accepted GitHub's Marketplace Developer Agreement. The documented
+[Releases API](https://docs.github.com/en/rest/releases/releases#update-a-release)
+has no Marketplace publication parameter.
+
+The release workflow prints the listing and release-editor links with a
+completion checklist in its job summary. Complete that verification for
+every release; use the editor only when publication needs enabling.
 
 See GitHub's [Marketplace publishing guide](https://docs.github.com/en/actions/how-tos/create-and-publish-actions/publish-in-github-marketplace).
 
