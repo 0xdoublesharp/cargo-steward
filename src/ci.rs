@@ -54,7 +54,7 @@ enum CiCommand {
         target_dir: Option<PathBuf>,
     },
     /// Run last, before the cache is saved: remove what the job didn't use,
-    /// then the least recently used units until under the budget
+    /// then enforce the budget using the selected eviction policy
     Trim(TrimArgs),
 }
 

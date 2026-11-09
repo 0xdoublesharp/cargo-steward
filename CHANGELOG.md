@@ -4,6 +4,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-08
+
 ### Added
 
 - Optional `compile-memory-budget` admission alongside the compile count
@@ -21,6 +23,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   builds fall back to LRU; `--eviction lru` selects it explicitly.
   `--keep-package PACKAGE` retains selected workspace members as candidates
   for caching, still subject to job usage and the byte budget.
+- GitHub Action inputs `eviction` and `keep-packages` expose the retention
+  policy and selected workspace packages directly in workflows.
 
 ### Fixed
 
@@ -39,7 +43,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Compile-limit integration tests use a parent-controlled start/release
   barrier instead of a shared busy-directory marker, so fast compiler
   processes cannot make the overlap assertion depend on scheduling.
-- Release builds use the supported macOS 15 Apple Silicon runner. A manual
+- Release builds use supported native macOS runners. A manual
   workflow run can rebuild binaries from an existing release tag without
   republishing the crate.
 

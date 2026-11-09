@@ -74,13 +74,15 @@ rustc-wrapper is cargo-steward. Otherwise follow the project's own rules.
 
 ## Machine output
 
-`status`, `gc`, `remove`, `dedup`, `doctor` and `shim explain` take `--json`:
+`status`, `stats`, `gc`, `remove`, `dedup`, `doctor` and `shim explain` take `--json`:
 one document on stdout, sizes in bytes. Failure prints
 `{"version": 1, "error": "..."}` and exits nonzero.
 
 - `doctor`: `sections[].checks[]` (`level`, `message`, `fix`).
 - `status`: `build_dirs[]` (`path`, `last_used`, `pinned`, `orphaned`,
   `workspaces`, `size_bytes`, `unshared_bytes`), `disks[].free_bytes`.
+- `stats`: `target_dir`, `units[]` (`path`, `observation` with calls,
+  execution/queue/CPU milliseconds and direct-compiler peak RSS).
 - `gc`, `remove`: `applied`, `actions[]` (`kind`, `path`, `bytes`),
   `skipped[].reason`, `total_bytes`, `freed_on_disk[]`; `remove` adds
   `worktrees[]` (`build_dir`, `exists`).
@@ -110,6 +112,7 @@ the line. If a holder is your own background build, finish or stop it.
 | --- | --- |
 | `cargo steward doctor [--json]` | Check the setup |
 | `cargo steward status [--discover] [--sizes] [--json]` | Recorded build directories and last observed compile; `--discover` also scans for unrecorded directories; `--sizes` measures disk use |
+| `cargo steward stats [--target-dir DIR] [--json]` | Per-unit execution and queue time, direct-compiler CPU and peak RSS |
 | `cargo steward gc [--apply] [-v] [--json]` | Preview, or run, a cleanup |
 | `cargo steward remove (--worktree DIR \| BUILD_DIR... \| --orphaned) [--apply] [--json]` | Remove whole build directories safely |
 | `cargo steward pin DIR` / `unpin DIR` | Protect a build directory from cleanup |

@@ -1,6 +1,6 @@
 # JSON output
 
-`status`, `gc`, `remove`, `dedup`, `doctor` and `shim explain` take `--json`.
+`status`, `stats`, `gc`, `remove`, `dedup`, `doctor` and `shim explain` take `--json`.
 With it, a command prints exactly one JSON document on stdout and nothing
 else there; warnings stay on stderr, and the exit status is the same as
 without it. Scripts and AI agents should read these documents rather than

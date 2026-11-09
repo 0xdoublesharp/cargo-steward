@@ -141,6 +141,58 @@ fn git(dir: &Path, args: &[&str]) {
 // ---- shim install / uninstall ----
 
 #[test]
+fn the_action_forwards_cache_policy_and_selected_packages_without_shell_splitting() {
+    let env = Env::new();
+    let bin = env.root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    script(
+        &bin.join("cargo-steward"),
+        "printf '%s\\n' \"$@\" > \"$ARGS_LOG\"",
+    );
+    let action = include_str!("../action.yml");
+    let step = action.split_once("    - name: cargo steward ci").unwrap().1;
+    let body = step.split_once("      run: |\n").unwrap().1;
+    let body = body
+        .lines()
+        .map(|line| line.strip_prefix("        ").unwrap_or(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let log = env.root.join("args");
+    for mode in ["start", "trim"] {
+        let out = Command::new("bash")
+            .args(["-c", &body])
+            .env("PATH", path_with(&bin))
+            .env("ARGS_LOG", &log)
+            .env("MODE", mode)
+            .env("TARGET_DIR", "/build output")
+            .env("BUDGET", "1GiB")
+            .env("KEEP_WORKSPACE", "true")
+            .env("KEEP_INCREMENTAL", "false")
+            .env("EVICTION", "lru")
+            .env("KEEP_PACKAGES", "crate-one\ncrate_two\r\n\n")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", text(&out));
+        let args = fs::read_to_string(&log).unwrap();
+        let mut expected = vec!["ci", mode, "--target-dir", "/build output"];
+        if mode == "trim" {
+            expected.extend([
+                "--budget",
+                "1GiB",
+                "--keep-workspace",
+                "--eviction",
+                "lru",
+                "--keep-package",
+                "crate-one",
+                "--keep-package",
+                "crate_two",
+            ]);
+        }
+        assert_eq!(args.lines().collect::<Vec<_>>(), expected);
+    }
+}
+
+#[test]
 fn install_refuses_to_replace_what_isnt_ours() {
     let env = Env::new();
     let bin = env.root.join("bin");

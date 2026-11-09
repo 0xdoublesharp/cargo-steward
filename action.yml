@@ -27,6 +27,18 @@ inputs:
     description: For `trim`, keep incremental caches (`true` or `false`).
     required: false
     default: 'false'
+  keep-packages:
+    description: >-
+      For `trim`, workspace packages to keep as cache candidates, one per line.
+      Job usage and the budget still apply. Other workspace packages are removed.
+    required: false
+    default: ''
+  eviction:
+    description: >-
+      For `trim`, `rebuild-cost` retains expensive compiler work per byte,
+      including dependent rebuilds; unmeasured caches use LRU. Or select `lru`.
+    required: false
+    default: 'rebuild-cost'
   target-dir:
     description: The build directory. By default, the one `cargo metadata` reports in `working-directory`.
     required: false
@@ -85,6 +97,8 @@ runs:
         BUDGET: ${{ inputs.budget }}
         KEEP_WORKSPACE: ${{ inputs.keep-workspace }}
         KEEP_INCREMENTAL: ${{ inputs.keep-incremental }}
+        KEEP_PACKAGES: ${{ inputs.keep-packages }}
+        EVICTION: ${{ inputs.eviction }}
         TARGET_DIR: ${{ inputs.target-dir }}
       run: |
         set -eo pipefail
@@ -104,6 +118,15 @@ runs:
             if [ "$KEEP_INCREMENTAL" = true ]; then
               args+=(--keep-incremental)
             fi
+            if [ -n "$EVICTION" ]; then
+              args+=(--eviction "$EVICTION")
+            fi
+            while IFS= read -r package || [ -n "$package" ]; do
+              package=${package%$'\r'}
+              if [ -n "$package" ]; then
+                args+=(--keep-package "$package")
+              fi
+            done <<< "$KEEP_PACKAGES"
             ;;
           *)
             echo "::error::cargo-steward: mode must be 'start' or 'trim', not '$MODE'"

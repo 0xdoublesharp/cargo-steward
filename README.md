@@ -19,7 +19,8 @@
 
 **Fast, bounded Cargo builds for people and AI agents working across many
 git worktrees.** cargo-steward removes leaked debug objects, cleans unused
-build output, and gives new worktrees a warm start.
+build output, gives new worktrees a warm start, and keeps expensive compiler
+work in bounded CI caches.
 
 It runs as Cargo's `rustc-wrapper`, keeping sccache or another wrapper
 behind it. An optional `cargo` proxy routes build output and limits
@@ -32,9 +33,10 @@ cron job or launchd agent.
 |---|---|
 | **Smaller build directories** | Removes leaked debug objects after each compile on toolchains from 1.88 up, including pinned ones. Background cleanup removes replaced objects, idle caches and build units, old Cargo layouts, and deleted or long-idle worktrees' build directories. |
 | **Warm worktrees** | Starts a new worktree as a copy-on-write clone of the best build among the repository's other worktrees. Shares identical files across build directories. [Warm starts →](docs/warm-start.md) |
-| **Less contention** | Limits concurrent compiles machine-wide with `max-compiles`, and concurrent Cargo builds through the proxy with `max-builds`. |
+| **Less contention** | Shares compile slots across builds, with optional estimated memory admission. Waiting compilers sleep until work finishes. The proxy's `max-builds` limits whole Cargo builds. |
 | **Output where you want it** | Routes each worktree's build output and temporary files to a scratch volume. [Cargo proxy →](docs/proxy.md) |
-| **Bounded CI caches** | Trims cached build output to what the job used, within a budget. [CI →](docs/ci.md) |
+| **Bounded CI caches** | Keeps the units a job used, then retains costly compiler work per byte, accounting for dependencies. Falls back to LRU without cost observations. [CI →](docs/ci.md) |
+| **Build cost visibility** | `stats` reports per-unit execution and queue time, plus CPU and peak RSS for direct compilers. `status` quickly reads recorded build directories; discovery is opt-in. |
 | **A setup check** | `doctor` finds bad settings, leaking or unused toolchains, wrapper overrides, split sccache caches, full dev debug info, extra rust-analyzer targets, and macOS backup or indexing overhead. |
 
 When a disk runs low, cleanup prioritizes the build directories that cost
@@ -72,7 +74,8 @@ see the [installation guide](docs/install.md).
 ```sh
 cargo steward setup               # become Cargo's rustc-wrapper; turn on automatic cleanup
 cargo steward doctor              # check everything; it says what to change
-cargo steward status --sizes      # the build directories it manages
+cargo steward status              # recorded build directories; --discover searches for others
+cargo steward stats               # per-unit execution, queue time and direct-compiler resources
 cargo steward gc                  # preview a cleanup (`--apply` to run one now)
 ```
 
@@ -112,6 +115,7 @@ git worktree remove ../app-fix-login
 | `setup` | Makes cargo-steward Cargo's rustc-wrapper, turns on automatic cleanup and sets scan roots. `--build-dir` also sets `build.build-dir`; `--volume` creates a macOS build volume | [Installation](docs/install.md#first-time-setup) |
 | `doctor` | Checks the setup and says what to change | |
 | `status` | Quickly lists recorded build directories and their last observed compile; `--discover` scans for others and checks artifact use; `--sizes` measures disk use | |
+| `stats` | Reports per-unit costs from the wrapper; `--target-dir` chooses a build directory and `--json` emits a machine-readable report | [JSON](docs/json.md#stats---json) |
 | `gc` | Shows what a cleanup would remove, by kind (`-v`: every item); `--apply` removes it now | [Cleanup](#what-gets-removed) |
 | `pin`, `unpin` | Keeps a build directory (named by any path inside it) out of cleanup, except its stale object files | |
 | `remove` | Removes whole build directories: the paths given, the one each `--worktree` builds into, or all whose workspaces were deleted with `--orphaned`, without waiting out `orphan-grace`. Previews without `--apply`; pinned ones need `--force` | |
@@ -157,7 +161,7 @@ With `--json`, `status`, `stats`, `gc`, `remove`, `dedup`, `doctor` and
 `shim explain` print one JSON document for scripts and agents;
 [docs/json.md](docs/json.md) describes each one.
 
-The reports (`status`, `doctor`, `shim status`, `shim explain`, and `gc`,
+The reports (`status`, `stats`, `doctor`, `shim status`, `shim explain`, and `gc`,
 `remove` and `dedup` without `--apply`) change nothing, and work where the
 steward home is read-only, as in an agent's sandbox.
 
@@ -379,6 +383,29 @@ up periodically. On runners that restore a cached build directory,
 `cargo steward ci start` and `cargo steward ci trim` keep the cache to what
 the job used. Both, and the GitHub Action, are in [docs/ci.md](docs/ci.md).
 
+For GitHub Actions, restore the cache, run `mode: start`, build and test,
+then run `mode: trim` before the cache is saved:
+
+```yaml
+- uses: Swatinem/rust-cache@v2
+- uses: 0xdoublesharp/cargo-steward@v0.2.0
+  with:
+    mode: start
+- run: cargo test --locked
+  env:
+    RUSTC_WRAPPER: cargo-steward
+- uses: 0xdoublesharp/cargo-steward@v0.2.0
+  with:
+    mode: trim
+    budget: 6GiB
+```
+
+The wrapper records direct-compiler CPU samples for cost-aware retention.
+An inner cache wrapper such as sccache keeps working, but its client timings
+are not used as compiler costs. `eviction: lru` selects recency alone;
+`keep-packages` selects workspace packages, one per line. See the
+[complete workflow and retention options](docs/ci.md#github-hosted-runners-with-rust-cache).
+
 ## Agent skill
 
 `cargo steward skill install` installs a skill (`SKILL.md`) that teaches AI
@@ -399,6 +426,7 @@ removes it.
 | [Cargo proxy](docs/proxy.md) | Routing output, per-project settings and build limits |
 | [CI](docs/ci.md) | Trimming caches and using the GitHub Action |
 | [JSON output](docs/json.md) | Machine-readable reports for scripts and agents |
+| [Releasing](docs/releasing.md) | Versioning, CI, trusted publishing and the Action listing |
 | [Changelog](CHANGELOG.md) | Release history |
 
 ## Development
