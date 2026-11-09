@@ -25,7 +25,7 @@ jobs:
         with:
           mode: start
           # Bootstrap with a published binary before this checkout is released.
-          version: '0.2.0'
+          version: '0.2.1'
       - name: Configure Cargo wrapper
         shell: bash
         run: |
@@ -58,7 +58,7 @@ jobs:
         with:
           mode: start
           # Bootstrap with a published binary before this checkout is released.
-          version: '0.2.0'
+          version: '0.2.1'
       - name: Configure Cargo wrapper
         shell: bash
         run: |
@@ -92,7 +92,7 @@ jobs:
         with:
           mode: start
           # Bootstrap with a published binary before this checkout is released.
-          version: '0.2.0'
+          version: '0.2.1'
       - name: Configure Cargo wrapper
         shell: bash
         run: |
@@ -128,7 +128,7 @@ jobs:
         with:
           mode: start
           # Bootstrap with a published binary before this checkout is released.
-          version: '0.2.0'
+          version: '0.2.1'
       - name: Configure Cargo wrapper
         shell: bash
         run: |

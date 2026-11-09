@@ -68,14 +68,14 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2           # restores here, saves in its post step
-      - uses: 0xdoublesharp/cargo-steward@v0.2.1
+      - uses: 0xdoublesharp/cargo-steward@v0.2.2
         with:
           mode: start                          # after the restore, before any build
       - run: cargo test --locked
         env:
           RUSTC_WRAPPER: cargo-steward            # records direct compiler costs
       - run: cargo steward stats
-      - uses: 0xdoublesharp/cargo-steward@v0.2.1
+      - uses: 0xdoublesharp/cargo-steward@v0.2.2
         with:
           mode: trim                           # last step: runs before rust-cache saves
           budget: 6GiB
@@ -111,7 +111,7 @@ crates and let cargo-steward select them:
   with:
     cache-workspace-crates: true
 # ... cargo-steward start, then build/test ...
-- uses: 0xdoublesharp/cargo-steward@v0.2.1
+- uses: 0xdoublesharp/cargo-steward@v0.2.2
   with:
     mode: trim
     budget: 6GiB

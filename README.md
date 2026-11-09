@@ -388,13 +388,13 @@ then run `mode: trim` before the cache is saved:
 
 ```yaml
 - uses: Swatinem/rust-cache@v2
-- uses: 0xdoublesharp/cargo-steward@v0.2.1
+- uses: 0xdoublesharp/cargo-steward@v0.2.2
   with:
     mode: start
 - run: cargo test --locked
   env:
     RUSTC_WRAPPER: cargo-steward
-- uses: 0xdoublesharp/cargo-steward@v0.2.1
+- uses: 0xdoublesharp/cargo-steward@v0.2.2
   with:
     mode: trim
     budget: 6GiB

@@ -899,26 +899,43 @@ fn clean_profile(
     }
     if !sessions.is_empty() {
         // Each session directory, and the lock file next to it.
-        let session_dirs: Vec<&PathBuf> = sessions.iter().filter(|p| p.is_dir()).collect();
-        let count = session_dirs.len();
-        let bytes: u64 = session_dirs.iter().map(|d| fsutil::tree_size(d)).sum();
-        if sweep.apply {
-            for path in &sessions {
-                if let Err(e) = fsutil::remove_into(path, root) {
-                    eprintln!(
-                        "warning: cargo-steward: failed to remove {}: {e}",
-                        path.display()
-                    );
-                }
+        let mut count = 0;
+        let mut bytes = 0;
+        for path in &sessions {
+            let is_session = path.is_dir();
+            let session_bytes = if is_session {
+                fsutil::tree_size(path)
+            } else {
+                0
+            };
+            if sweep.apply
+                && let Err(e) = fsutil::remove_into(path, root)
+            {
+                eprintln!(
+                    "warning: cargo-steward: failed to remove {}: {e}",
+                    path.display()
+                );
+                out.skipped.push(Skipped {
+                    kind: Kind::OldSessions,
+                    path: path.clone(),
+                    reason: format!("failed to remove: {e}"),
+                });
+                continue;
+            }
+            if is_session {
+                count += 1;
+                bytes += session_bytes;
             }
         }
-        out.actions.push(Action {
-            kind: Kind::OldSessions,
-            path: profile.path.join("incremental"),
-            files: 0,
-            bytes,
-            note: format!("{count} sessions"),
-        });
+        if count > 0 {
+            out.actions.push(Action {
+                kind: Kind::OldSessions,
+                path: profile.path.join("incremental"),
+                files: 0,
+                bytes,
+                note: format!("{count} sessions"),
+            });
+        }
     }
     out
 }
@@ -2546,7 +2563,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_session_that_cannot_be_removed_is_left_in_place() {
+    fn a_session_that_cannot_be_removed_is_not_reported_removed() {
         let tmp = tempfile::tempdir().unwrap();
         let root = build_dir(tmp.path(), "target");
         let cache = root.join("debug/incremental/app-1a2b");
@@ -2557,11 +2574,51 @@ mod tests {
         let dirs = vec![BuildDir::inspect(&root, None)];
         // Nothing in the cache can be renamed or unlinked.
         set_mode(&cache, 0o555);
-        let actions = run_clean(&dirs, true);
+        let policy = policy();
+        let running = Running::default();
+        let cleanup = clean(&dirs, sweep(&policy, &running, true));
         set_mode(&cache, 0o755);
-        let kinds: Vec<Kind> = actions.iter().map(|a| a.kind).collect();
-        assert_eq!(kinds, [Kind::OldSessions]);
+        assert!(cleanup.actions.iter().all(|a| a.kind != Kind::OldSessions));
+        assert_eq!(cleanup.skipped.len(), 1);
+        assert_eq!(cleanup.skipped[0].kind, Kind::OldSessions);
+        assert_eq!(cleanup.skipped[0].path, cache.join("s-h1aaaa-xyz1-3abc"));
+        assert!(cleanup.skipped[0].reason.contains("failed to remove"));
         assert!(cache.join("s-h1aaaa-xyz1-3abc").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn superseded_session_totals_count_only_successful_removals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = build_dir(tmp.path(), "target");
+        make(&root.join("debug/.fingerprint/app-0123456789abcdef/bin-app"));
+        let locked = root.join("debug/incremental/locked-1a2b");
+        let writable = root.join("debug/incremental/writable-3c4d");
+        for cache in [&locked, &writable] {
+            make(&cache.join("s-h1aaaa-xyz1-3abc/dep-graph.bin"));
+            make(&cache.join("s-h2bbbb-xyz2-4def/dep-graph.bin"));
+            age(&cache.join("s-h1aaaa-xyz1-3abc"), Duration::from_secs(3600));
+        }
+        let bytes = fsutil::tree_size(&writable.join("s-h1aaaa-xyz1-3abc"));
+        let dirs = vec![BuildDir::inspect(&root, None)];
+        set_mode(&locked, 0o555);
+        let preview = run_clean(&dirs, false);
+        let policy = policy();
+        let running = Running::default();
+        let cleanup = clean(&dirs, sweep(&policy, &running, true));
+        set_mode(&locked, 0o755);
+
+        assert_eq!(preview.len(), 1);
+        assert_eq!(preview[0].note, "2 sessions");
+        assert_eq!(preview[0].bytes, 2 * bytes);
+        assert_eq!(cleanup.actions.len(), 1);
+        assert_eq!(cleanup.actions[0].kind, Kind::OldSessions);
+        assert_eq!(cleanup.actions[0].note, "1 sessions");
+        assert_eq!(cleanup.actions[0].bytes, bytes);
+        assert_eq!(cleanup.skipped.len(), 1);
+        assert!(locked.join("s-h1aaaa-xyz1-3abc").is_dir());
+        assert!(!writable.join("s-h1aaaa-xyz1-3abc").exists());
+        assert!(writable.join("s-h2bbbb-xyz2-4def/dep-graph.bin").is_file());
     }
 
     #[cfg(unix)]

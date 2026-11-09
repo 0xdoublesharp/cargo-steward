@@ -4,6 +4,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-11-09
+
+### Fixed
+
+- Cleanup counts only successfully removed superseded incremental sessions
+  and their bytes. Failed deletions appear under kept paths with the error
+  instead of inflating removal totals, including in JSON output.
+
 ## [0.2.1] - 2026-11-08
 
 ### Changed
