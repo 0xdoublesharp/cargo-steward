@@ -16,7 +16,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 
 - Release archive and checksum downloads retry transient HTTP errors,
-  including 504, with connection and request timeouts.
+  including 504, with connection and request timeouts. GitHub Actions uses
+  the authenticated asset API when `gh` is available, avoiding release-page
+  download failures.
 
 ## [0.2.0] - 2026-11-08
 

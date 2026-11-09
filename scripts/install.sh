@@ -157,13 +157,33 @@ detect_target() {
 download() {
     if command -v curl >/dev/null 2>&1; then
         curl --proto '=https,file' --tlsv1.2 -fsSL \
-            --retry 5 --retry-max-time 180 --connect-timeout 15 --max-time 60 \
+            --retry 5 --retry-all-errors --retry-max-time 180 --connect-timeout 15 --max-time 60 \
             -o "$2" "$1"
     elif command -v wget >/dev/null 2>&1; then
         wget -q --tries=6 --timeout=30 \
             --retry-on-http-error=429,500,502,503,504 -O "$2" "$1"
     else
         die "neither curl nor wget is installed"
+    fi
+}
+
+download_release_assets() {
+    # The API avoids release-page CDN failures on GitHub-hosted runners.
+    if [ -z "${CARGO_STEWARD_RELEASE_URL:-}" ] &&
+        [ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ] && command -v gh >/dev/null 2>&1; then
+        set -- --repo "$repo" --pattern "$asset" --pattern "$asset.sha256" --dir "$tmp" --clobber
+        if [ "$version" != latest ]; then
+            set -- "v${version#v}" "$@"
+        fi
+        attempt=1
+        until gh release download "$@"; do
+            [ "$attempt" -lt 6 ] || die "release download failed after $attempt attempts"
+            sleep "$attempt"
+            attempt=$((attempt + 1))
+        done
+    else
+        download "$url/$asset" "$tmp/$asset"
+        download "$url/$asset.sha256" "$tmp/$asset.sha256"
     fi
 }
 
@@ -217,8 +237,7 @@ case $mode in
         tmp=$(mktemp -d)
         trap 'rm -rf "$tmp"' EXIT
         say "Downloading $url/$asset"
-        download "$url/$asset" "$tmp/$asset"
-        download "$url/$asset.sha256" "$tmp/$asset.sha256"
+        download_release_assets
         expected=$(cut -d ' ' -f 1 <"$tmp/$asset.sha256")
         actual=$(sha256_of "$tmp/$asset")
         if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then

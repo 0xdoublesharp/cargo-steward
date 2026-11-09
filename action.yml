@@ -72,6 +72,7 @@ runs:
       env:
         STEWARD_VERSION: ${{ inputs.version }}
         STEWARD_FROM_SOURCE: ${{ inputs.install-from-source }}
+        GH_TOKEN: ${{ github.token }}
         CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-steward-install
         TMPDIR: ${{ runner.temp }}
         # A wrapper set for the job (possibly cargo-steward itself) mustn't

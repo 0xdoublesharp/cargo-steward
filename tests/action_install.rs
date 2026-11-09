@@ -108,6 +108,8 @@ impl Fixture {
             .env("HOME", root)
             .env("CARGO_HOME", root.join("cargo"))
             .env_remove("CARGO_INSTALL_ROOT")
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
             .env("CARGO_LOG", root.join("cargo.log"))
             .env("CARGO_TARGET_DIR", root.join("build"))
             .env("GITHUB_ACTION_PATH", env!("CARGO_MANIFEST_DIR"))
@@ -195,6 +197,81 @@ fn action_rejects_bad_checksums_without_compiling() {
 }
 
 #[test]
+fn action_uses_authenticated_asset_api_and_retries_a_connection_failure() {
+    let fx = Fixture::new();
+    script(fx.bin.join("curl"), "exit 88");
+    script(fx.bin.join("sleep"), ":");
+    script(
+        fx.bin.join("gh"),
+        r#"
+printf '%s\n' "$*" >> "$HOME/gh.log"
+if [ ! -f "$HOME/attempted" ]; then
+  touch "$HOME/attempted"
+  exit 56
+fi
+previous=
+destination=
+for arg do
+  if [ "$previous" = --dir ]; then destination=$arg; fi
+  previous=$arg
+done
+cp "$RELEASE_FIXTURE"/* "$destination/"
+"#,
+    );
+    let out = fx
+        .command()
+        .env_remove("CARGO_STEWARD_RELEASE_URL")
+        .env("GH_TOKEN", "fixture-token")
+        .env(
+            "RELEASE_FIXTURE",
+            fx.tmp
+                .path()
+                .join(format!("releases/download/v{}", fx.version)),
+        )
+        .output()
+        .unwrap();
+    fx.assert_ok(&out);
+    let log = fs::read_to_string(fx.tmp.path().join("gh.log")).unwrap();
+    assert_eq!(log.lines().count(), 2, "{log}");
+    assert!(
+        log.contains(&format!(
+            "release download v{} --repo 0xdoublesharp/cargo-steward",
+            fx.version
+        )),
+        "{log}"
+    );
+    assert!(log.contains(".tar.gz.sha256"), "{log}");
+    assert!(!fx.tmp.path().join("cargo.log").exists());
+}
+
+#[test]
+fn action_stops_after_repeated_asset_api_failures_without_compiling() {
+    let fx = Fixture::new();
+    script(fx.bin.join("curl"), "exit 88");
+    script(fx.bin.join("sleep"), ":");
+    script(
+        fx.bin.join("gh"),
+        "echo attempt >> \"$HOME/gh.log\"\nexit 56",
+    );
+    let out = fx
+        .command()
+        .env_remove("CARGO_STEWARD_RELEASE_URL")
+        .env("GH_TOKEN", "fixture-token")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("failed after 6 attempts"));
+    assert_eq!(
+        fs::read_to_string(fx.tmp.path().join("gh.log"))
+            .unwrap()
+            .lines()
+            .count(),
+        6
+    );
+    assert!(!fx.tmp.path().join("cargo.log").exists());
+}
+
+#[test]
 fn action_source_opt_in_builds_the_checkout_even_with_a_matching_binary() {
     let fx = Fixture::new();
     fs::copy(
@@ -237,7 +314,7 @@ fn action_source_opt_in_builds_the_checkout_even_with_a_matching_binary() {
 }
 
 #[test]
-fn release_download_retries_http_504() {
+fn release_download_retries_http_504_and_connection_failures() {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     let fx = Fixture::new();
@@ -246,8 +323,8 @@ fn release_download_retries_http_504() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let server = std::thread::spawn(move || {
-        // Both archive and checksum recover from a first request returning 504.
-        for request in 0..4 {
+        // Recover from an empty reply and from 504s on both archive and checksum.
+        for request in 0..5 {
             let (mut stream, _) = listener.accept().unwrap();
             stream
                 .set_read_timeout(Some(std::time::Duration::from_secs(10)))
@@ -255,7 +332,10 @@ fn release_download_retries_http_504() {
             let mut bytes = [0; 4096];
             let len = stream.read(&mut bytes).unwrap();
             let head = String::from_utf8_lossy(&bytes[..len]);
-            let (status, body): (&str, &[u8]) = if request == 0 || request == 2 {
+            if request == 0 {
+                continue;
+            }
+            let (status, body): (&str, &[u8]) = if request == 1 || request == 3 {
                 ("504 Gateway Timeout", b"temporary failure")
             } else if head.contains(".sha256 ") {
                 ("200 OK", digest.as_bytes())

@@ -135,6 +135,10 @@ Set `version` to select another exact release. Downloads retry transient
 errors, including HTTP 504; a failed download or checksum stops the job.
 The runner's Cargo configuration stays intact.
 
+When `gh` is available, the Action uses GitHub's asset API with the job's
+token to avoid failures on release-page download URLs. Other runners use
+curl or wget. Both paths verify the release checksum.
+
 Put `Swatinem/rust-cache` before `start`: its `cache-bin` option is on by
 default, so it saves the installed binary and later runs can reuse it
 without downloading or compiling. The Action itself doesn't create a cache.
