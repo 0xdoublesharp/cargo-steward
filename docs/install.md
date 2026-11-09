@@ -34,7 +34,7 @@ cargo install --locked --git https://github.com/0xdoublesharp/cargo-steward carg
 **A prebuilt binary** (no Rust toolchain needed):
 
 ```sh
-scripts/install.sh --release 0.2.2 --repo 0xdoublesharp/cargo-steward   # or --release latest
+scripts/install.sh --release 0.2.3 --repo 0xdoublesharp/cargo-steward   # or --release latest
 ```
 
 This downloads `cargo-steward-<target>.tar.gz` for this machine
