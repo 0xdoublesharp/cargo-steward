@@ -132,3 +132,15 @@ jobs:
           files: dist/*
           generate_release_notes: true
           fail_on_unmatched_files: true
+      - name: Marketplace publication reminder
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          {
+            echo '### Finish Marketplace publication'
+            echo ''
+            printf -- '- [ ] Open the [release editor](https://github.com/%s/releases/edit/%s), select **Publish this Action to the GitHub Marketplace**, confirm categories and update the release.\n' "$GITHUB_REPOSITORY" "$RELEASE_TAG"
+            printf -- '- [ ] Verify **%s** is offered on the [Marketplace listing](https://github.com/marketplace/actions/cargo-steward).\n' "$RELEASE_TAG"
+            echo ''
+            echo 'GitHub and crates.io publication alone do not finish the release.'
+          } >> "$GITHUB_STEP_SUMMARY"

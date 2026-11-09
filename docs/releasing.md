@@ -18,6 +18,13 @@ The crate, command-line binary and GitHub Action share the version in
    git tag -a v0.2.1 -m "Cargo Steward 0.2.1"
    git push origin v0.2.1
    ```
+5. Wait for the release workflow to succeed, then publish the Action to
+   GitHub Marketplace using the release editor
+   (`https://github.com/0xdoublesharp/cargo-steward/releases/edit/v0.2.1`).
+   Select **Publish this Action to the GitHub Marketplace**, confirm the
+   categories and update the release. Verify `v0.2.1` is offered on the
+   [Marketplace listing](https://github.com/marketplace/actions/cargo-steward).
+   GitHub and crates.io publication alone do not finish the release.
 
 Pushing the tag runs the release workflow. The main-branch CI workflow does
 not run again for tags.
@@ -44,6 +51,10 @@ The versioned tag makes the Action usable as
 listing, edit the GitHub release, select **Publish this Action to the GitHub
 Marketplace**, confirm its categories and update the release. The account
 owner must have accepted GitHub's Marketplace Developer Agreement.
+
+The release workflow prints the release-editor link and a completion
+checklist in its job summary. Complete that checklist for every release;
+the workflow does not publish to Marketplace automatically.
 
 See GitHub's [Marketplace publishing guide](https://docs.github.com/en/actions/how-tos/create-and-publish-actions/publish-in-github-marketplace).
 

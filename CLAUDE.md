@@ -27,3 +27,8 @@ See [README.md](README.md) for what the tool does and how it is tested.
 - Keep build output and temporary files off the repository: machine-specific
   settings stay untracked.
 - Release history belongs in `CHANGELOG.md`.
+- Releases include the GitHub Action's Marketplace publication. After the
+  release workflow succeeds, publish that release through GitHub's release
+  editor and verify its version on the Marketplace listing. GitHub releases
+  and crates.io publication alone do not finish a release; see
+  `docs/releasing.md`.
