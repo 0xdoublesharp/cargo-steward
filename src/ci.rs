@@ -260,6 +260,16 @@ mod tests {
         assert_eq!(saved_last_use(&root).get(&dir), Some(&read));
 
         // And `trim` puts it back.
+        // Keep this unit using a fixed job start instead of its directory's
+        // creation time coincidentally falling within the current second.
+        marker::write(
+            &root,
+            &marker::Marker {
+                start: 1_600_000_000,
+                atime: true,
+            },
+        )
+        .unwrap();
         trim::run(&trim::Options {
             root: root.clone(),
             members: BTreeSet::new(),

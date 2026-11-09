@@ -785,21 +785,14 @@ fn remove_orphaned_takes_every_dir_of_deleted_workspaces_now() {
 }
 
 #[test]
-fn low_space_cleanups_that_free_nothing_back_off() {
-    let fx = Fixture::new("dedup = false\nmin-free = \"1000000T\"\ntarget-free = \"1000000T\"\n");
-    // Used today: low space doesn't remove it, so the cleanup frees nothing.
+fn gc_resets_low_space_backoff_when_no_disk_is_low() {
+    let fx = Fixture::new("dedup = false\nmin-free = \"0B\"\ntarget-free = \"0B\"\n");
     let dir = fx.build_dir("target", Duration::ZERO);
+    let backoff = fx.home.join("gc.backoff");
+    // Doubling is covered with fixed observations in gc's unit tests;
+    // free space on a shared volume can change during any CLI invocation.
+    fs::write(&backoff, "1200\n").unwrap();
     fx.steward(&["gc", "--apply"]);
     assert!(dir.exists());
-    let backoff = fx.home.join("gc.backoff");
-    assert_eq!(fs::read_to_string(&backoff).unwrap().trim(), "600");
-    fx.steward(&["gc", "--apply"]);
-    assert_eq!(fs::read_to_string(&backoff).unwrap().trim(), "1200");
-
-    // Space recovered: back to the shortest wait.
-    let config = fx.home.join("config.toml");
-    let settings = fs::read_to_string(&config).unwrap();
-    fs::write(&config, settings.replace("1000000T", "0")).unwrap();
-    fx.steward(&["gc", "--apply"]);
     assert!(!backoff.exists());
 }
