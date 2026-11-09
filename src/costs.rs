@@ -113,8 +113,8 @@ pub fn record(
     }
 }
 
-/// RSS is meaningful for a directly spawned compiler, not an sccache client
-/// whose compiler runs in a separate server process.
+/// The peak RSS of the largest process this one waited for, and their total
+/// CPU time. Both describe the compiler only when it was spawned directly.
 pub fn child_usage() -> (Option<u64>, Option<u64>) {
     // SAFETY: rusage is plain data; getrusage writes into this live buffer.
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
@@ -133,6 +133,16 @@ pub fn child_usage() -> (Option<u64>, Option<u64>) {
     #[cfg(target_os = "linux")]
     let bytes = bytes.saturating_mul(1024);
     ((bytes > 0).then_some(bytes), Some(cpu_ms))
+}
+
+/// What a peak measured through a cache wrapper says about the compiler.
+/// The cache's client is usually all that was measured: its compiler runs in
+/// a separate server process. A client that ran the compiler itself, as
+/// sccache does for units it can't cache (executables among them), reports
+/// the compiler's peak instead. A client stays far below `fallback`, the
+/// estimate for an unmeasured compile, so only a larger peak is a compiler's.
+pub fn compiler_rss_through_cache(rss: Option<u64>, fallback: u64) -> Option<u64> {
+    rss.filter(|&bytes| bytes > fallback)
 }
 
 impl Observation {
@@ -224,7 +234,7 @@ pub fn run(args: &Args) -> Result<()> {
         );
     }
     println!(
-        "Execution includes any inner cache wrapper. CPU and RSS are recorded only for direct compiler children."
+        "Execution includes any inner cache wrapper. CPU is recorded only for direct compiler children; RSS also for compilers a cache wrapper ran itself."
     );
     Ok(())
 }
@@ -232,6 +242,18 @@ pub fn run(args: &Args) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cache_clients_own_peak_is_not_the_compilers() {
+        let fallback = 2 << 30;
+        assert_eq!(compiler_rss_through_cache(Some(6 << 20), fallback), None);
+        assert_eq!(compiler_rss_through_cache(Some(fallback), fallback), None);
+        assert_eq!(
+            compiler_rss_through_cache(Some(19 << 30), fallback),
+            Some(19 << 30)
+        );
+        assert_eq!(compiler_rss_through_cache(None, fallback), None);
+    }
 
     #[test]
     fn seeded_observations_do_not_claim_the_producers_calls() {

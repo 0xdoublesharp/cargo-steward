@@ -59,14 +59,14 @@ pub fn run(argv: Vec<OsString>) -> ! {
     };
 
     let cost_path = costs::path(&out_dir, args.extra_filename.as_deref());
+    let fallback = config::parse_size(&config.compile_memory_estimate)
+        .ok()
+        .filter(|&n| n > 0)
+        .unwrap_or(2 << 30);
     let queued = Instant::now();
     let memory_budget = memory_budget(&config);
     let slot = match (&paths, compile_limit(&config), memory_budget) {
         (Some(paths), limit, Some(budget)) => {
-            let fallback = config::parse_size(&config.compile_memory_estimate)
-                .ok()
-                .filter(|&n| n > 0)
-                .unwrap_or(2 << 30);
             let estimate = cost_path
                 .as_deref()
                 .and_then(costs::read)
@@ -105,10 +105,11 @@ pub fn run(argv: Vec<OsString>) -> ! {
         if config.record_costs
             && let (Some(path), Some(name)) = (cost_path, args.crate_name.as_deref())
         {
+            let (rss, cpu) = costs::child_usage();
             let (rss, cpu) = if direct {
-                costs::child_usage()
+                (rss, cpu)
             } else {
-                (None, None)
+                (costs::compiler_rss_through_cache(rss, fallback), None)
             };
             costs::record(
                 &path,

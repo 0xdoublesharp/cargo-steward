@@ -406,7 +406,7 @@ fn check_wrapper(out: &mut Report, settings: &config::Config, configured: Option
     }
     match wrapper::memory_budget(settings) {
         Some(budget) => out.say(Level::Info, format!(
-            "Compile memory reservations: {}; unknown compilers reserve {}. Estimates are not an RSS cap; inner cache wrappers use the fallback estimate",
+            "Compile memory reservations: {}; unknown compilers reserve {}. Estimates are not an RSS cap; through an inner cache wrapper only compilers it runs itself are measured",
             crate::fsutil::human(budget), settings.compile_memory_estimate
         )),
         None => out.say(Level::Info, "Compile memory admission is disabled"),

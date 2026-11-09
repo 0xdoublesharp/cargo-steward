@@ -99,8 +99,10 @@ With [actions/cache] instead, split it into `actions/cache/restore` and
 
 The `start` step installs the CLI; `RUSTC_WRAPPER` belongs on build/test steps
 after it. To preserve sccache, also set `CARGO_STEWARD_INNER: sccache` on those
-steps. CPU and RSS observations then remain unknown unless the cache already
-contains direct-compiler samples. Unmeasured compiles use the fallback memory estimate.
+steps. CPU observations then remain unknown unless the cache already
+contains direct-compiler samples. RSS is recorded only for compilers sccache
+runs itself, such as executable links. Unmeasured compiles use the fallback
+memory estimate.
 Existing caches without CPU samples use LRU until direct compiles record some.
 
 To retain selected workspace libraries, allow rust-cache to save workspace

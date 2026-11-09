@@ -1121,6 +1121,54 @@ fn the_wrapper_records_dependency_costs_without_claiming_workspace_ownership() {
     assert!(!env.home.join("ledger.jsonl").exists());
 }
 
+/// Regression: a compile sccache can't cache (an executable's link) runs as
+/// the cache client's own child. Its peak went unrecorded, so memory
+/// admission gave each such link the small fallback estimate.
+#[test]
+fn the_wrapper_records_the_peak_of_a_compiler_its_cache_wrapper_ran() {
+    let env = Env::new();
+    let deps = env.root.join("target/debug/deps");
+    fs::create_dir_all(&deps).unwrap();
+    let rustc = fake_rustc(&env.root, "exit 0");
+    // As sccache does for a unit it can't cache: run it and wait.
+    let inner = env.root.join("cache-client");
+    script(&inner, "\"$@\"\nexit $?");
+    let observation = |hash: &str| -> serde_json::Value {
+        env.ok(env
+            .cmd(
+                &env.root,
+                &[
+                    rustc.to_str().unwrap(),
+                    "--crate-name",
+                    "app",
+                    "-C",
+                    &format!("extra-filename=-{hash}"),
+                    "--out-dir",
+                    deps.to_str().unwrap(),
+                ],
+            )
+            .env("CARGO_STEWARD_INNER", &inner));
+        let path = deps.join(format!(".cargo-steward-{hash}.json"));
+        serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+    };
+
+    // Any process is larger than this estimate, as a real link is larger
+    // than the default one.
+    env.config("compile-memory-estimate = \"4KiB\"\n");
+    let measured = observation("0123456789abcdef");
+    assert!(
+        measured["max_rss_bytes"].as_u64().unwrap() > 4096,
+        "{measured}"
+    );
+    // The client's CPU time is still not the compiler's.
+    assert_eq!(measured["cpu_samples_ms"], serde_json::json!([]));
+
+    // Below the estimate the peak may be the client's own: not recorded.
+    env.config("");
+    let unmeasured = observation("fedcba9876543210");
+    assert!(unmeasured["max_rss_bytes"].is_null(), "{unmeasured}");
+}
+
 #[test]
 fn the_wrapper_records_workspace_compiles_in_the_ledger() {
     let env = Env::new();

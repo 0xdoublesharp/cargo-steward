@@ -36,7 +36,7 @@ cron job or launchd agent.
 | **Less contention** | Shares compile slots across builds, with optional estimated memory admission. Waiting compilers sleep until work finishes. The proxy's `max-builds` limits whole Cargo builds. |
 | **Output where you want it** | Routes each worktree's build output and temporary files to a scratch volume. [Cargo proxy →](docs/proxy.md) |
 | **Bounded CI caches** | Keeps the units a job used, then retains costly compiler work per byte, accounting for dependencies. Falls back to LRU without cost observations. [CI →](docs/ci.md) |
-| **Build cost visibility** | `stats` reports per-unit execution and queue time, plus CPU and peak RSS for direct compilers. `status` quickly reads recorded build directories; discovery is opt-in. |
+| **Build cost visibility** | `stats` reports per-unit execution and queue time, plus CPU and peak RSS for measured compilers. `status` quickly reads recorded build directories; discovery is opt-in. |
 | **A setup check** | `doctor` finds bad settings, leaking or unused toolchains, wrapper overrides, split sccache caches, full dev debug info, extra rust-analyzer targets, and macOS backup or indexing overhead. |
 
 When a disk runs low, cleanup prioritizes the build directories that cost
@@ -244,7 +244,7 @@ object-grace = "10m"          # keep replaced objects up to this long while a bi
 process-guard = true          # never remove what a running program was started from
 # max-compiles = 8            # most compiles at once, machine-wide; unset or 0: no limit
 # compile-memory-budget = "32GiB" # optional estimated reservations, not an RSS cap
-compile-memory-estimate = "2GiB"  # unknown units and inner cache wrappers
+compile-memory-estimate = "2GiB"  # units whose compiler has not been measured
 record-costs = true           # per-unit observations beside compiler output
 seed = true                   # let `seed` (the hook and the proxy) clone build directories
 dedup = true                  # on macOS, share identical files after each cleanup
@@ -314,9 +314,11 @@ from inside another compile (by a proc macro, say) doesn't wait. The
 proxy's `max-builds` limits whole cargo builds instead.
 
 With `compile-memory-budget`, a compile also reserves estimated memory.
-Direct compiler peak RSS plus 25% supplies its next estimate; unknown units
-and inner cache wrappers use `compile-memory-estimate`. Without an explicit
-count limit, memory mode uses the logical CPU count. These are cooperative
+A compiler's measured peak RSS plus 25% supplies its next estimate;
+unmeasured units use `compile-memory-estimate`. Through an inner cache
+wrapper a compiler is measured only when the cache's client runs it itself,
+as sccache does for units it can't cache, such as executables. Without an
+explicit count limit, memory mode uses the logical CPU count. These are cooperative
 reservations, not an RSS cap: linker processes can overlap, estimates can
 be low, and builds with admission disabled are outside the budget.
 An oversized compile runs alone. The head waiter blocks new memory-mode
@@ -329,9 +331,11 @@ With a memory budget enabled, `CARGO_STEWARD_MAX_COMPILES=0` removes the
 explicit count override and memory mode uses the logical CPU count.
 
 **Unit costs.** `stats` reads small `.cargo-steward-<hash>.json` observations
-alongside build output. Execution includes an inner cache wrapper; CPU and
-RSS are measured only for direct compiler children, including children they
-wait for. RSS is the largest individual child peak, not their combined peak.
+alongside build output. Execution includes an inner cache wrapper. CPU is
+measured only for direct compiler children, including children they wait
+for. RSS is the largest individual child peak, not their combined peak;
+through a cache wrapper it is recorded only above `compile-memory-estimate`,
+which the cache's own client never reaches.
 Cloning output preserves estimates and resets checkout counters.
 `record-costs = false` disables new observations. Cargo or other cache
 cleaners may leave these metadata files behind; they are disposable hints.
