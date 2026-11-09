@@ -4,6 +4,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- The wrapper ends a compile once the process that started it has exited.
+  Cargo killed alone, by a supervisor's timeout for example, left its
+  compiles running with nothing to use their output. The compile and every
+  process below it receive SIGTERM within a second, and a wrapper still
+  waiting for a compile slot leaves without starting its compile.
+- Memory admission learns the peak of a compiler that an inner cache wrapper
+  runs itself, as sccache does for units it can't cache, such as executable
+  links. These reserved only `compile-memory-estimate`, however much memory
+  they had used before. Through a cache wrapper a peak is recorded only when
+  it exceeds that estimate; smaller ones are the cache client's own.
+
 ## [0.2.2] - 2026-11-09
 
 ### Fixed

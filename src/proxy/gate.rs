@@ -233,6 +233,58 @@ pub fn ancestor_pids() -> std::collections::BTreeSet<u32> {
     ancestors
 }
 
+/// Every process `root` started that is still running, and theirs in turn,
+/// nearest first. Empty when processes can't be listed.
+pub fn descendant_pids(root: u32) -> Vec<u32> {
+    let mut children: std::collections::BTreeMap<u32, Vec<u32>> = Default::default();
+    for pid in process_ids().unwrap_or_default() {
+        let parent = parent_of(pid).and_then(|p| u32::try_from(p).ok());
+        if let (Ok(id), Some(parent)) = (u32::try_from(pid), parent)
+            && id != parent
+        {
+            children.entry(parent).or_default().push(id);
+        }
+    }
+    let mut found = vec![root];
+    let mut next = 0;
+    while let Some(&pid) = found.get(next) {
+        next += 1;
+        for &child in children.get(&pid).map_or(&[][..], Vec::as_slice) {
+            if !found.contains(&child) {
+                found.push(child);
+            }
+        }
+    }
+    found.remove(0);
+    found
+}
+
+/// The ID of every process, or `None` if they can't be listed.
+#[cfg(target_os = "macos")]
+pub fn process_ids() -> Option<Vec<libc::pid_t>> {
+    // SAFETY: a null buffer of size 0 asks only for the number of processes.
+    let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    let count = usize::try_from(count).ok()?;
+    // Room for processes started between the two calls.
+    let mut pids: Vec<libc::pid_t> = vec![0; count + 64];
+    let bytes = libc::c_int::try_from(pids.len() * size_of::<libc::pid_t>()).ok()?;
+    // SAFETY: `pids` is writable for `bytes` bytes and outlives the call.
+    let found = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+    pids.truncate(usize::try_from(found).ok()?);
+    Some(pids)
+}
+
+/// The ID of every process, or `None` if they can't be listed.
+#[cfg(not(target_os = "macos"))]
+pub fn process_ids() -> Option<Vec<libc::pid_t>> {
+    let pids = fs::read_dir("/proc")
+        .ok()?
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
+        .collect();
+    Some(pids)
+}
+
 #[cfg(target_os = "macos")]
 fn parent_of(pid: libc::pid_t) -> Option<libc::pid_t> {
     // SAFETY: `proc_bsdinfo` is plain data, for which all zeroes is valid.

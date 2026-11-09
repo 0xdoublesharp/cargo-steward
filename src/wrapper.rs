@@ -12,7 +12,8 @@
 //!
 //! Nothing here may fail or slow a build: every step is best effort, and
 //! invocations that compile nothing (`rustc -vV`, `--print`) are handed
-//! straight to rustc.
+//! straight to rustc. A compile is ended early only once the process that
+//! asked for it has exited ([`orphan`]).
 
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -24,6 +25,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::config::{self, Config, Paths};
 use crate::{costs, gc, ledger, scan};
 
+mod orphan;
 mod slots;
 
 /// Overrides `max-compiles`.
@@ -59,14 +61,16 @@ pub fn run(argv: Vec<OsString>) -> ! {
     };
 
     let cost_path = costs::path(&out_dir, args.extra_filename.as_deref());
+    let fallback = config::parse_size(&config.compile_memory_estimate)
+        .ok()
+        .filter(|&n| n > 0)
+        .unwrap_or(2 << 30);
+    // From before the wait for a slot: a build that is gone starts nothing.
+    let orphans = orphan::Guard::watch();
     let queued = Instant::now();
     let memory_budget = memory_budget(&config);
     let slot = match (&paths, compile_limit(&config), memory_budget) {
         (Some(paths), limit, Some(budget)) => {
-            let fallback = config::parse_size(&config.compile_memory_estimate)
-                .ok()
-                .filter(|&n| n > 0)
-                .unwrap_or(2 << 30);
             let estimate = cost_path
                 .as_deref()
                 .and_then(costs::read)
@@ -84,12 +88,15 @@ pub fn run(argv: Vec<OsString>) -> ! {
     };
     let queue_time = queued.elapsed();
     let started = Instant::now();
-    let mut child = Command::new(&command[0]);
-    child.args(&command[1..]);
+    let mut compile = Command::new(&command[0]);
+    compile.args(&command[1..]);
     if let Some(slot) = &slot {
-        slot.describe_child(&mut child);
+        slot.describe_child(&mut compile);
     }
-    let status = child.status();
+    let status = orphans
+        .spawn(&mut compile)
+        .and_then(|mut child| child.wait());
+    orphans.finished();
     drop(slot);
     let status = match status {
         Ok(status) => status,
@@ -105,10 +112,11 @@ pub fn run(argv: Vec<OsString>) -> ! {
         if config.record_costs
             && let (Some(path), Some(name)) = (cost_path, args.crate_name.as_deref())
         {
+            let (rss, cpu) = costs::child_usage();
             let (rss, cpu) = if direct {
-                costs::child_usage()
+                (rss, cpu)
             } else {
-                (None, None)
+                (costs::compiler_rss_through_cache(rss, fallback), None)
             };
             costs::record(
                 &path,

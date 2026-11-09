@@ -104,7 +104,7 @@ output. The default directory comes from the current Cargo workspace.
 | `units[].observation.cpu_ms` | integer | Total direct-compiler child CPU time |
 | `units[].observation.cpu_samples_ms` | array of integers | Up to nine recent direct-compiler CPU samples; eviction uses their median |
 | `units[].observation.max_execution_ms` | integer | Largest observed child wall time |
-| `units[].observation.max_rss_bytes` | integer or null | Largest individual child peak RSS, direct compilers only |
+| `units[].observation.max_rss_bytes` | integer or null | Largest individual child peak RSS, for direct compilers and compilers an inner cache wrapper ran itself |
 
 Cloned observations retain estimates and producer paths, but report zero
 calls and accumulated times until this checkout compiles the unit. CPU and
