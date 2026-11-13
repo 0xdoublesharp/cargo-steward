@@ -20,7 +20,7 @@
 #
 # Anything else is passed to `cargo steward setup`, for example
 #   scripts/install.sh --scan-root /Volumes/Scratch
-#   scripts/install.sh --release 0.2.3 --repo OWNER/cargo-steward -- --volume Scratch
+#   scripts/install.sh --release 0.2.4 --repo OWNER/cargo-steward -- --volume Scratch
 #
 # CARGO_STEWARD_RELEASE_URL replaces https://github.com/OWNER/NAME/releases
 # (for a mirror).

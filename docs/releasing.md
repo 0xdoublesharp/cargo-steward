@@ -1,7 +1,7 @@
 # Releasing Cargo Steward
 
 The crate, command-line binary and GitHub Action share the version in
-`Cargo.toml`. A release tag such as `v0.2.3` must match that version.
+`Cargo.toml`. A release tag such as `v0.2.4` must match that version.
 
 ## Prepare and validate
 
@@ -15,15 +15,15 @@ The crate, command-line binary and GitHub Action share the version in
 4. After CI passes, tag that commit and push the tag:
 
    ```sh
-   git tag -a v0.2.3 -m "Cargo Steward 0.2.3"
-   git push origin v0.2.3
+   git tag -a v0.2.4 -m "Cargo Steward 0.2.4"
+   git push origin v0.2.4
    ```
-5. Wait for the release workflow to succeed, then verify `v0.2.3` is offered
+5. Wait for the release workflow to succeed, then verify `v0.2.4` is offered
    as latest on the
    [Marketplace listing](https://github.com/marketplace/actions/cargo-steward).
    The existing listing can pick up published releases automatically. If the
    version is missing, open the release editor
-   (`https://github.com/0xdoublesharp/cargo-steward/releases/edit/v0.2.3`),
+   (`https://github.com/0xdoublesharp/cargo-steward/releases/edit/v0.2.4`),
    select **Publish this Action to the GitHub Marketplace**, confirm the
    categories and update the release. Verify the listing before reporting
    the release complete.
@@ -49,7 +49,7 @@ with its `tag` input. A manual run skips crate publication.
 ## GitHub Marketplace
 
 The versioned tag makes the Action usable as
-`0xdoublesharp/cargo-steward@v0.2.3`. For this repository's existing listing,
+`0xdoublesharp/cargo-steward@v0.2.4`. For this repository's existing listing,
 `v0.2.1` appeared as latest after the automated release without another
 manual update. Verify that each new version appears; do not assume indexing
 has completed just because the release workflow passed.
@@ -72,7 +72,7 @@ See GitHub's [Marketplace publishing guide](https://docs.github.com/en/actions/h
 - Check that crates.io reports the new version and that it is not yanked.
 - Check that the GitHub release has four binary archives and four checksum
   files, and that the Marketplace version selector offers the new version.
-- Install a prebuilt binary with `scripts/install.sh --release 0.2.3
+- Install a prebuilt binary with `scripts/install.sh --release 0.2.4
   --repo 0xdoublesharp/cargo-steward --no-setup` in an isolated Cargo home,
   then check `cargo-steward --version`.
 - Use the [CI guide](ci.md) to check the Action's start/build/trim order.
