@@ -39,7 +39,10 @@ prints this document in place of its own:
 
 Recorded build directories and their last observed compile, most recently
 used first. `--discover` also searches the configured roots and checks
-artifact-use times. Routine status does not walk the scan roots.
+artifact-use times. Both forms search for interrupted deletions independently
+of Cargo markers, in scan roots and routed build/temporary roots (six levels
+deep), and beside recorded builds. Trash is reported separately from builds;
+`total_bytes` and `total_unshared_bytes` remain build-only totals.
 
 | Field | Type | |
 |---|---|---|
@@ -55,7 +58,13 @@ artifact-use times. Routine status does not walk the scan roots.
 | `build_dirs[].workspaces` | array of strings | the package directories the wrapper recorded building here |
 | `build_dirs[].size_bytes` | integer or null | with `--sizes`: as `du` counts it |
 | `build_dirs[].unshared_bytes` | integer or null | with `--sizes`: blocks no clone shares (what removing it alone frees); null where the filesystem can't tell |
-| `total_bytes` | integer or null | with `--sizes`: sum of `size_bytes` |
+| `trash_dirs` | array | interrupted deletions, including malformed names that GC will keep |
+| `trash_dirs[].path` | string | renamed directory |
+| `trash_dirs[].owner_pid` | integer or null | PID from its name; null for malformed names |
+| `trash_dirs[].owner_running` | bool | whether that PID is alive; live owners are kept |
+| `trash_dirs[].size_bytes` | integer or null | with `--sizes`: allocated bytes |
+| `trash_dirs[].unshared_bytes` | integer or null | with `--sizes`: blocks no clone shares, where available |
+| `total_bytes` | integer or null | with `--sizes`: sum of build `size_bytes` |
 | `total_unshared_bytes` | integer or null | with `--sizes`: sum of `unshared_bytes` |
 | `disks` | array | one per disk holding build directories |
 | `disks[].path` | string | the first build directory listed on that disk |
@@ -122,7 +131,7 @@ fields that only one of them fills are empty in the other's.
 | `command` | string | `"gc"`, `"remove"`, or `"remove --orphaned"` |
 | `applied` | bool | `--apply`: removed; otherwise a preview |
 | `busy` | bool | `gc --apply` found another cleanup running and did nothing |
-| `worktrees` | array | `remove --worktree`: `{worktree, build_dir, exists}` per worktree; a `build_dir` that doesn't exist has nothing to remove |
+| `worktrees` | array | `remove --worktree`: `{worktree, build_dir, exists}` per worktree; routed temporary files can still be removed when `exists` is false |
 | `refused` | array | `remove`: `{path, reason}` per path given that doesn't exist or isn't the root of a cargo build directory |
 | `actions` | array | what was or would be removed, below |
 | `actions[].kind` | string | a kind id, below |
@@ -153,6 +162,7 @@ Kind ids, cheapest to rebuild first (the README's
 | `requested` | build directories `remove` was asked to remove |
 | `routed_tmp` | the TMPDIRs the `cargo` proxy routed for removed build directories |
 | `leftover_tmp` | TMPDIRs the proxy routed whose build directory was already gone |
+| `interrupted_trash` | renamed trees left by interrupted deletion; recovery requires explicit `gc --apply` |
 
 ```json
 {

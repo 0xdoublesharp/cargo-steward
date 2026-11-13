@@ -283,10 +283,12 @@ fn remove(
     as_json: bool,
 ) -> Result<()> {
     let mut found = Vec::new();
+    let mut worktree_targets = Vec::new();
     for worktree in worktrees {
         // Named in full, however it was given (`.`).
         let worktree = &worktree.canonicalize().unwrap_or_else(|_| worktree.clone());
         let dir = gc::build_dir_of(worktree)?;
+        let dir = dir.canonicalize().unwrap_or(dir);
         if !as_json {
             println!("{} builds into {}", worktree.display(), dir.display());
         }
@@ -295,11 +297,12 @@ fn remove(
             build_dir: json::path(&dir),
             exists: dir.exists(),
         });
+        worktree_targets.push((worktree.clone(), dir.clone()));
         if dir.exists() {
             dirs.push(dir);
         }
     }
-    let requested = if dirs.is_empty() && !orphaned {
+    let requested = if dirs.is_empty() && worktree_targets.is_empty() && !orphaned {
         if !as_json {
             println!("Nothing to remove.");
             return Ok(());
@@ -309,8 +312,17 @@ fn remove(
             ..gc::Requested::default()
         }
     } else {
-        gc::remove_requested(&dirs, orphaned, apply, force)?
+        gc::remove_requested(&dirs, &worktree_targets, orphaned, apply, force)?
     };
+    if !as_json
+        && dirs.is_empty()
+        && !orphaned
+        && requested.cleanup.actions.is_empty()
+        && requested.cleanup.skipped.is_empty()
+    {
+        println!("Nothing to remove.");
+        return Ok(());
+    }
     if as_json {
         json::print(&gc::Document::removal(&requested, found, apply))
     } else {

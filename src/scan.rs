@@ -135,6 +135,38 @@ pub fn discover(roots: &[PathBuf], max_depth: usize) -> Vec<PathBuf> {
     outermost(found)
 }
 
+/// Interrupted deletions are independent of Cargo markers: a whole build
+/// directory may already be gone, and the renamed tree partly erased.
+/// Use the same bounded search and cache exclusions as build discovery;
+/// inspect build roots themselves but never descend into their artifacts.
+pub fn discover_trash(roots: &[PathBuf], max_depth: usize) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack: Vec<_> = roots
+        .iter()
+        .filter_map(|r| r.canonicalize().ok())
+        .map(|r| (r, 0))
+        .collect();
+    while let Some((dir, depth)) = stack.pop() {
+        if dir
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with(crate::fsutil::TRASH_PREFIX))
+        {
+            found.push(dir);
+            continue;
+        }
+        let stop = is_cargo_root(&dir) || depth >= max_depth || has_cargo_tag(&dir);
+        for path in subdirs(&dir) {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            if name.starts_with(crate::fsutil::TRASH_PREFIX) {
+                found.push(path);
+            } else if !stop && !SKIP_DIRS.contains(&name.as_ref()) {
+                stack.push((path, depth + 1));
+            }
+        }
+    }
+    outermost(found)
+}
+
 /// A profile directory, such as `target/debug` or
 /// `target/aarch64-apple-darwin/release`.
 #[derive(Debug, Clone, PartialEq)]

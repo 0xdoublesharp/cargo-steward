@@ -19,6 +19,7 @@
 
 pub mod document;
 mod guard;
+pub mod trash;
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -65,6 +66,7 @@ pub enum Kind {
     RoutedTmp,
     /// A TMPDIR the `cargo` proxy routed for a build directory that is gone.
     LeftoverTmp,
+    InterruptedTrash,
 }
 
 impl Kind {
@@ -81,6 +83,7 @@ impl Kind {
             Kind::Requested => "build dirs removed on request",
             Kind::RoutedTmp => "temporary dirs the proxy routed for them",
             Kind::LeftoverTmp => "temporary dirs of build dirs already gone",
+            Kind::InterruptedTrash => "interrupted steward deletions",
         }
     }
 
@@ -98,6 +101,7 @@ impl Kind {
             Kind::Requested => "requested",
             Kind::RoutedTmp => "routed_tmp",
             Kind::LeftoverTmp => "leftover_tmp",
+            Kind::InterruptedTrash => "interrupted_trash",
         }
     }
 }
@@ -412,8 +416,23 @@ pub fn run(options: Options) -> Result<()> {
     } else {
         Running::default()
     };
+    let trash = trash::inventory(&config, &dirs);
+    let tmp_paths: Vec<_> = dirs
+        .iter()
+        .filter_map(|d| crate::proxy::routed_tmp_dir(&config, &d.root))
+        .chain(
+            crate::proxy::orphaned_tmp_dirs(&config)
+                .into_iter()
+                .map(|(tmp, _)| tmp),
+        )
+        .collect();
     let volumes = if options.apply {
-        Volume::measure(&dirs)
+        Volume::measure_paths(
+            dirs.iter()
+                .map(|d| d.root.as_path())
+                .chain(trash.iter().map(PathBuf::as_path))
+                .chain(tmp_paths.iter().map(PathBuf::as_path)),
+        )
     } else {
         Vec::new()
     };
@@ -423,12 +442,12 @@ pub fn run(options: Options) -> Result<()> {
         now: SystemTime::now(),
         apply: options.apply,
     };
-    let mut cleanup = clean(&dirs, sweep);
-    let freed = Volume::freed_by(&volumes, &dirs, &cleanup.actions);
+    let mut cleanup = clean_with_trash(&dirs, &trash, sweep, !options.auto);
 
-    let tmp = remove_routed_tmp_dirs(&config, &cleanup.actions, options.apply);
-    cleanup.actions.extend(tmp);
+    let tmp = remove_routed_tmp_dirs(&config, &cleanup.actions, sweep);
+    cleanup.absorb(tmp);
     cleanup.absorb(remove_leftover_tmp_dirs(&config, sweep));
+    let freed = Volume::freed_by(&volumes, &cleanup.actions);
     for action in cleanup.actions.iter().filter(|a| a.kind >= Kind::Orphaned) {
         registry.roots.remove(&action.path);
     }
@@ -546,20 +565,19 @@ struct Volume {
 }
 
 impl Volume {
-    fn measure(dirs: &[BuildDir]) -> Vec<Volume> {
+    fn measure_paths<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Vec<Volume> {
         let mut volumes: Vec<Volume> = Vec::new();
-        for dir in dirs {
-            let Some(device) = dir.device else {
+        for path in paths {
+            let Some(device) = fsutil::device(path) else {
                 continue;
             };
             if volumes.iter().any(|v| v.device == device) {
                 continue;
             }
-            let probe = dir
-                .root
+            let probe = path
                 .parent()
                 .filter(|p| fsutil::device(p) == Some(device))
-                .unwrap_or(&dir.root)
+                .unwrap_or(path)
                 .to_path_buf();
             if let Some(before) = fsutil::free_space(&probe) {
                 volumes.push(Volume {
@@ -573,21 +591,20 @@ impl Volume {
     }
 
     /// The change in free space on each of `volumes` that `actions` removed
-    /// something from, inside one of `dirs`.
-    fn freed_by(volumes: &[Volume], dirs: &[BuildDir], actions: &[Action]) -> Vec<(PathBuf, i128)> {
+    /// something from, including trash and routed temporary directories.
+    fn freed_by(volumes: &[Volume], actions: &[Action]) -> Vec<(PathBuf, i128)> {
         volumes
             .iter()
             .filter(|v| {
-                actions.iter().any(|a| {
-                    dirs.iter()
-                        .any(|d| d.device == Some(v.device) && a.path.starts_with(&d.root))
-                })
+                actions
+                    .iter()
+                    .any(|a| a.path.ancestors().find_map(fsutil::device) == Some(v.device))
             })
             .filter_map(|v| Some((v.probe.clone(), v.freed()?)))
             .collect()
     }
 
-    /// How much the volume's free space rose since [`Volume::measure`]. Other
+    /// How much the volume's free space rose since [`Volume::measure_paths`]. Other
     /// writes meanwhile move it too, so it can be negative.
     fn freed(&self) -> Option<i128> {
         let after = fsutil::free_space_near(&self.probe)?;
@@ -607,22 +624,52 @@ pub struct Sweep<'a> {
 
 /// Plans, and when applying, carries out the cleanup of `dirs`. Each build
 /// directory is handled by one thread, several at a time.
+#[cfg(test)]
 pub fn clean(dirs: &[BuildDir], sweep: Sweep) -> Cleanup {
-    // Finish removals an interrupted cleanup left renamed aside: inside a
-    // build directory everything goes to its root, and a whole one goes
-    // next to it. Only when applying: a preview changes nothing.
-    if sweep.apply {
-        for dir in dirs {
-            fsutil::sweep_trash(&dir.root);
-            if let Some(parent) = dir.root.parent() {
-                fsutil::sweep_trash(parent);
+    clean_with_trash(dirs, &trash::near_builds(dirs), sweep, true)
+}
+
+fn clean_with_trash(
+    dirs: &[BuildDir],
+    trash_paths: &[PathBuf],
+    sweep: Sweep,
+    recover: bool,
+) -> Cleanup {
+    let mut cleanup = trash::clean(trash_paths, sweep, recover);
+    // A parent removal must not bypass a refused/live/automatic recovery.
+    let protected: BTreeSet<_> = dirs
+        .iter()
+        .filter(|dir| {
+            cleanup
+                .skipped
+                .iter()
+                .any(|skip| skip.path.starts_with(&dir.root))
+        })
+        .map(|d| d.root.clone())
+        .collect();
+    let results = fsutil::parallel_map(dirs, |dir| {
+        if protected.contains(&dir.root) {
+            (Cleanup::default(), false)
+        } else {
+            clean_dir(dir, sweep)
+        }
+    });
+    let mut removed = protected;
+    for (dir, (mut result, whole)) in dirs.iter().zip(results) {
+        if whole && !sweep.apply {
+            // Recovery is already a separate preview action.
+            for action in &mut result.actions {
+                let recovered: u64 = cleanup
+                    .actions
+                    .iter()
+                    .filter(|a| {
+                        a.kind == Kind::InterruptedTrash && a.path.starts_with(&action.path)
+                    })
+                    .map(|a| a.bytes)
+                    .sum();
+                action.bytes = action.bytes.saturating_sub(recovered);
             }
         }
-    }
-    let results = fsutil::parallel_map(dirs, |dir| clean_dir(dir, sweep));
-    let mut cleanup = Cleanup::default();
-    let mut removed: BTreeSet<PathBuf> = BTreeSet::new();
-    for (dir, (result, whole)) in dirs.iter().zip(results) {
         if whole {
             removed.insert(dir.root.clone());
         }
@@ -1025,6 +1072,16 @@ fn remove_build_dir(
     sweep: Sweep,
     out: &mut Cleanup,
 ) -> Removal {
+    if let Some((_, path)) = fsutil::entries(&dir.root)
+        .find(|(_, path)| fsutil::trash_owner(path).is_some_and(fsutil::process_alive))
+    {
+        out.skipped.push(Skipped {
+            kind,
+            path: dir.root.clone(),
+            reason: format!("live deletion owner in {}", path.display()),
+        });
+        return Removal::Guarded;
+    }
     let trash = dir.root.parent().unwrap_or(&dir.root);
     if !sweep.apply {
         return remove_dir(kind, &dir.root, note, bytes, trash, sweep, out);
@@ -1070,36 +1127,122 @@ fn lock_build_dir(root: &Path, known: &[Profile]) -> Option<Vec<Lock>> {
 /// `actions` removed whole (`<tmp-root>/<repo>/<worktree>` for
 /// `<target-root>/<repo>/<worktree>`): a deleted worktree's temporary files
 /// otherwise stay forever. Only directories the proxy routed are touched.
-fn remove_routed_tmp_dirs(config: &config::Config, actions: &[Action], apply: bool) -> Vec<Action> {
-    let mut out = Vec::new();
+fn remove_routed_tmp_dirs(config: &config::Config, actions: &[Action], sweep: Sweep) -> Cleanup {
+    let mut out = Cleanup::default();
     for action in actions.iter().filter(|a| {
         matches!(
             a.kind,
             Kind::Orphaned | Kind::Idle | Kind::LowSpace | Kind::Requested
         )
     }) {
-        let Some(tmp) = crate::proxy::routed_tmp_dir(config, &action.path) else {
-            continue;
-        };
-        if !fs::symlink_metadata(&tmp).is_ok_and(|m| m.is_dir()) {
-            continue;
+        if let Some(tmp) = crate::proxy::routed_tmp_dir(config, &action.path) {
+            out.absorb(remove_tmp_dir(
+                &tmp,
+                &action.path,
+                Kind::RoutedTmp,
+                sweep.now,
+                sweep,
+            ));
         }
-        let bytes = fsutil::tree_size(&tmp);
-        if apply && let Err(e) = fsutil::remove(&tmp) {
-            eprintln!(
-                "warning: cargo-steward: failed to remove {}: {e}",
-                tmp.display()
-            );
-            continue;
-        }
-        out.push(Action {
-            kind: Kind::RoutedTmp,
-            path: tmp,
-            files: 0,
-            bytes,
-            note: format!("of {}", action.path.display()),
-        });
     }
+    out
+}
+
+/// Shared safety checks for immediate retirement and delayed leftover GC.
+fn remove_tmp_dir(
+    tmp: &Path,
+    build: &Path,
+    kind: Kind,
+    cutoff: SystemTime,
+    sweep: Sweep,
+) -> Cleanup {
+    let mut out = Cleanup::default();
+    if !fs::symlink_metadata(tmp).is_ok_and(|m| m.is_dir()) {
+        return out;
+    }
+    let skip = |out: &mut Cleanup, reason: String| {
+        out.skipped.push(Skipped {
+            kind,
+            path: tmp.to_path_buf(),
+            reason,
+        });
+    };
+    if tmp.canonicalize().as_deref().ok() != Some(tmp) {
+        skip(
+            &mut out,
+            "temporary path contains a symlink or cannot be resolved".into(),
+        );
+        return out;
+    }
+    let Some(contents) = TmpContents::read(tmp, cutoff) else {
+        if kind == Kind::RoutedTmp {
+            skip(
+                &mut out,
+                "temporary files changed during inspection or could not be read; retry retirement"
+                    .into(),
+            );
+        }
+        return out;
+    };
+    if contents.contains_trash {
+        skip(
+            &mut out,
+            "contains interrupted deletions; recover with explicit gc --apply first".into(),
+        );
+        return out;
+    }
+    if contents.pinned {
+        skip(
+            &mut out,
+            "temporary directory contains pinned artifacts".into(),
+        );
+        return out;
+    }
+    if let Some(process) = sweep.running.inside(tmp) {
+        skip(
+            &mut out,
+            format!(
+                "{} is running from it (pid {})",
+                process.exe.display(),
+                process.pid
+            ),
+        );
+        return out;
+    }
+    let mut locks = Vec::new();
+    if sweep.apply {
+        for root in &contents.build_dirs {
+            match lock_build_dir(root, &[]) {
+                Some(held) => locks.extend(held),
+                None => {
+                    skip(
+                        &mut out,
+                        "a cargo build is using its temporary directory".into(),
+                    );
+                    return out;
+                }
+            }
+        }
+        // A new build may have recreated its output after retirement.
+        if !fs::symlink_metadata(build).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
+            skip(
+                &mut out,
+                "build directory exists again; keeping its temporary files".into(),
+            );
+            return out;
+        }
+        if let Err(err) = fsutil::remove(tmp) {
+            skip(&mut out, format!("failed to remove temporary files: {err}"));
+            return out;
+        }
+    }
+    out.actions.push(Action {
+        kind,
+        path: tmp.to_path_buf(),
+        files: 0,
+        bytes: contents.bytes,
+        note: format!("of {}", build.display()),
+    });
     out
 }
 
@@ -1129,53 +1272,15 @@ fn remove_leftover_tmp_dirs(config: &config::Config, sweep: Sweep) -> Cleanup {
         .checked_sub(sweep.policy.orphan_grace)
         .unwrap_or(UNIX_EPOCH);
     for (tmp, build) in crate::proxy::orphaned_tmp_dirs(config) {
-        let Some(contents) = TmpContents::read(&tmp, cutoff) else {
-            continue;
-        };
-        if let Some(process) = sweep.running.inside(&tmp) {
-            out.skipped.push(Skipped {
-                kind: Kind::LeftoverTmp,
-                path: tmp,
-                reason: format!(
-                    "{} is running from it (pid {})",
-                    process.exe.display(),
-                    process.pid
-                ),
-            });
-            continue;
-        }
-        let mut locks = Vec::new();
-        if sweep.apply {
-            let mut busy = false;
-            for root in &contents.build_dirs {
-                match lock_build_dir(root, &[]) {
-                    Some(held) => locks.extend(held),
-                    None => busy = true,
-                }
-            }
-            if busy {
-                continue;
-            }
-            if let Err(e) = fsutil::remove(&tmp) {
-                eprintln!(
-                    "warning: cargo-steward: failed to remove {}: {e}",
-                    tmp.display()
-                );
-                continue;
-            }
-        }
-        drop(locks);
-        out.actions.push(Action {
-            kind: Kind::LeftoverTmp,
-            path: tmp,
-            files: 0,
-            bytes: contents.bytes,
-            note: format!(
+        let mut result = remove_tmp_dir(&tmp, &build, Kind::LeftoverTmp, cutoff, sweep);
+        for action in &mut result.actions {
+            action.note = format!(
                 "unmodified for {}; {} is gone",
-                fsutil::ago(contents.modified),
+                humantime::format_duration(sweep.policy.orphan_grace),
                 build.display()
-            ),
-        });
+            );
+        }
+        out.absorb(result);
     }
     out
 }
@@ -1187,6 +1292,9 @@ struct TmpContents {
     bytes: u64,
     /// Cargo build directories inside it.
     build_dirs: Vec<PathBuf>,
+    pinned: bool,
+    contains_trash: bool,
+    live_deletion: bool,
 }
 
 impl TmpContents {
@@ -1198,6 +1306,9 @@ impl TmpContents {
             modified: meta.modified().ok()?,
             bytes: 0,
             build_dirs: Vec::new(),
+            pinned: false,
+            contains_trash: false,
+            live_deletion: false,
         };
         let mut stack = vec![dir.to_path_buf()];
         while let Some(current) = stack.pop() {
@@ -1209,6 +1320,10 @@ impl TmpContents {
                 }
                 contents.bytes += fsutil::allocated(&meta);
                 let name = entry.file_name();
+                contents.pinned |= name == PIN_FILE;
+                contents.contains_trash |= name.to_string_lossy().starts_with(fsutil::TRASH_PREFIX);
+                contents.live_deletion |=
+                    fsutil::trash_owner(&entry.path()).is_some_and(fsutil::process_alive);
                 if meta.is_dir() {
                     stack.push(entry.path());
                 } else if ((name == ".rustc_info.json" || name == ".rustc-info.json")
@@ -1232,6 +1347,7 @@ impl TmpContents {
 /// workspaces are all gone, without waiting out `orphan-grace`.
 pub fn remove_requested(
     roots: &[PathBuf],
+    worktree_targets: &[(PathBuf, PathBuf)],
     orphaned: bool,
     apply: bool,
     force: bool,
@@ -1288,12 +1404,45 @@ pub fn remove_requested(
         }
     }
     let measured: Vec<BuildDir> = targets.iter().map(|(_, dir)| dir.clone()).collect();
+    let missing: Vec<_> = worktree_targets
+        .iter()
+        .map(|(_, root)| root)
+        .filter(|p| {
+            fs::symlink_metadata(p).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        })
+        .filter_map(|p| Some((p, crate::proxy::routed_tmp_dir(&config, p)?)))
+        .collect();
+    let routed: Vec<_> = measured
+        .iter()
+        .filter_map(|d| crate::proxy::routed_tmp_dir(&config, &d.root))
+        .collect();
     let volumes = if apply {
-        Volume::measure(&measured)
+        Volume::measure_paths(
+            measured
+                .iter()
+                .map(|d| d.root.as_path())
+                .chain(routed.iter().map(PathBuf::as_path))
+                .chain(missing.iter().map(|(_, t)| t.as_path())),
+        )
     } else {
         Vec::new()
     };
     for (kind, dir) in &targets {
+        if worktree_targets.iter().any(|(_, root)| root == &dir.root)
+            && dir.workspaces.iter().any(|workspace| {
+                !worktree_targets
+                    .iter()
+                    .any(|(worktree, root)| root == &dir.root && workspace.starts_with(worktree))
+            })
+        {
+            out.skipped.push(Skipped {
+                kind: *kind,
+                path: dir.root.clone(),
+                reason: "build output also belongs to another worktree; keeping shared artifacts"
+                    .into(),
+            });
+            continue;
+        }
         if dir.pinned && !force {
             out.skipped.push(Skipped {
                 kind: *kind,
@@ -1321,9 +1470,18 @@ pub fn remove_requested(
             _ => {}
         }
     }
-    let freed = Volume::freed_by(&volumes, &measured, &out.actions);
-    out.actions
-        .extend(remove_routed_tmp_dirs(&config, &out.actions, apply));
+    let tmp = remove_routed_tmp_dirs(&config, &out.actions, sweep);
+    out.absorb(tmp);
+    for (build, tmp) in missing {
+        out.absorb(remove_tmp_dir(
+            &tmp,
+            build,
+            Kind::RoutedTmp,
+            sweep.now,
+            sweep,
+        ));
+    }
+    let freed = Volume::freed_by(&volumes, &out.actions);
     if apply {
         ledger::save(&paths, &registry)?;
     }
@@ -1369,7 +1527,7 @@ pub fn build_dir_of(worktree: &Path) -> Result<PathBuf> {
     let config = Paths::resolve()
         .map(|p| config::load_lenient(&p).0)
         .unwrap_or_default();
-    if let Ok(plan) = crate::proxy::Plan::new(&config, &worktree, &[])
+    if let Ok(plan) = crate::proxy::Plan::for_worktree(&config, &worktree)
         && plan.skip.is_none()
         && let Some(target) = plan.target
     {
@@ -2638,12 +2796,10 @@ mod tests {
     }
 
     #[test]
-    fn volumes_skip_dirs_without_a_device() {
+    fn volumes_skip_paths_without_a_device() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = build_dir(tmp.path(), "target");
-        let mut dir = BuildDir::inspect(&root, None);
-        dir.device = None;
-        assert!(Volume::measure(&[dir]).is_empty());
+        let missing = tmp.path().join("missing");
+        assert!(Volume::measure_paths([missing.as_path()]).is_empty());
     }
 
     #[test]
@@ -2855,6 +3011,8 @@ mod tests {
         for dir in [&left[0], &left[0].join("s-abc/stuck")] {
             let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o755));
         }
+        // Simulate the next process after the interrupted owner has exited.
+        fs::rename(&left[0], root.join(".steward-trash-old-0-0")).unwrap();
         // The next cleanup finishes it.
         run_clean(&[BuildDir::inspect(&root, None)], true);
         assert!(trash(&root).is_empty());

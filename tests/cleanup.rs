@@ -796,3 +796,309 @@ fn gc_resets_low_space_backoff_when_no_disk_is_low() {
     assert!(dir.exists());
     assert!(!backoff.exists());
 }
+
+#[test]
+fn stranded_trash_is_visible_without_an_original_build_directory() {
+    let f = Fixture::new("");
+    let original = f.build_dir("cargo/repo-0123456789/retired", Duration::ZERO);
+    let trash = original.with_file_name(".steward-trash-retired-0-0");
+    fs::rename(&original, &trash).unwrap();
+    // Even the Cargo marker may have been deleted before interruption.
+    fs::remove_file(trash.join("CACHEDIR.TAG")).unwrap();
+    for args in [vec!["status"], vec!["status", "--discover"]] {
+        let (doc, _) = f.steward_json(&args);
+        assert!(
+            doc["trash_dirs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|d| d["path"] == trash.to_str().unwrap()),
+            "{doc}"
+        );
+    }
+    let (preview, _) = f.steward_json(&["gc"]);
+    assert!(
+        preview["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["kind"] == "interrupted_trash" && a["path"] == trash.to_str().unwrap()),
+        "{preview}"
+    );
+    assert!(trash.exists());
+    let (applied, _) = f.steward_json(&["gc", "--apply"]);
+    assert!(!trash.exists(), "{applied}");
+    assert_eq!(
+        applied["freed_on_disk"].as_array().unwrap().len(),
+        1,
+        "{applied}"
+    );
+}
+
+#[test]
+fn stranded_trash_keeps_live_owners_and_rejects_invalid_paths() {
+    let f = Fixture::new("");
+    let mut live = Command::new("sleep").arg("30").spawn().unwrap();
+    let trash = f
+        .root
+        .join(format!(".steward-trash-retired-{}-0", live.id()));
+    fs::create_dir_all(&trash).unwrap();
+    let invalid = f.root.join(".steward-trash-unknown");
+    fs::create_dir_all(&invalid).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    fs::write(outside.path().join("keep"), "x").unwrap();
+    std::os::unix::fs::symlink(outside.path(), f.root.join(".steward-trash-link-0-0")).unwrap();
+    let (status, _) = f.steward_json(&["status"]);
+    let (applied, _) = f.steward_json(&["gc", "--apply"]);
+    let _ = live.kill();
+    let _ = live.wait();
+    assert!(
+        status["trash_dirs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["path"] == trash.to_str().unwrap() && d["owner_running"] == true),
+        "{status}"
+    );
+    assert!(trash.exists(), "{applied}");
+    assert!(invalid.exists());
+    assert!(outside.path().join("keep").exists());
+    assert!(
+        applied["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["path"] == trash.to_str().unwrap()),
+        "{applied}"
+    );
+}
+
+fn retirement_fixture() -> (Fixture, PathBuf, PathBuf, PathBuf) {
+    let f = Fixture::new("");
+    let config = f.home.join("config.toml");
+    let settings = fs::read_to_string(&config).unwrap();
+    fs::write(
+        &config,
+        format!(
+            "{settings}target-root = {:?}\ntmp-root = {:?}\n",
+            f.root.join("cargo"),
+            f.root.join("tmp")
+        ),
+    )
+    .unwrap();
+    let wt = f.root.join("wt");
+    fs::create_dir_all(wt.join("src")).unwrap();
+    fs::write(
+        wt.join("Cargo.toml"),
+        "[package]\nname = \"retired\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(wt.join("src/lib.rs"), "").unwrap();
+    let (doc, _) = f.steward_json(&["remove", "--worktree", wt.to_str().unwrap()]);
+    let build = PathBuf::from(doc["worktrees"][0]["build_dir"].as_str().unwrap());
+    let tmp = f
+        .root
+        .join("tmp")
+        .join(build.strip_prefix(f.root.join("cargo")).unwrap());
+    fs::create_dir_all(&tmp).unwrap();
+    fs::write(tmp.join("scratch"), "x").unwrap();
+    (f, wt, build, tmp)
+}
+
+#[test]
+fn retirement_retries_exact_tmp_when_the_build_is_already_gone() {
+    let (f, wt, build, tmp) = retirement_fixture();
+    let other = f.build_dir("cargo/other-0123456789/warm", Duration::ZERO);
+    let other_tmp = f.root.join("tmp/other-0123456789/warm");
+    fs::create_dir_all(&other_tmp).unwrap();
+    let (preview, _) = f.steward_json(&["remove", "--worktree", wt.to_str().unwrap()]);
+    assert!(
+        preview["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["path"] == tmp.to_str().unwrap()),
+        "{preview}"
+    );
+    assert!(!build.exists() && tmp.exists());
+    let (doc, _) = f.steward_json(&["remove", "--worktree", wt.to_str().unwrap(), "--apply"]);
+    assert!(!tmp.exists(), "{doc}");
+    assert!(other.exists() && other_tmp.exists());
+    assert_eq!(doc["freed_on_disk"].as_array().unwrap().len(), 1, "{doc}");
+}
+
+#[test]
+fn retirement_keeps_locked_and_pinned_temporary_builds() {
+    for pinned in [false, true] {
+        let (f, wt, build, tmp) = retirement_fixture();
+        f.build_dir(
+            build.strip_prefix(&f.root).unwrap().to_str().unwrap(),
+            Duration::ZERO,
+        );
+        let nested = f.build_dir(
+            tmp.join("case/target")
+                .strip_prefix(&f.root)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            Duration::ZERO,
+        );
+        let lock = File::open(nested.join("debug/.cargo-lock"))
+            .unwrap_or_else(|_| File::create(nested.join("debug/.cargo-lock")).unwrap());
+        if pinned {
+            fs::write(nested.join(".cargo-steward-keep"), "").unwrap();
+        } else {
+            lock.lock().unwrap();
+        }
+        let (doc, _) = f.steward_json(&["remove", "--worktree", wt.to_str().unwrap(), "--apply"]);
+        assert!(tmp.exists(), "{doc}");
+        assert!(
+            doc["skipped"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["path"] == tmp.to_str().unwrap()),
+            "{doc}"
+        );
+    }
+}
+
+#[test]
+fn retirement_ignores_another_checkouts_target_environment() {
+    let (f, wt, build, tmp) = retirement_fixture();
+    let out = Command::new(BIN)
+        .args(["remove", "--worktree", wt.to_str().unwrap(), "--json"])
+        .env("CARGO_STEWARD_HOME", &f.home)
+        .env("CARGO_TARGET_DIR", f.root.join("foreign-target"))
+        .env_remove("CARGO")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    let doc = json_document(&out.stdout);
+    assert_eq!(
+        doc["worktrees"][0]["build_dir"],
+        build.to_str().unwrap(),
+        "{doc}"
+    );
+    assert!(tmp.exists());
+}
+
+#[test]
+fn retirement_keeps_output_shared_with_another_worktree() {
+    let (f, wt, build, tmp) = retirement_fixture();
+    f.build_dir(
+        build.strip_prefix(&f.root).unwrap().to_str().unwrap(),
+        Duration::ZERO,
+    );
+    let other = f.root.join("another-worktree");
+    fs::create_dir_all(&other).unwrap();
+    record(&f, &[(&build, &[wt.clone(), other])]);
+    let (doc, _) = f.steward_json(&["remove", "--worktree", wt.to_str().unwrap(), "--apply"]);
+    assert!(build.exists() && tmp.exists(), "{doc}");
+    assert!(
+        doc["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["reason"].as_str().unwrap().contains("another worktree")),
+        "{doc}"
+    );
+}
+
+#[test]
+fn retirement_keeps_a_program_running_from_its_tmp() {
+    let (f, wt, build, tmp) = retirement_fixture();
+    f.build_dir(
+        build.strip_prefix(&f.root).unwrap().to_str().unwrap(),
+        Duration::ZERO,
+    );
+    let program = tmp.join("sleeper");
+    fs::copy(std::env::current_exe().unwrap(), &program).unwrap();
+    let mut child = common::spawn_retrying(
+        Command::new(&program)
+            .args(["--exact", "sleeper", "--test-threads=1", "-q"])
+            .env(SLEEP_VAR, "1")
+            .stdout(std::process::Stdio::null()),
+    );
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(child.try_wait().unwrap().is_none());
+    let (doc, _) = f.steward_json(&["remove", "--worktree", wt.to_str().unwrap(), "--apply"]);
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(tmp.exists(), "{doc}");
+    assert!(
+        doc["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["path"] == tmp.to_str().unwrap()
+                && a["reason"].as_str().unwrap().contains("running from it")),
+        "{doc}"
+    );
+}
+
+#[test]
+fn automatic_gc_leaves_interrupted_trash_for_explicit_apply() {
+    let f = Fixture::new("");
+    let trash = f.root.join(".steward-trash-gone-0-0");
+    fs::create_dir_all(&trash).unwrap();
+    f.steward(&["gc", "--auto"]);
+    assert!(trash.exists());
+    f.steward(&["gc", "--apply"]);
+    assert!(!trash.exists());
+}
+
+#[test]
+fn trash_is_found_under_routed_tmp_roots_without_scan_roots() {
+    let (f, _, _, tmp) = retirement_fixture();
+    let config = f.home.join("config.toml");
+    let settings = fs::read_to_string(&config).unwrap();
+    fs::write(
+        &config,
+        settings
+            .lines()
+            .filter(|l| !l.starts_with("scan-roots"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+    let trash = tmp.with_file_name(".steward-trash-retired-0-0");
+    fs::rename(&tmp, &trash).unwrap();
+    let (doc, _) = f.steward_json(&["gc"]);
+    assert!(
+        doc["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["path"] == trash.to_str().unwrap()),
+        "{doc}"
+    );
+    assert!(trash.exists());
+}
+
+#[test]
+fn automatic_gc_cannot_remove_trash_through_its_build_parent() {
+    let f = Fixture::new("");
+    let build = f.build_dir("idle", 40 * DAY);
+    let trash = build.join(".steward-trash-unit-0-0");
+    fs::create_dir_all(&trash).unwrap();
+    fs::write(trash.join("file"), vec![1u8; 4096]).unwrap();
+    age(&build, 40 * DAY);
+    f.steward(&["gc", "--auto"]);
+    assert!(trash.exists());
+    f.steward(&["gc", "--apply"]);
+    assert!(!trash.exists() && !build.exists());
+}
+
+#[test]
+fn temporary_parent_cannot_bypass_interrupted_trash_protection() {
+    let (f, _, _, tmp) = retirement_fixture();
+    fs::create_dir_all(f.root.join("cargo")).unwrap();
+    let trash = tmp.join(".steward-trash-file-0-0");
+    fs::create_dir_all(&trash).unwrap();
+    age(&tmp, 3 * DAY);
+    f.steward(&["gc", "--auto"]);
+    assert!(trash.exists());
+    f.steward(&["gc", "--apply"]);
+    assert!(!trash.exists());
+}

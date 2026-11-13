@@ -65,6 +65,11 @@ rustc-wrapper is cargo-steward. Otherwise follow the project's own rules.
    git worktree remove <dir>
    ```
 
+   Check `skipped` before deleting the checkout. Retirement also removes its
+   routed temporary files, including on a retry after build output is gone.
+   It keeps running programs, locked temporary builds, pins, and recorded
+   output belonging to other worktrees. The seeding hook does not retire worktrees.
+
    If you built it with your own `CARGO_TARGET_DIR`, pass that directory:
    `cargo steward remove <build-dir> --apply`. For worktrees already deleted:
    `cargo steward remove --orphaned [--apply]`. Never remove what another
@@ -84,7 +89,10 @@ one document on stdout, sizes in bytes. Failure prints
 
 - `doctor`: `sections[].checks[]` (`level`, `message`, `fix`).
 - `status`: `build_dirs[]` (`path`, `last_used`, `pinned`, `orphaned`,
-  `workspaces`, `size_bytes`, `unshared_bytes`), `disks[].free_bytes`.
+  `workspaces`, `size_bytes`, `unshared_bytes`), `disks[].free_bytes`, and
+  `trash_dirs[]` (`path`, `owner_pid`, `owner_running`, optional sizes).
+  Interrupted deletions are discoverable without a surviving build directory;
+  preview with `gc`, then recover with explicit `gc --apply`.
 - `stats`: `target_dir`, `units[]` (`path`, `observation` with calls,
   execution/queue/CPU milliseconds and direct-compiler peak RSS).
 - `gc`, `remove`: `applied`, `actions[]` (`kind`, `path`, `bytes`),

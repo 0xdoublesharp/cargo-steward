@@ -36,7 +36,7 @@ cron job or launchd agent.
 | **Less contention** | Shares compile slots across builds, with optional estimated memory admission. Waiting compilers sleep until work finishes. The proxy's `max-builds` limits whole Cargo builds. |
 | **Output where you want it** | Routes each worktree's build output and temporary files to a scratch volume. [Cargo proxy →](docs/proxy.md) |
 | **Bounded CI caches** | Keeps the units a job used, then retains costly compiler work per byte, accounting for dependencies. Falls back to LRU without cost observations. [CI →](docs/ci.md) |
-| **Build cost visibility** | `stats` reports per-unit execution and queue time, plus CPU and peak RSS for measured compilers. `status` quickly reads recorded build directories; discovery is opt-in. |
+| **Build cost visibility** | `stats` reports per-unit execution and queue time, plus CPU and peak RSS for measured compilers. `status` lists recorded build directories and interrupted deletions; `--discover` also finds unrecorded builds. |
 | **A setup check** | `doctor` finds bad settings, leaking or unused toolchains, wrapper overrides, split sccache caches, full dev debug info, extra rust-analyzer targets, and macOS backup or indexing overhead. |
 
 When a disk runs low, cleanup prioritizes the build directories that cost
@@ -84,12 +84,20 @@ comments and a backup next to it): `build.rustc-wrapper` becomes
 cargo-steward, and the wrapper that was there, such as `sccache`, becomes
 cargo-steward's inner wrapper. `cargo steward setup --undo` puts it back.
 
-Before deleting a worktree, remove its build directory:
+Before deleting a worktree, preview and remove its build output and routed temporary files:
 
 ```sh
-cargo steward remove --worktree ../app-fix-login --apply
+cargo steward remove --worktree ../app-fix-login --json
+cargo steward remove --worktree ../app-fix-login --apply --json
 git worktree remove ../app-fix-login
 ```
+
+Check `skipped` before deleting the worktree. Retirement keeps busy or pinned
+output, programs running from temporary directories, and output recorded for
+other worktrees. Rerun the same command after the protected work finishes; it
+also removes routed temporary files when the build directory is already gone.
+For an explicit `CARGO_TARGET_DIR`, pass that build directory to `remove`.
+The Git hook seeds new worktrees; retirement requires the commands above.
 
 ## Why build directories keep growing
 
@@ -114,7 +122,7 @@ git worktree remove ../app-fix-login
 |---|---|---|
 | `setup` | Makes cargo-steward Cargo's rustc-wrapper, turns on automatic cleanup and sets scan roots. `--build-dir` also sets `build.build-dir`; `--volume` creates a macOS build volume | [Installation](docs/install.md#first-time-setup) |
 | `doctor` | Checks the setup and says what to change | |
-| `status` | Quickly lists recorded build directories and their last observed compile; `--discover` scans for others and checks artifact use; `--sizes` measures disk use | |
+| `status` | Lists recorded build directories, their last observed compile, and interrupted deletions; `--discover` scans for others and checks artifact use; `--sizes` measures disk use | |
 | `stats` | Reports per-unit costs from the wrapper; `--target-dir` chooses a build directory and `--json` emits a machine-readable report | [JSON](docs/json.md#stats---json) |
 | `gc` | Shows what a cleanup would remove, by kind (`-v`: every item); `--apply` removes it now | [Cleanup](#what-gets-removed) |
 | `pin`, `unpin` | Keeps a build directory (named by any path inside it) out of cleanup, except its stale object files | |
@@ -210,8 +218,11 @@ so.
 - Incremental caches and sessions are removed whole: removing part of one
   can crash rustc.
 - Directories are renamed aside before they're deleted, so nothing sees one
-  half removed. The next `gc --apply` finishes what an interrupted cleanup
-  left.
+  half removed. Status and GC previews find interrupted `.steward-trash-*`
+  deletions independently of surviving build directories, including trees
+  whose Cargo markers are already gone. Explicit `gc --apply` finishes them
+  after checking their paths, deletion owners, Cargo locks, pins, and running
+  programs. Automatic GC leaves these trees for explicit recovery.
 
 Sizes are counted the way `du` counts them, so blocks that APFS or btrfs
 clones share count in every copy. `status --sizes` also shows each
@@ -231,7 +242,7 @@ else `$CARGO_HOME/steward`, else `~/.cargo/steward`.
 leak-fix = true               # remove the object files each incremental compile replaces
 auto-gc = false               # clean up in the background after builds (`setup` turns this on)
 gc-interval = "1h"            # at most this often, or sooner when a disk is low on space
-scan-roots = []               # directory trees searched for build directories the wrapper hasn't seen
+scan-roots = []               # directory trees searched for builds and interrupted deletions
 unit-idle = "14d"             # remove a Cargo 1.100-layout build unit unused this long
 incremental-idle = "7d"       # remove a crate's incremental cache unused this long
 legacy-idle = "3d"            # remove old-layout files once no old-layout build has run for this long

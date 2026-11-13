@@ -18,8 +18,29 @@ pub fn run(sizes: bool, as_json: bool, discover: bool) -> Result<()> {
     } else {
         gc::recorded_inventory(&paths)
     };
+    let trash = gc::trash::inventory(&config, &dirs);
     if as_json {
-        return json::print(&document(dirs, sizes, discover));
+        let mut doc = document(dirs, sizes, discover);
+        doc.trash_dirs = gc::trash::entries(&trash, sizes);
+        return json::print(&doc);
+    }
+    if !trash.is_empty() {
+        println!("Interrupted steward deletions (gc previews recovery; gc --apply finishes it):");
+        for path in &trash {
+            let owner = fsutil::trash_owner(path);
+            let state = match owner {
+                Some(pid) if fsutil::process_alive(pid) => format!("live owner pid {pid}; kept"),
+                Some(_) => "owner gone".into(),
+                None => "invalid name; kept".into(),
+            };
+            let size = if sizes {
+                human(fsutil::tree_size(path))
+            } else {
+                "-".into()
+            };
+            println!("{size:>10}  {} [{state}]", path.display());
+        }
+        println!();
     }
     if dirs.is_empty() {
         println!("No build directories found yet.");
@@ -116,6 +137,8 @@ struct Document {
     sizes_measured: bool,
     /// Most recently used first.
     build_dirs: Vec<DirEntry>,
+    /// Interrupted deletions, discovered independently of build roots.
+    trash_dirs: Vec<gc::trash::Entry>,
     /// With `--sizes`: the sums over every directory.
     total_bytes: Option<u64>,
     total_unshared_bytes: Option<u64>,
@@ -170,6 +193,7 @@ fn document(mut dirs: Vec<BuildDir>, sizes: bool, discover: bool) -> Document {
         version: json::VERSION,
         discovery_performed: discover,
         sizes_measured: sizes,
+        trash_dirs: Vec::new(),
         total_bytes: measured
             .as_ref()
             .map(|u| u.iter().map(|u| u.allocated).sum()),

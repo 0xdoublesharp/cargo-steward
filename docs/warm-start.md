@@ -135,6 +135,29 @@ directory you track in git, both commands change files there.
 `status` reports whether the hook is installed, whether it chains another,
 and whether seeding is turned off.
 
+## Retiring a worktree
+
+The `post-checkout` hook only seeds new worktrees. Before deleting one, run:
+
+```sh
+cargo steward remove --worktree ../app-fix-login --json
+cargo steward remove --worktree ../app-fix-login --apply --json
+git worktree remove ../app-fix-login
+```
+
+Review `skipped` before removing the checkout. Busy or pinned build output,
+temporary directories with running programs or locked Cargo builds, and output
+recorded for other worktrees are kept. Retry retirement after the work finishes;
+the same command can remove its routed temporary files even if build output
+was already deleted. Other worktrees' warm builds and shared compiler caches
+stay in place.
+
+If the build used an explicit target directory, pass it directly to `remove`.
+If Git already removed the checkout, `remove --orphaned` previews known orphaned
+build directories; add `--apply` to remove them. GC handles leftover routed
+temporary files after `orphan-grace`. Interrupted `.steward-trash-*` deletions
+appear in status and GC previews and require explicit `gc --apply` recovery.
+
 ## `cargo steward dedup`
 
 ```sh

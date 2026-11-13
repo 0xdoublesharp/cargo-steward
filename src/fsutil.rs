@@ -356,25 +356,44 @@ pub fn remove_into(path: &Path, trash_dir: &Path) -> io::Result<()> {
     }
 }
 
-/// Finishes deletions that an interrupted cleanup left renamed aside in
-/// `dir`. Trash another running process is still deleting is left to it.
-pub fn sweep_trash(dir: &Path) {
-    for (name, path) in entries(dir) {
-        if name.starts_with(TRASH_PREFIX) && !owner_running(&name) {
-            let _ = fs::remove_dir_all(&path);
-        }
+/// The owner encoded by `remove_into`: `<original-name>-<pid>-<counter>`.
+/// Reject malformed names rather than interpreting them as dead owners.
+pub fn trash_owner(path: &Path) -> Option<u32> {
+    let name = path.file_name()?.to_str()?.strip_prefix(TRASH_PREFIX)?;
+    let mut parts = name.rsplitn(3, '-');
+    parts.next()?.parse::<u64>().ok()?;
+    let pid = parts.next()?.parse::<u32>().ok()?;
+    if parts.next()?.is_empty() || pid > i32::MAX as u32 {
+        return None;
     }
+    Some(pid)
 }
 
-/// Whether the process named in trash `...-<pid>-<n>` is another one that
-/// is still running.
-fn owner_running(name: &str) -> bool {
-    let mut parts = name.rsplitn(3, '-');
-    let (Some(_), Some(pid)) = (parts.next(), parts.next()) else {
-        return false;
-    };
-    pid.parse::<u32>()
-        .is_ok_and(|pid| pid != std::process::id() && process_alive(pid))
+/// Validate again immediately before finishing an interrupted deletion.
+/// No symlink components or live owner, including this process, are allowed.
+pub fn remove_trash(path: &Path) -> io::Result<()> {
+    let owner = trash_owner(path).ok_or_else(|| io::Error::other("invalid steward-trash name"))?;
+    if !fs::symlink_metadata(path)?.is_dir() || path.canonicalize()? != path {
+        return Err(io::Error::other(
+            "trash path is not a real, resolved directory",
+        ));
+    }
+    if process_alive(owner) {
+        return Err(io::Error::other(format!(
+            "deletion owner pid {owner} is still running"
+        )));
+    }
+    fs::remove_dir_all(path)
+}
+
+pub fn sweep_trash(dir: &Path) {
+    for (_, path) in entries(dir) {
+        if fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir())
+            && let Ok(resolved) = path.canonicalize()
+        {
+            let _ = remove_trash(&resolved);
+        }
+    }
 }
 
 /// Whether a process with this ID exists.
@@ -723,13 +742,13 @@ mod tests {
         let _ = live.wait();
         let mut left: Vec<String> = entries(tmp.path()).map(|(n, _)| n).collect();
         left.sort();
-        assert_eq!(
-            left,
-            [
-                format!("{TRASH_PREFIX}deps-{}-0", live.id()),
-                "deps".to_owned()
-            ]
-        );
+        let mut expected = vec![
+            format!("{TRASH_PREFIX}deps-{}-0", live.id()),
+            format!("{TRASH_PREFIX}deps-{}-0", std::process::id()),
+            "deps".to_owned(),
+        ];
+        expected.sort();
+        assert_eq!(left, expected);
     }
 
     #[test]

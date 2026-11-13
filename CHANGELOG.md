@@ -4,6 +4,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Status and GC previews discover interrupted steward deletions even after the
+  original build directory or Cargo markers disappear. Explicit `gc --apply`
+  recovers validated trees while preserving live owners, locks, pins, and
+  running programs; automatic GC leaves them for explicit recovery.
+- Worktree retirement retries routed temporary cleanup after build output is
+  gone, checks temporary builds' Cargo locks, pins, and running programs, and
+  keeps output recorded for other worktrees. Worktree resolution ignores a
+  different checkout's exported target directory. Physical free-space reports
+  include interrupted deletion and temporary-file cleanup.
+
 ## [0.2.3] - 2026-11-09
 
 ### Fixed

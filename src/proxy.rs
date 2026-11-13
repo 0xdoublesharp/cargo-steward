@@ -270,6 +270,20 @@ impl Plan {
     /// Works out the routing for `args` run in `cwd`. Reads files but
     /// changes nothing.
     pub fn new(config: &Config, cwd: &Path, args: &[OsString]) -> Result<Plan> {
+        Self::with_env(config, cwd, args, |name| env::var_os(name))
+    }
+
+    /// Resolve another worktree independently of this shell's target override.
+    pub fn for_worktree(config: &Config, cwd: &Path) -> Result<Plan> {
+        Self::with_env(config, cwd, &[], |_| None)
+    }
+
+    fn with_env(
+        config: &Config,
+        cwd: &Path,
+        args: &[OsString],
+        var: impl Fn(&str) -> Option<OsString>,
+    ) -> Result<Plan> {
         let dir = route::command_dir(cwd, args);
         let effective = Effective::of(config, &dir);
         if effective.target_root.is_none() && effective.tmp_root.is_none() {
@@ -298,12 +312,7 @@ impl Plan {
             // Only the command line can override a forced route.
             route::target_dir_chosen(args, |_| None, &[], None)
         } else {
-            route::target_dir_chosen(
-                args,
-                |name| env::var_os(name),
-                &[&real_cwd, &dir],
-                cargo_home.as_deref(),
-            )
+            route::target_dir_chosen(args, var, &[&real_cwd, &dir], cargo_home.as_deref())
         };
         let label = namespace
             .repo
@@ -383,9 +392,23 @@ fn root(path: &Path) -> Result<PathBuf> {
 /// worktree's build directory is found even before the wrapper records a
 /// compile in it (a seeded one that hasn't built yet).
 pub fn target_roots(config: &Config) -> Vec<PathBuf> {
-    let configured = std::iter::once(&config.target_root)
-        .chain(config.routes.iter().map(|r| &r.target_root))
-        .flatten();
+    expanded_roots(
+        std::iter::once(&config.target_root)
+            .chain(config.routes.iter().map(|r| &r.target_root))
+            .flatten(),
+    )
+}
+
+/// Temporary routing roots are searched for interrupted deletions too.
+pub fn tmp_roots(config: &Config) -> Vec<PathBuf> {
+    expanded_roots(
+        std::iter::once(&config.tmp_root)
+            .chain(config.routes.iter().map(|r| &r.tmp_root))
+            .flatten(),
+    )
+}
+
+fn expanded_roots<'a>(configured: impl Iterator<Item = &'a PathBuf>) -> Vec<PathBuf> {
     let mut found = Vec::new();
     for setting in configured {
         let Ok(path) = root(setting) else {
