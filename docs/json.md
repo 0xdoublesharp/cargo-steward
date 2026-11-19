@@ -39,9 +39,10 @@ prints this document in place of its own:
 
 Recorded build directories and their last observed compile, most recently
 used first. `--discover` also searches the configured roots and checks
-artifact-use times. Both forms search for interrupted deletions independently
-of Cargo markers, in scan roots and routed build/temporary roots (six levels
-deep), and beside recorded builds. Trash is reported separately from builds;
+artifact-use times. Routine status checks for interrupted deletions directly
+inside and beside recorded builds. `--discover` also searches scan roots
+and routed build/temporary roots (six levels deep), even when the original
+build is gone. Trash is reported separately from builds;
 `total_bytes` and `total_unshared_bytes` remain build-only totals.
 
 | Field | Type | |

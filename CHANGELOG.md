@@ -4,6 +4,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+- A route can cover multiple checkout locations with `additional-paths` and
+  enforce one build limit across them.
+- `cargo steward shim explain` sees the caller's target override and can
+  describe a build without creating output directories or links.
+- Routine status checks for interrupted deletions near recorded builds.
+  `status --discover` and GC also search the configured roots.
+
 ## [0.2.4] - 2026-11-13
 
 ### Fixed

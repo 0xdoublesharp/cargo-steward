@@ -61,7 +61,7 @@ enum Cmd {
     Stats(costs::Args),
     /// List recorded build directories
     Status {
-        /// Also search scan-roots for unrecorded build directories (slower)
+        /// Also search configured roots for unrecorded builds and interrupted deletions (slower)
         #[arg(long)]
         discover: bool,
         /// Measure each directory's size (slower)

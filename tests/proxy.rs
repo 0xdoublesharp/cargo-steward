@@ -200,6 +200,50 @@ fn stdout(out: &Output) -> String {
 }
 
 #[test]
+fn regression_proxied_shim_explains_the_callers_environment() {
+    let fx = Fixture::new("link-target = true");
+    symlink(BIN, fx.bin.join("cargo-steward")).unwrap();
+    let args = [
+        "--color", "never", "steward", "shim", "explain", "--json", "--", "build",
+    ];
+    let explained = |output: Output| {
+        assert!(output.status.success(), "{output:?}");
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let doc = explained(fx.run(&fx.repo, &args));
+    assert_eq!(doc["target_dir"]["routed"], true, "{doc}");
+    assert!(!fx.targets.exists());
+    assert!(!fx.tmps.exists());
+    assert!(fx.repo.join("target").symlink_metadata().is_err());
+    let doc = explained(
+        fx.proxy(&fx.repo, &args)
+            .env("CARGO_TARGET_DIR", &fx.targets)
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(doc["target_dir"]["routed"], false, "{doc}");
+}
+
+#[test]
+fn regression_route_paths_share_one_build_limit() {
+    let fx = Fixture::new("");
+    let other = fx.root.join("other");
+    fs::create_dir(&other).unwrap();
+    let config = format!(
+        "[[routes]]\npath = {:?}\nadditional-paths = [{:?}]\nmax-builds = 3\n",
+        fx.repo, other
+    );
+    fs::write(fx.home.join("config.toml"), config).unwrap();
+    let slot = |dir| {
+        let output = fx.steward(dir, &["shim", "explain", "--json", "--", "build"]);
+        let doc: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(doc["build_slot"]["limit"], 3, "{doc}");
+        doc["build_slot"]["dir"].clone()
+    };
+    assert_eq!(slot(&fx.repo), slot(&other));
+}
+
+#[test]
 fn routes_the_main_checkout_and_each_worktree() {
     let fx = Fixture::new("");
     let ns = fx.targets.join(fx.repo_ns());

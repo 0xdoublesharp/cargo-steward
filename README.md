@@ -36,7 +36,7 @@ cron job or launchd agent.
 | **Less contention** | Shares compile slots across builds, with optional estimated memory admission. Waiting compilers sleep until work finishes. The proxy's `max-builds` limits whole Cargo builds. |
 | **Output where you want it** | Routes each worktree's build output and temporary files to a scratch volume. [Cargo proxy →](docs/proxy.md) |
 | **Bounded CI caches** | Keeps the units a job used, then retains costly compiler work per byte, accounting for dependencies. Falls back to LRU without cost observations. [CI →](docs/ci.md) |
-| **Build cost visibility** | `stats` reports per-unit execution and queue time, plus CPU and peak RSS for measured compilers. `status` lists recorded build directories and interrupted deletions; `--discover` also finds unrecorded builds. |
+| **Build cost visibility** | `stats` reports per-unit execution and queue time, plus CPU and peak RSS for measured compilers. `status` lists recorded build directories and nearby interrupted deletions; `--discover` searches for both across configured roots. |
 | **A setup check** | `doctor` finds bad settings, leaking or unused toolchains, wrapper overrides, split sccache caches, full dev debug info, extra rust-analyzer targets, and macOS backup or indexing overhead. |
 
 When a disk runs low, cleanup prioritizes the build directories that cost
@@ -218,7 +218,7 @@ so.
 - Incremental caches and sessions are removed whole: removing part of one
   can crash rustc.
 - Directories are renamed aside before they're deleted, so nothing sees one
-  half removed. Status and GC previews find interrupted `.steward-trash-*`
+  half removed. `status --discover` and GC previews find interrupted `.steward-trash-*`
   deletions independently of surviving build directories, including trees
   whose Cargo markers are already gone. Explicit `gc --apply` finishes them
   after checking their paths, deletion owners, Cargo locks, pins, and running

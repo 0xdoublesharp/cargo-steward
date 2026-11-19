@@ -805,16 +805,18 @@ fn stranded_trash_is_visible_without_an_original_build_directory() {
     fs::rename(&original, &trash).unwrap();
     // Even the Cargo marker may have been deleted before interruption.
     fs::remove_file(trash.join("CACHEDIR.TAG")).unwrap();
-    for args in [vec!["status"], vec!["status", "--discover"]] {
+    for discover in [false, true] {
+        let mut args = vec!["status"];
+        if discover {
+            args.push("--discover");
+        }
         let (doc, _) = f.steward_json(&args);
-        assert!(
-            doc["trash_dirs"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|d| d["path"] == trash.to_str().unwrap()),
-            "{doc}"
-        );
+        let found = doc["trash_dirs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["path"] == trash.to_str().unwrap());
+        assert_eq!(found, discover, "{doc}");
     }
     let (preview, _) = f.steward_json(&["gc"]);
     assert!(
@@ -838,6 +840,8 @@ fn stranded_trash_is_visible_without_an_original_build_directory() {
 #[test]
 fn stranded_trash_keeps_live_owners_and_rejects_invalid_paths() {
     let f = Fixture::new("");
+    let recorded = f.build_dir("current", Duration::ZERO);
+    record(&f, &[(&recorded, &[])]);
     let mut live = Command::new("sleep").arg("30").spawn().unwrap();
     let trash = f
         .root

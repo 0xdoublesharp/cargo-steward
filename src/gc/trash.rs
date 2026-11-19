@@ -16,7 +16,7 @@ pub fn inventory(config: &config::Config, dirs: &[BuildDir]) -> Vec<PathBuf> {
     scan::outermost(found)
 }
 
-pub(super) fn near_builds(dirs: &[BuildDir]) -> Vec<PathBuf> {
+pub(crate) fn near_builds(dirs: &[BuildDir]) -> Vec<PathBuf> {
     let roots: Vec<_> = dirs
         .iter()
         .flat_map(|d| {

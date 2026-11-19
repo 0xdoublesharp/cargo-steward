@@ -90,12 +90,16 @@ tmp-root = "/Volumes/Scratch/{label}/tmp"
 `target-root`, `tmp-root` and `max-builds`. The route with the longest
 matching `path` applies; otherwise the top-level settings do. A route's
 `max-builds` counts its own set of slots, separate from the top-level one.
+Use `additional-paths` for other checkout locations that share the route's
+settings and build slots. Each prefix participates in longest-path matching.
+The primary `path` identifies the slot directory.
 A route that sets no roots routes nothing, which exempts a tree, or gives it
 a build limit alone.
 
 ```toml
 [[routes]]
 path = "/Users/me/Workspaces/bigproject"
+additional-paths = ["/Users/me/Workspaces/worktrees/bigproject"]
 target-root = "/Volumes/Scratch/bigproject/cargo"
 tmp-root = "/Volumes/Scratch/bigproject/tmp"
 max-builds = 3

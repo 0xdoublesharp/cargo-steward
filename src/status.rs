@@ -18,7 +18,11 @@ pub fn run(sizes: bool, as_json: bool, discover: bool) -> Result<()> {
     } else {
         gc::recorded_inventory(&paths)
     };
-    let trash = gc::trash::inventory(&config, &dirs);
+    let trash = if discover {
+        gc::trash::inventory(&config, &dirs)
+    } else {
+        gc::trash::near_builds(&dirs)
+    };
     if as_json {
         let mut doc = document(dirs, sizes, discover);
         doc.trash_dirs = gc::trash::entries(&trash, sizes);

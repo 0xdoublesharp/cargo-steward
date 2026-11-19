@@ -99,6 +99,11 @@ fn prepare(
     cargo_args: &[OsString],
     me: Option<&Path>,
 ) -> (Vec<(OsString, OsString)>, Option<gate::Slot>) {
+    // Shim diagnostics must see the same environment as the invocation they explain.
+    if matches!(gate::command_args(cargo_args), [cmd, sub, ..] if cmd == "steward" && sub == "shim")
+    {
+        return (Vec::new(), None);
+    }
     let plan = match cwd {
         Ok(cwd) => Plan::new(config, &cwd, cargo_args),
         Err(e) => Err(e.into()),
@@ -214,19 +219,29 @@ impl Effective {
         let matched = config
             .routes
             .iter()
-            .filter_map(|r| Some((root(&r.path).ok().map(|p| route::resolve(&p))?, r)))
-            .filter(|(path, _)| dir.starts_with(path))
-            .max_by_key(|(path, _)| path.components().count());
+            .filter_map(|r| {
+                let primary = route::resolve(&root(&r.path).ok()?);
+                let matched = std::iter::once(primary.clone())
+                    .chain(
+                        r.additional_paths
+                            .iter()
+                            .filter_map(|p| root(p).ok().map(|p| route::resolve(&p))),
+                    )
+                    .filter(|p| dir.starts_with(p))
+                    .max_by_key(|p| p.components().count())?;
+                Some((matched, primary, r))
+            })
+            .max_by_key(|(matched, _, _)| matched.components().count());
         match matched {
-            Some((path, r)) => Effective {
+            Some((matched, primary, r)) => Effective {
                 target_root: r.target_root.clone(),
                 tmp_root: r.tmp_root.clone(),
                 max_builds: r.max_builds,
                 slots: format!(
                     "route-{}",
-                    route::repo_name("", path.as_os_str()).trim_start_matches('-')
+                    route::repo_name("", primary.as_os_str()).trim_start_matches('-')
                 ),
-                route: Some(path),
+                route: Some(matched),
                 force: r.force,
             },
             None => Effective {
@@ -808,6 +823,7 @@ mod tests {
             routes: vec![
                 config::Route {
                     path: base.join("work"),
+                    additional_paths: vec![],
                     target_root: Some(base.join("work-root")),
                     tmp_root: None,
                     max_builds: Some(2),
@@ -815,6 +831,7 @@ mod tests {
                 },
                 config::Route {
                     path: repo.clone(),
+                    additional_paths: vec![],
                     target_root: Some(base.join("proj-root")),
                     tmp_root: Some(base.join("proj-tmp")),
                     max_builds: Some(3),
@@ -856,6 +873,7 @@ mod tests {
         let config = Config {
             routes: vec![config::Route {
                 path: base.clone(),
+                additional_paths: vec![],
                 target_root: None,
                 tmp_root: None,
                 max_builds: Some(1),
@@ -887,6 +905,7 @@ mod tests {
         .unwrap();
         let route = |force| config::Route {
             path: repo.clone(),
+            additional_paths: vec![],
             target_root: Some(base.join("root")),
             tmp_root: None,
             max_builds: None,
@@ -997,6 +1016,7 @@ mod tests {
     fn forced(base: &Path, target: Option<PathBuf>, tmp: Option<PathBuf>) -> config::Route {
         config::Route {
             path: base.to_path_buf(),
+            additional_paths: vec![],
             target_root: target,
             tmp_root: tmp,
             max_builds: None,
@@ -1232,6 +1252,7 @@ mod tests {
             tmp_root: Some(base.join("{label}/tmp")),
             routes: vec![config::Route {
                 path: "/w/big".into(),
+                additional_paths: vec![],
                 target_root: Some(base.join("big/cargo")),
                 tmp_root: Some(base.join("big/tmp")),
                 max_builds: None,
@@ -1289,6 +1310,7 @@ mod tests {
             tmp_root: Some("/s/{label}/tmp".into()),
             routes: vec![config::Route {
                 path: "/w/big".into(),
+                additional_paths: vec![],
                 target_root: Some("/big/cargo".into()),
                 tmp_root: Some("/big/tmp".into()),
                 max_builds: None,
@@ -1329,6 +1351,7 @@ mod tests {
             routes: vec![
                 config::Route {
                     path: "/w/big".into(),
+                    additional_paths: vec![],
                     target_root: Some(base.join("big/cargo")),
                     tmp_root: None,
                     max_builds: None,
@@ -1336,6 +1359,7 @@ mod tests {
                 },
                 config::Route {
                     path: "/w/gone".into(),
+                    additional_paths: vec![],
                     target_root: Some(base.join("missing")),
                     tmp_root: None,
                     max_builds: None,

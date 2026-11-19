@@ -72,8 +72,16 @@ pub fn command(args: &[OsString]) -> Option<String> {
     if args.iter().any(|a| a == "--help" || a == "-h") {
         return None;
     }
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
+    command_args(args)
+        .first()
+        .map(|a| a.to_string_lossy().into_owned())
+}
+
+/// Subcommand and its arguments, without Cargo's leading global options.
+pub fn command_args(args: &[OsString]) -> &[OsString] {
+    let args = own_args(args);
+    let mut iter = args.iter().enumerate();
+    while let Some((index, arg)) = iter.next() {
         let text = arg.to_string_lossy();
         if matches!(
             text.as_ref(),
@@ -81,10 +89,10 @@ pub fn command(args: &[OsString]) -> Option<String> {
         ) {
             iter.next();
         } else if !text.starts_with(['+', '-']) {
-            return Some(text.into_owned());
+            return &args[index..];
         }
     }
-    None
+    &[]
 }
 
 /// The proxy holding the slot a build runs in. A nested cargo (run from a

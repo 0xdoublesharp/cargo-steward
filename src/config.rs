@@ -196,6 +196,9 @@ pub struct Config {
 pub struct Route {
     /// Applies to commands whose directory is this one or below it.
     pub path: PathBuf,
+    /// Other directory prefixes governed by this route and its build slots.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_paths: Vec<PathBuf>,
     /// As the top-level `target-root`; unset routes no target directory.
     #[serde(default)]
     pub target_root: Option<PathBuf>,
