@@ -25,7 +25,10 @@ use super::route::own_args;
 /// The inherited slot's descriptor number.
 pub const FD_VAR: &str = "CARGO_STEWARD_SLOT_FD";
 /// The inherited slot's file.
-pub const SLOT_VAR: &str = "CARGO_STEWARD_SLOT";
+pub const SLOT_VAR: &str = "_STEWARD_BUILD_SLOT";
+/// Read the previous proxy's markers when nested in a build started before upgrade.
+pub const LEGACY_SLOT_VAR: &str = "CARGO_STEWARD_SLOT";
+pub const LEGACY_HOLDER_VAR: &str = "CARGO_STEWARD_SLOT_PID";
 
 const POLL: Duration = Duration::from_millis(100);
 
@@ -99,7 +102,7 @@ pub fn command_args(args: &[OsString]) -> &[OsString] {
 /// build script, or by a cargo subcommand) reuses that slot only while this
 /// process is one of its ancestors, so a program the build left running
 /// (a test's daemon) can't pass the gate with it.
-pub const HOLDER_VAR: &str = "CARGO_STEWARD_SLOT_PID";
+pub const HOLDER_VAR: &str = "_STEWARD_BUILD_HOLDER";
 
 /// A build slot.
 #[derive(Debug)]
@@ -115,14 +118,20 @@ pub enum Slot {
 /// them) while all `limit` are taken, or reuses the one an enclosing build
 /// holds. `about` describes this build for anyone waiting on it.
 pub fn acquire(dir: &Path, limit: u32, about: &str) -> io::Result<Slot> {
-    let slot = std::env::var_os(SLOT_VAR);
-    if reuse_inherited(dir, std::env::var_os(FD_VAR).as_deref(), slot.as_deref())
-        || held_by_ancestor(
-            dir,
-            slot.as_deref(),
-            std::env::var_os(HOLDER_VAR).as_deref(),
-        )
-    {
+    let legacy_slot = std::env::var_os(LEGACY_SLOT_VAR);
+    if reuse_inherited(
+        dir,
+        std::env::var_os(FD_VAR).as_deref(),
+        legacy_slot.as_deref(),
+    ) || held_by_ancestor(
+        dir,
+        std::env::var_os(SLOT_VAR).as_deref(),
+        std::env::var_os(HOLDER_VAR).as_deref(),
+    ) || held_by_ancestor(
+        dir,
+        legacy_slot.as_deref(),
+        std::env::var_os(LEGACY_HOLDER_VAR).as_deref(),
+    ) {
         return Ok(Slot::Inherited);
     }
     fs::create_dir_all(dir)?;

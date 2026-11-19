@@ -39,10 +39,6 @@ use clone::Cloned;
 /// from before giving up.
 pub(crate) const LOCK_WAIT: Duration = Duration::from_secs(5);
 
-/// How long to wait for a build to release one candidate before trying the
-/// next.
-const EACH_WAIT: Duration = Duration::from_millis(500);
-
 /// `cargo steward seed`. Its flags are a contract: the `cargo` proxy runs
 /// `cargo-steward seed --target-dir <new> --worktree <dir> --quiet`.
 #[derive(Debug, Default, clap::Args)]
@@ -123,7 +119,7 @@ pub fn run_seed(args: &SeedArgs) -> Result<()> {
         ));
         return Ok(());
     };
-    let seeding = seed_best(&job.mine.build, &job.candidates, EACH_WAIT, LOCK_WAIT)?;
+    let seeding = seed_best(&job.mine.build, &job.candidates, LOCK_WAIT)?;
     say(describe(&seeding, &job.mine.build, &job.candidates));
     // With a separate build-dir, final artifacts live in the target dir:
     // start it from the same worktree's.
@@ -137,12 +133,7 @@ pub fn run_seed(args: &SeedArgs) -> Result<()> {
             target: None,
             ..job.candidates[i].clone()
         };
-        let again = seed_best(
-            &job.mine.target,
-            std::slice::from_ref(&from),
-            LOCK_WAIT,
-            LOCK_WAIT,
-        )?;
+        let again = seed_best(&job.mine.target, std::slice::from_ref(&from), LOCK_WAIT)?;
         say(describe(&again, &job.mine.target, &[from]));
     }
     Ok(())
@@ -365,14 +356,14 @@ pub(crate) fn git(dir: &Path, args: &[&str]) -> Option<String> {
 #[cfg(test)]
 pub(crate) fn seed_dir(target: &Path, baseline: &Path, wait: Duration) -> Result<Outcome> {
     let from = Candidate::given(baseline, true, &ledger::Registry::default());
-    Ok(seed_best(target, &[from], wait, wait)?.outcome)
+    Ok(seed_best(target, &[from], wait)?.outcome)
 }
 
 /// Starts `target` as a clone of the first of the ranked `candidates` that
 /// holds a build no build is using.
 ///
-/// Each candidate is tried in turn, waiting up to `each` for a build using
-/// it to finish; if builds are using them all, they're tried again in turn
+/// Candidates are tried immediately in rank order. If builds are using
+/// them all, they are tried again in turn
 /// until `total` has passed. The clone is made under a temporary name next
 /// to `target` while holding cargo's locks on every profile of the
 /// candidate, then renamed into place, so no build ever sees a half made
@@ -380,7 +371,6 @@ pub(crate) fn seed_dir(target: &Path, baseline: &Path, wait: Duration) -> Result
 pub(crate) fn seed_best(
     target: &Path,
     candidates: &[Candidate],
-    each: Duration,
     total: Duration,
 ) -> Result<Seeding> {
     let done = |outcome, from, tried| {
@@ -435,7 +425,7 @@ pub(crate) fn seed_best(
 
     let dirs: Vec<&Path> = usable.iter().map(|(_, d)| d.as_path()).collect();
     let tried = tried(&usable);
-    let Some((k, locks)) = lock_first(&dirs, each, total) else {
+    let Some((k, locks)) = lock_first(&dirs, total) else {
         return done(Outcome::Busy, None, tried);
     };
     let (from, baseline) = (usable[k].0, &usable[k].1);
@@ -494,53 +484,33 @@ fn is_empty_or_missing(dir: &Path) -> bool {
     }
 }
 
-/// Cargo's locks on every profile of the first of the build directories
-/// `dirs` that no build is using, and which one that is. Each is tried in
-/// turn for up to `each`, then all of them in turn until `total` has passed.
-fn lock_first(dirs: &[&Path], each: Duration, total: Duration) -> Option<(usize, Vec<Lock>)> {
+/// Try each candidate in rank order. Wait only after a whole pass finds them busy.
+fn lock_first(dirs: &[&Path], total: Duration) -> Option<(usize, Vec<Lock>)> {
     let deadline = Instant::now() + total;
-    for (i, dir) in dirs.iter().enumerate() {
-        let wait = each.min(deadline.saturating_duration_since(Instant::now()));
-        if let Some(locks) = lock_all(dir, wait) {
-            return Some((i, locks));
-        }
-    }
-    while Instant::now() < deadline {
-        sleep(Duration::from_millis(100));
+    loop {
         for (i, dir) in dirs.iter().enumerate() {
-            if let Some(locks) = lock_all(dir, Duration::ZERO) {
+            if let Some(locks) = lock_all(dir) {
                 return Some((i, locks));
             }
         }
-    }
-    None
-}
-
-/// Cargo's locks on every profile of the build directory `root`, retrying
-/// until `wait` has passed. `None` if a build kept any of them.
-fn lock_all(root: &Path, wait: Duration) -> Option<Vec<Lock>> {
-    let deadline = Instant::now() + wait;
-    loop {
-        let mut held = Vec::new();
-        let mut busy = false;
-        for profile in scan::profiles(root) {
-            match fsutil::lock_profile(&profile.path) {
-                Lock::Busy => {
-                    busy = true;
-                    break;
-                }
-                lock => held.push(lock),
-            }
-        }
-        if !busy {
-            return Some(held);
-        }
-        drop(held);
-        if Instant::now() >= deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             return None;
         }
-        sleep(Duration::from_millis(100));
+        sleep(remaining.min(Duration::from_millis(100)));
     }
+}
+
+/// Hold all profile locks together or release the partial set before trying the next candidate.
+fn lock_all(root: &Path) -> Option<Vec<Lock>> {
+    let mut held = Vec::new();
+    for profile in scan::profiles(root) {
+        match fsutil::lock_profile(&profile.path) {
+            Lock::Busy => return None,
+            lock => held.push(lock),
+        }
+    }
+    Some(held)
 }
 
 #[cfg(test)]
@@ -727,15 +697,9 @@ mod tests {
         let held_busy = fsutil::lock_profile(&busy.join("debug"));
         let target = tmp.path().join("wt/target");
         let started = Instant::now();
-        let seeding = seed_best(
-            &target,
-            &candidates,
-            Duration::from_millis(100),
-            Duration::from_secs(5),
-        )
-        .unwrap();
+        let seeding = seed_best(&target, &candidates, Duration::from_secs(5)).unwrap();
         assert!(
-            started.elapsed() < Duration::from_secs(3),
+            started.elapsed() < Duration::from_millis(850),
             "waited too long"
         );
         assert_eq!(seeding.from, Some(2), "{seeding:?}");
@@ -758,7 +722,7 @@ mod tests {
         // Once main is idle, it's preferred again.
         drop(held_main);
         let other = tmp.path().join("wt2/target");
-        let seeding = seed_best(&other, &candidates, LOCK_WAIT, LOCK_WAIT).unwrap();
+        let seeding = seed_best(&other, &candidates, LOCK_WAIT).unwrap();
         assert_eq!(seeding.from, Some(0), "{seeding:?}");
         drop(held_busy);
     }
@@ -778,16 +742,16 @@ mod tests {
             worktree_candidate(&empty, "worktree empty", false, 0),
             worktree_candidate(&notes, "worktree notes", false, 0),
         ];
-        let seeding = seed_best(&target, &candidates, Duration::ZERO, Duration::ZERO).unwrap();
+        let seeding = seed_best(&target, &candidates, Duration::ZERO).unwrap();
         assert_eq!(seeding.outcome, Outcome::NoBaseline);
         assert!(!target.exists());
-        let seeding = seed_best(&target, &[], Duration::ZERO, Duration::ZERO).unwrap();
+        let seeding = seed_best(&target, &[], Duration::ZERO).unwrap();
         assert_eq!(seeding.outcome, Outcome::NoBaseline);
 
         // The target is the only build there is.
         build_dir(&target);
         let me = [worktree_candidate(&target, "worktree wt", false, 0)];
-        let seeding = seed_best(&target, &me, Duration::ZERO, Duration::ZERO).unwrap();
+        let seeding = seed_best(&target, &me, Duration::ZERO).unwrap();
         assert_eq!(seeding.outcome, Outcome::Same);
     }
 
@@ -827,13 +791,7 @@ mod tests {
         ];
         let target = tmp.path().join("wt/target");
         let started = Instant::now();
-        let seeding = seed_best(
-            &target,
-            &candidates,
-            Duration::from_millis(100),
-            Duration::from_millis(400),
-        )
-        .unwrap();
+        let seeding = seed_best(&target, &candidates, Duration::from_millis(400)).unwrap();
         assert!(started.elapsed() >= Duration::from_millis(400));
         assert_eq!(seeding.outcome, Outcome::Busy);
         assert_eq!(seeding.tried, [0, 1]);

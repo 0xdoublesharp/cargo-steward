@@ -68,10 +68,9 @@ there.
 The main checkout's build is used whenever it holds one and no build is
 using it. Otherwise the others are tried from the most recently used (by the
 wrapper's records, or the times cargo last wrote into each), skipping any
-that hold no build or are on another volume. A candidate a build is using
-gets half a second to come free before the next is tried; if builds are
-using all of them, they're tried in turn until 5 seconds have passed, and
-then the worktree builds cold.
+that hold no build or are on another volume. The first idle candidate is
+used immediately. When all candidates are busy, the same order is retried
+for up to 5 seconds before the worktree builds cold.
 
 It does nothing, and exits 0, when:
 

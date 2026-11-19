@@ -144,7 +144,10 @@ impl Fixture {
             .env_remove("CARGO_BUILD_TARGET_DIR")
             .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
             .env_remove("CARGO_STEWARD_SLOT_FD")
-            .env_remove("CARGO_STEWARD_SLOT");
+            .env_remove("CARGO_STEWARD_SLOT")
+            .env_remove("CARGO_STEWARD_SLOT_PID")
+            .env_remove("_STEWARD_BUILD_SLOT")
+            .env_remove("_STEWARD_BUILD_HOLDER");
         cmd
     }
 
@@ -414,6 +417,36 @@ fn waits_for_a_build_slot() {
             .join("main/debug/pfx")
             .is_file()
     );
+}
+
+#[test]
+fn build_slot_does_not_change_sccache_inputs() {
+    // A second slot lets a broken nested build finish and report the wrong holder.
+    let fx = Fixture::new("max-builds = 2\n");
+    let nested = fx.repo.join("nested");
+    write_crate(&nested, "nested");
+    fs::write(
+        nested.join("src/main.rs"),
+        r#"
+        fn main() {
+            println!("{}", env!("_STEWARD_BUILD_HOLDER"));
+        }
+    "#,
+    )
+    .unwrap();
+    fs::write(fx.repo.join("build.rs"), r#"
+        fn main() {
+            assert!(std::env::vars_os().all(|(name, _)| !name.to_string_lossy().starts_with("CARGO_STEWARD_SLOT")));
+            let holder = std::env::var("_STEWARD_BUILD_HOLDER").unwrap();
+            let child = std::process::Command::new("cargo")
+                .args(["run", "--quiet", "--offline", "--manifest-path", "nested/Cargo.toml",
+                       "--target-dir", "nested/target"])
+                .output().unwrap();
+            assert!(child.status.success(), "{child:?}");
+            assert_eq!(String::from_utf8(child.stdout).unwrap().trim(), holder);
+        }
+    "#).unwrap();
+    fx.run(&fx.repo, &["build", "--offline"]);
 }
 
 #[test]

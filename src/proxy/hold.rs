@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use super::gate::{FD_VAR, HOLDER_VAR, SLOT_VAR};
+use super::gate::{FD_VAR, HOLDER_VAR, LEGACY_HOLDER_VAR, LEGACY_SLOT_VAR, SLOT_VAR};
 
 /// How often the running command is checked for having become the program
 /// it runs.
@@ -33,10 +33,13 @@ pub fn run(
     slot_path: &Path,
     cargo_like: &[Option<PathBuf>],
 ) -> ! {
+    // sccache includes CARGO_* in Rust cache keys; lease identity changes every build.
     command
         .env(SLOT_VAR, slot_path)
         .env(HOLDER_VAR, process::id().to_string())
-        .env_remove(FD_VAR);
+        .env_remove(FD_VAR)
+        .env_remove(LEGACY_SLOT_VAR)
+        .env_remove(LEGACY_HOLDER_VAR);
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) => {
