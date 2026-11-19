@@ -4,10 +4,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-11-18
+
 - Build-slot identifiers are private to steward so repeated gated builds can
   reuse cached Rust dependencies through sccache.
 - Worktree seeding tries every idle candidate before waiting for busy builds.
-
 - A route can cover multiple checkout locations with `additional-paths` and
   enforce one build limit across them.
 - `cargo steward shim explain` sees the caller's target override and can
