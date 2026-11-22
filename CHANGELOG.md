@@ -4,6 +4,49 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-11-21
+
+### Fixed
+
+- Memory admission no longer transiently locks free compile slots before the
+  admission turnstile, avoiding phantom fallback reservations and unnecessary
+  waits; uncontended compiles take a single-scan fast path and open
+  `wake.fifo` lazily only when waiting.
+- The `cargo` proxy skips routing and directory creation for meta commands
+  (`--version`, `-vV`, `--help`, `help`, `version`, and non-CI `cargo steward`
+  subcommands), preventing empty routed build and temporary directories.
+- Cargo download caches (`$CARGO_HOME/registry`, `$CARGO_HOME/git`) are no
+  longer recorded as workspace owners during `cargo install`, so they no
+  longer pollute `doctor` or prevent abandoned build directories from being
+  recognized as orphaned.
+- `ci trim` accounts only for paths that were actually removed when a unit
+  fails to delete, and avoids redundant metadata verification calls when
+  resetting or restoring fingerprint access times.
+- `doctor` checks workspace `.cargo/config.toml` and `.cargo/config` in
+  addition to `Cargo.toml` when reporting dev-profile debug info settings.
+- CLI commands restore default `SIGPIPE` handling after wrapper/proxy
+  dispatch so piping `stats`, `status`, or `gc` to `head` exits cleanly.
+
+### Changed
+
+- Discovery (`status --discover` and `gc`) finds build directories and
+  interrupted deletions in one two-level parallel pass using a single
+  `read_dir` per directory, skips `pnpm-store`, `pnpm-cache`, Python/JS
+  caches, and content-addressed hex-bucket cache trees (`0..=f`, `00..=ff`),
+  and skips inactive Cargo layouts during profile scans.
+- `dedup` queries APFS clone IDs lazily only for multi-candidate groups,
+  compares candidate groups in parallel with reused right-sized buffers, and
+  clones with target metadata in one pass.
+- When `inner-wrapper` is `sccache`, incremental compiles (`-C incremental=...`)
+  and non-compiling probes (`rustc -vV`, `--print`) bypass `sccache` directly,
+  removing per-compile IPC overhead and restoring direct-compiler CPU and
+  peak RSS measurements for incremental workspace crates.
+- Orphaned-compile detection uses `kqueue` (`EVFILT_PROC`, `NOTE_EXIT`) on
+  macOS for instant notification without periodic wakeups, and `proxy`
+  reuses open slot descriptors while waiting for build slots.
+- `cargo steward stats` sorts text output by heaviest execution, CPU, and
+  peak RSS first (`--json` ordering is unchanged).
+
 ## [0.2.5] - 2026-11-18
 
 - Build-slot identifiers are private to steward so repeated gated builds can

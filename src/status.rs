@@ -13,15 +13,13 @@ use crate::json;
 pub fn run(sizes: bool, as_json: bool, discover: bool) -> Result<()> {
     let paths = Paths::resolve().context("cannot locate the home directory")?;
     let config = config::load_warning(&paths);
-    let mut dirs = if discover {
-        gc::inventory(&paths, &gc::scan_roots(&config), false)?.1
+    let (mut dirs, trash) = if discover {
+        let (_, dirs, trash) = gc::inventory_with_trash(&paths, &config, false)?;
+        (dirs, trash)
     } else {
-        gc::recorded_inventory(&paths)
-    };
-    let trash = if discover {
-        gc::trash::inventory(&config, &dirs)
-    } else {
-        gc::trash::near_builds(&dirs)
+        let dirs = gc::recorded_inventory(&paths);
+        let trash = gc::trash::near_builds(&dirs);
+        (dirs, trash)
     };
     if as_json {
         let mut doc = document(dirs, sizes, discover);

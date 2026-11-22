@@ -317,7 +317,8 @@ wrapper that isn't installed is skipped, so builds keep working without it.
 
 When the process that started a compile exits first (Cargo killed alone by
 a supervisor's timeout, say), nothing will use that compile's output. The
-wrapper notices within a second and sends SIGTERM to the compile and every
+wrapper notices (immediately via `kqueue` on macOS, or within a second on
+Linux) and sends SIGTERM to the compile and every
 process below it. A wrapper still waiting for a compile slot leaves without
 starting its compile.
 
@@ -348,10 +349,12 @@ With a memory budget enabled, `CARGO_STEWARD_MAX_COMPILES=0` removes the
 explicit count override and memory mode uses the logical CPU count.
 
 **Unit costs.** `stats` reads small `.cargo-steward-<hash>.json` observations
-alongside build output. Execution includes an inner cache wrapper. CPU is
-measured only for direct compiler children, including children they wait
-for. RSS is the largest individual child peak, not their combined peak;
-through a cache wrapper it is recorded only above `compile-memory-estimate`,
+alongside build output and prints the heaviest units first in text output.
+Execution includes an inner cache wrapper. When `inner-wrapper` is `sccache`,
+incremental compiles (`-C incremental=...`) and non-compiling probes run
+`rustc` directly so they skip `sccache` IPC and record direct compiler CPU
+and peak RSS. For cached/non-incremental compiles through a cache wrapper,
+CPU is left unrecorded and RSS is recorded only above `compile-memory-estimate`,
 which the cache's own client never reaches.
 Cloning output preserves estimates and resets checkout counters.
 `record-costs = false` disables new observations. Cargo or other cache
@@ -409,13 +412,13 @@ then run `mode: trim` before the cache is saved:
 
 ```yaml
 - uses: Swatinem/rust-cache@v2
-- uses: 0xdoublesharp/cargo-steward@v0.2.5
+- uses: 0xdoublesharp/cargo-steward@v0.2.6
   with:
     mode: start
 - run: cargo test --locked
   env:
     RUSTC_WRAPPER: cargo-steward
-- uses: 0xdoublesharp/cargo-steward@v0.2.5
+- uses: 0xdoublesharp/cargo-steward@v0.2.6
   with:
     mode: trim
     budget: 6GiB

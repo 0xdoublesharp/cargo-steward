@@ -45,12 +45,12 @@ pub fn run(argv: Vec<OsString>) -> ! {
     let paths = Paths::resolve();
     let config = settings(paths.as_ref());
 
-    let inner = inner_wrapper(&config);
+    let args = RustcArgs::parse(&argv[1..]);
+    let inner = inner_wrapper_for(&config, &args);
     let direct = inner.is_none();
     let mut command: Vec<OsString> = inner.into_iter().collect();
     command.extend(argv.iter().cloned());
 
-    let args = RustcArgs::parse(&argv[1..]);
     let Some(out_dir) = args.out_dir.clone() else {
         exec(&command);
     };
@@ -198,17 +198,60 @@ fn object_grace(config: &Config) -> Duration {
 /// The wrapper to run rustc through: `$CARGO_STEWARD_INNER` (empty for none),
 /// else `inner-wrapper` from the settings. Skipped if it isn't installed, so a
 /// missing sccache never breaks builds, and never ourselves.
+#[cfg(test)]
 fn inner_wrapper(config: &Config) -> Option<OsString> {
+    inner_wrapper_for(
+        config,
+        &RustcArgs {
+            out_dir: Some(PathBuf::from("/out")),
+            ..RustcArgs::default()
+        },
+    )
+}
+
+fn inner_wrapper_for(config: &Config, args: &RustcArgs) -> Option<OsString> {
     let value: OsString = match env::var_os("CARGO_STEWARD_INNER") {
         Some(value) => value,
         None => config.inner_wrapper.clone()?.into(),
     };
-    if value.is_empty() {
+    if value.is_empty() || should_bypass_inner(&value, args) {
         return None;
     }
     let path = find_program(&value)?;
     let name = path.file_stem().and_then(OsStr::to_str).unwrap_or_default();
     (name != "cargo-steward").then(|| path.into_os_string())
+}
+
+/// Whether an inner wrapper adds only overhead for this rustc invocation.
+/// `sccache` never caches incremental compiles (`-C incremental=...`) or
+/// non-compiling probes (`rustc -vV`, `--print`), so running rustc directly
+/// skips an extra process + server IPC hop and preserves direct CPU and RSS
+/// measurements for workspace crates.
+fn should_bypass_inner(program: &OsStr, args: &RustcArgs) -> bool {
+    let is_sccache = Path::new(program)
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .is_some_and(|stem| stem == "sccache");
+    is_sccache && (args.incremental || args.out_dir.is_none())
+}
+
+/// Whether `dir` is inside Cargo's download caches (`$CARGO_HOME/registry` or
+/// `$CARGO_HOME/git`). `cargo install` compiles registry crates with
+/// `CARGO_PRIMARY_PACKAGE=1`, which must not claim workspace ownership of a
+/// build directory or keep it from being recognized as orphaned.
+pub(crate) fn is_cargo_download_cache(dir: &Path, cargo_home: Option<&Path>) -> bool {
+    let Some(home) = cargo_home else {
+        return false;
+    };
+    let in_cache =
+        |base: &Path| dir.starts_with(base.join("registry")) || dir.starts_with(base.join("git"));
+    if in_cache(home) {
+        return true;
+    }
+    home.canonicalize()
+        .ok()
+        .filter(|canon| canon != home)
+        .is_some_and(|canon| in_cache(&canon))
 }
 
 /// Resolves a program name against `PATH` the way exec would.
@@ -448,7 +491,10 @@ fn after_compile(paths: &Paths, config: &Config, out_dir: &Path, took: Duration)
     let Some(root) = scan::find_root(out_dir) else {
         return;
     };
-    let workspace = env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from);
+    let cargo_home = config::cargo_home();
+    let workspace = env::var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .filter(|dir| !is_cargo_download_cache(dir, cargo_home.as_deref()));
     // A few stat calls up to the worktree's `.git`: lets cleanup ask git
     // whether the worktree was removed, once it's gone.
     let linked = workspace
@@ -983,5 +1029,45 @@ mod tests {
         // A broken policy never starts one.
         config.gc_interval = "often".into();
         assert!(!gc_due(&paths, &config, tmp.path()));
+    }
+
+    #[test]
+    fn bypasses_sccache_only_for_incremental_and_probes() {
+        let inc = RustcArgs {
+            out_dir: Some(PathBuf::from("/t/debug/deps")),
+            incremental: true,
+            ..RustcArgs::default()
+        };
+        let cacheable = RustcArgs {
+            out_dir: Some(PathBuf::from("/t/debug/deps")),
+            incremental: false,
+            ..RustcArgs::default()
+        };
+        let probe = RustcArgs::default();
+        assert!(should_bypass_inner("/usr/local/bin/sccache".as_ref(), &inc));
+        assert!(should_bypass_inner("sccache".as_ref(), &probe));
+        assert!(!should_bypass_inner(
+            "/usr/local/bin/sccache".as_ref(),
+            &cacheable
+        ));
+        // Never bypass a custom wrapper.
+        assert!(!should_bypass_inner("/usr/local/bin/custom".as_ref(), &inc));
+        assert!(!should_bypass_inner(
+            "/usr/local/bin/custom".as_ref(),
+            &probe
+        ));
+    }
+
+    #[test]
+    fn ignores_cargo_download_caches_as_workspace_owners() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cargo_home = tmp.path().join(".cargo");
+        let reg = cargo_home.join("registry/src/index.crates.io-abc/wasm-bindgen-cli-0.2.128");
+        let git = cargo_home.join("git/checkouts/foo-123/rev");
+        let user_ws = tmp.path().join("workspaces/app");
+        assert!(is_cargo_download_cache(&reg, Some(&cargo_home)));
+        assert!(is_cargo_download_cache(&git, Some(&cargo_home)));
+        assert!(!is_cargo_download_cache(&user_ws, Some(&cargo_home)));
+        assert!(!is_cargo_download_cache(&reg, None));
     }
 }

@@ -176,9 +176,20 @@ impl Remover {
                 &format!("{} {}", unit.noun(), what.unwrap_or_default()),
             );
         }
-        if self.apply {
-            for path in &unit.paths {
-                if let Err(e) = fsutil::remove(path) {
+        if !self.apply {
+            self.report.add(reason, 1, bytes);
+            self.gone.extend(unit.paths);
+            return;
+        }
+        let mut removed = Vec::new();
+        let mut remaining_bytes = 0u64;
+        let mut failed = false;
+        for path in unit.paths {
+            match fsutil::remove(&path) {
+                Ok(()) => removed.push(path),
+                Err(e) => {
+                    failed = true;
+                    remaining_bytes = remaining_bytes.saturating_add(fsutil::tree_size(&path));
                     eprintln!(
                         "warning: cargo-steward: failed to remove {}: {e}",
                         path.display()
@@ -186,8 +197,15 @@ impl Remover {
                 }
             }
         }
-        self.report.add(reason, 1, bytes);
-        self.gone.extend(unit.paths);
+        if !removed.is_empty() {
+            let accounted = if failed {
+                bytes.saturating_sub(remaining_bytes)
+            } else {
+                bytes
+            };
+            self.report.add(reason, 1, accounted);
+            self.gone.extend(removed);
+        }
     }
 
     fn is_gone(&self, path: &Path) -> bool {
@@ -1326,5 +1344,34 @@ mod tests {
         };
         let err = run(&options).unwrap_err();
         assert!(format!("{err:#}").contains("step summary"), "{err:#}");
+    }
+
+    #[test]
+    fn failed_unit_removals_are_not_counted_as_freed() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("target");
+        let unit = root.join("debug/build/serde/0123456789abcdef");
+        fs::create_dir_all(unit.join("fingerprint")).unwrap();
+        fs::create_dir_all(unit.join("out")).unwrap();
+        fs::write(unit.join("fingerprint/lib-serde"), b"x").unwrap();
+        fs::write(unit.join("out/libserde.rlib"), vec![1u8; 64 << 10]).unwrap();
+        let pkg = unit.parent().unwrap();
+        fs::set_permissions(pkg, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let options = Options {
+            budget: Some(1),
+            keep_workspace: true,
+            keep_incremental: true,
+            ..opts(&root)
+        };
+        let report = trim(&options, Tracking::NoMarker);
+        fs::set_permissions(pkg, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(unit.exists(), "the unit could not be removed");
+        assert!(
+            report.removed.is_empty(),
+            "a unit whose removal failed completely must not be counted: {report:?}"
+        );
     }
 }

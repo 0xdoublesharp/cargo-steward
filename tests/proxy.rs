@@ -361,6 +361,26 @@ fn broken_settings_still_run_cargo() {
     assert!(stderr.contains("warning: cargo-steward"), "{stderr}");
 }
 
+#[test]
+fn meta_commands_do_not_create_empty_routed_directories() {
+    let fx = Fixture::new("link-target = true\n");
+    let non_rust = fx.root.join("non-rust");
+    fs::create_dir_all(&non_rust).unwrap();
+    for args in [&["--version"][..], &["-vV"], &["--help"], &["help"]] {
+        fx.run(&non_rust, args);
+    }
+    assert!(
+        !fx.targets.exists(),
+        "meta commands created target dirs: {:?}",
+        fx.targets
+    );
+    assert!(
+        !fx.tmps.exists(),
+        "meta commands created tmp dirs: {:?}",
+        fx.tmps
+    );
+}
+
 fn hold_slot(fx: &Fixture) -> (File, PathBuf) {
     let slot = fx.home.join("slots/0.lock");
     fs::create_dir_all(slot.parent().unwrap()).unwrap();

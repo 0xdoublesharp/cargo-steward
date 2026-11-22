@@ -111,6 +111,9 @@ pub fn tree_usage(path: &Path) -> Usage {
             private_total += bytes;
             return;
         }
+        if bytes == 0 && supported {
+            return;
+        }
         match private_size(file) {
             Some(private) => {
                 supported = true;
@@ -136,18 +139,33 @@ pub fn tree_private_size(path: &Path) -> Option<u64> {
 /// isn't a directory), not following symlinks and visiting each hard-linked
 /// file once.
 fn walk_files(path: &Path, mut visit: impl FnMut(&Path, &fs::Metadata)) {
+    let Ok(root_meta) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if !root_meta.is_dir() {
+        visit(path, &root_meta);
+        return;
+    }
     let mut seen = HashSet::new();
     let mut stack = vec![path.to_path_buf()];
-    while let Some(p) = stack.pop() {
-        let Ok(meta) = fs::symlink_metadata(&p) else {
+    while let Some(dir) = stack.pop() {
+        let Ok(read) = fs::read_dir(&dir) else {
             continue;
         };
-        if meta.is_dir() {
-            stack.extend(entries(&p).map(|(_, child)| child));
-            continue;
-        }
-        if first_link(&meta, &mut seen) {
-            visit(&p, &meta);
+        for entry in read.flatten() {
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if ft.is_dir() {
+                stack.push(entry.path());
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if first_link(&meta, &mut seen) {
+                visit(&entry.path(), &meta);
+            }
         }
     }
 }

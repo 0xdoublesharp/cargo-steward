@@ -99,9 +99,10 @@ fn prepare(
     cargo_args: &[OsString],
     me: Option<&Path>,
 ) -> (Vec<(OsString, OsString)>, Option<gate::Slot>) {
-    // Shim diagnostics must see the same environment as the invocation they explain.
-    if matches!(gate::command_args(cargo_args), [cmd, sub, ..] if cmd == "steward" && sub == "shim")
-    {
+    // Non-project/meta commands (such as `--version`, `--help`, `help`, and
+    // `cargo steward shim`/`status`/`gc`) never use a target dir or routed
+    // TMPDIR, so skip routing and avoid creating empty directories.
+    if !gate::needs_routing(cargo_args) {
         return (Vec::new(), None);
     }
     let plan = match cwd {

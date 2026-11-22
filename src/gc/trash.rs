@@ -5,16 +5,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use super::{BuildDir, Cleanup, Kind, Skipped, Sweep, lock_build_dir};
-use crate::{config, fsutil, scan};
-
-/// Find trash in configured scan/routing roots and beside recorded builds.
-pub fn inventory(config: &config::Config, dirs: &[BuildDir]) -> Vec<PathBuf> {
-    let mut roots = super::scan_roots(config);
-    roots.extend(crate::proxy::tmp_roots(config));
-    let mut found = scan::discover_trash(&roots, super::SCAN_DEPTH);
-    found.extend(near_builds(dirs));
-    scan::outermost(found)
-}
+use crate::{fsutil, scan};
 
 pub(crate) fn near_builds(dirs: &[BuildDir]) -> Vec<PathBuf> {
     let roots: Vec<_> = dirs

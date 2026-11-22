@@ -82,6 +82,34 @@ pub fn workspace_roots(packages: &BTreeSet<PathBuf>) -> BTreeSet<PathBuf> {
     packages.iter().filter_map(|p| workspace_root(p)).collect()
 }
 
+/// Effective `[profile.dev].debug` for one workspace: project `.cargo/config.toml`
+/// or `.cargo/config` (walking ancestors, skipping `cargo_home`), then
+/// `root/Cargo.toml`.
+fn workspace_dev_debug(root: &Path, cargo_home: Option<&Path>) -> Debug {
+    let canon_home = cargo_home.and_then(|h| h.canonicalize().ok());
+    for dir in root.ancestors() {
+        let dot_cargo = dir.join(".cargo");
+        if cargo_home.is_some_and(|h| h == dot_cargo)
+            || canon_home
+                .as_ref()
+                .is_some_and(|h| dot_cargo.canonicalize().ok().as_ref() == Some(h))
+        {
+            continue;
+        }
+        for name in ["config.toml", "config"] {
+            if let Ok(text) = fs::read_to_string(dot_cargo.join(name)) {
+                let setting = dev_debug(&text);
+                if setting != Debug::Unset {
+                    return setting;
+                }
+            }
+        }
+    }
+    fs::read_to_string(root.join("Cargo.toml"))
+        .map(|text| dev_debug(&text))
+        .unwrap_or(Debug::Unset)
+}
+
 /// Mentions `debug = "line-tables-only"` for workspaces whose dev profile
 /// keeps full debug info, unless the environment or the user-wide Cargo
 /// config already reduces it everywhere.
@@ -92,8 +120,10 @@ pub fn report(out: &mut Report, roots: &BTreeSet<PathBuf>) {
     let from_env = env::var("CARGO_PROFILE_DEV_DEBUG")
         .map(|v| env_debug(&v))
         .unwrap_or(Debug::Unset);
-    let from_user = config::cargo_home()
-        .and_then(|h| fs::read_to_string(config::user_cargo_config(&h)).ok())
+    let cargo_home = config::cargo_home();
+    let from_user = cargo_home
+        .as_deref()
+        .and_then(|h| fs::read_to_string(config::user_cargo_config(h)).ok())
         .map_or(Debug::Unset, |t| dev_debug(&t));
     if from_env == Debug::Reduced || (from_env == Debug::Unset && from_user == Debug::Reduced) {
         out.say(
@@ -105,8 +135,8 @@ pub fn report(out: &mut Report, roots: &BTreeSet<PathBuf>) {
     let full: Vec<String> = roots
         .iter()
         .filter(|root| {
-            fs::read_to_string(root.join("Cargo.toml"))
-                .is_ok_and(|text| dev_debug(&text) != Debug::Reduced)
+            root.join("Cargo.toml").is_file()
+                && workspace_dev_debug(root, cargo_home.as_deref()) != Debug::Reduced
         })
         .map(|root| root.display().to_string())
         .collect();
@@ -178,5 +208,27 @@ mod tests {
         fs::create_dir_all(&solo).unwrap();
         fs::write(solo.join("Cargo.toml"), "[package]\nname = \"solo\"\n").unwrap();
         assert_eq!(workspace_root(&solo), Some(solo.clone()));
+    }
+
+    #[test]
+    fn reads_dev_debug_from_project_cargo_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(ws.join(".cargo")).unwrap();
+        fs::write(ws.join("Cargo.toml"), "[package]\nname = \"ws\"\n").unwrap();
+        assert_eq!(workspace_dev_debug(&ws, None), Debug::Unset);
+        fs::write(
+            ws.join(".cargo/config.toml"),
+            "[profile.dev]\ndebug = \"line-tables-only\"\n",
+        )
+        .unwrap();
+        assert_eq!(workspace_dev_debug(&ws, None), Debug::Reduced);
+        // Project .cargo/config.toml overrides Cargo.toml's full setting.
+        fs::write(
+            ws.join("Cargo.toml"),
+            "[package]\nname = \"ws\"\n[profile.dev]\ndebug = true\n",
+        )
+        .unwrap();
+        assert_eq!(workspace_dev_debug(&ws, None), Debug::Reduced);
     }
 }

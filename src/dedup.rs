@@ -338,31 +338,38 @@ pub fn dedup(dirs: &[BuildDir], apply: bool, since: Option<SystemTime>) -> Resul
         BTreeMap::new()
     };
 
-    let mut keys: Vec<_> = by_key.keys().cloned().collect();
-    keys.sort();
+    let mut candidate_groups: Vec<((u64, OsString, u64), Vec<Candidate>)> = by_key
+        .into_iter()
+        .filter(|(_, group)| group.len() >= 2)
+        .collect();
+    candidate_groups.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Read-only phase (clone ID lookup + content comparison) runs in parallel
+    // across candidate groups, preserving sorted order. Only groups with >=2
+    // same-size/same-name files ever query APFS clone IDs or read file bytes.
+    let partitioned: Vec<(u64, Vec<Vec<Cluster>>)> =
+        fsutil::parallel_map(&candidate_groups, |(key, group)| {
+            let clusters = by_clone_id(group);
+            if clusters.len() < 2 {
+                return (key.0, Vec::new());
+            }
+            (key.0, partition(clusters, key.2))
+        });
+
     let mut failed_volumes: HashSet<u64> = HashSet::new();
-    for key in keys {
-        let Some(group) = by_key.remove(&key) else {
-            continue;
-        };
-        if failed_volumes.contains(&key.0) {
+    for (device, classes) in partitioned {
+        if failed_volumes.contains(&device) {
             continue;
         }
-        // Pure clones hold the same data already: one of each is compared,
-        // and a group that is all one clone has nothing to gain.
-        let clusters = by_clone_id(group);
-        if clusters.len() < 2 {
-            continue;
-        }
-        for class in partition(clusters) {
-            if failed_volumes.contains(&key.0) {
+        for class in classes {
+            if failed_volumes.contains(&device) {
                 break;
             }
             if let Some(found) = replace_class(class, apply, &mut summary) {
                 summary.groups.push(found);
             } else if apply {
                 // `None` with apply set only when cloning proved unsupported.
-                failed_volumes.insert(key.0);
+                failed_volumes.insert(device);
             }
         }
     }
@@ -443,6 +450,7 @@ enum Replaced {
 /// files' profiles, if neither changed since their contents were compared.
 fn replace(kept: &Candidate, dup: &Candidate) -> Replaced {
     let mut profiles = vec![&kept.profile, &dup.profile];
+    profiles.sort();
     profiles.dedup();
     let mut locks = Vec::new();
     for profile in profiles {
@@ -465,7 +473,7 @@ fn replace(kept: &Candidate, dup: &Candidate) -> Replaced {
         std::process::id()
     ));
     let _ = fs::remove_file(&temp);
-    match clone::clone_file(&kept.path, &temp) {
+    match clone::clone_file_like(&kept.path, &temp, &dup.meta) {
         Ok(Cloned::Done) => {}
         Ok(Cloned::Unsupported) => return Replaced::Unsupported,
         Err(_) => {
@@ -473,8 +481,7 @@ fn replace(kept: &Candidate, dup: &Candidate) -> Replaced {
             return Replaced::Skipped;
         }
     }
-    if clone::set_times_and_mode(&temp, &dup.meta).is_err() || fs::rename(&temp, &dup.path).is_err()
-    {
+    if fs::rename(&temp, &dup.path).is_err() {
         let _ = fs::remove_file(&temp);
         return Replaced::Skipped;
     }
@@ -488,16 +495,24 @@ fn collect(profile: &Path) -> Vec<Candidate> {
     let mut found = Vec::new();
     let mut stack = vec![profile.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        for (name, path) in fsutil::entries(&dir) {
-            if skipped(&name, dir == profile) {
+        let top = dir == profile;
+        let Ok(read) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in read.flatten() {
+            let name = entry.file_name();
+            if skipped(&name.to_string_lossy(), top) {
                 continue;
             }
-            let Ok(meta) = fs::symlink_metadata(&path) else {
+            let Ok(kind) = entry.file_type() else {
                 continue;
             };
-            if meta.is_dir() {
-                stack.push(path);
-            } else if let Some(candidate) = candidate(path, profile, meta) {
+            if kind.is_dir() {
+                stack.push(entry.path());
+            } else if kind.is_file()
+                && let Ok(meta) = entry.metadata()
+                && let Some(candidate) = candidate(entry.path(), profile, meta)
+            {
                 found.push(candidate);
             }
         }
@@ -515,9 +530,11 @@ fn skipped(name: &str, top: bool) -> bool {
 
 /// The file at `path` in `profile`, if it may have duplicates worth
 /// replacing: a regular file of at least [`MIN_SIZE`] with a single link.
+/// Clone IDs are queried lazily in [`by_clone_id`] only for groups that
+/// actually have multiple candidates of the same name and size.
 fn candidate(path: PathBuf, profile: &Path, meta: fs::Metadata) -> Option<Candidate> {
     (meta.is_file() && meta.len() >= MIN_SIZE && links(&meta) == 1).then(|| Candidate {
-        clone_id: clone::clone_id(&path),
+        clone_id: None,
         path,
         profile: profile.to_path_buf(),
         meta,
@@ -624,19 +641,27 @@ fn changed(meta: &fs::Metadata) -> SystemTime {
     meta.modified().unwrap_or(UNIX_EPOCH)
 }
 
-/// Groups files that are pure clones of each other. Files whose clone ID
-/// isn't known are each their own cluster.
-fn by_clone_id(files: Vec<Candidate>) -> Vec<Cluster> {
+/// Groups files that are pure clones of each other, querying clone IDs
+/// lazily now that the group is known to have multiple candidates. Files
+/// whose clone ID isn't known are each their own cluster.
+fn by_clone_id(files: &[Candidate]) -> Vec<Cluster> {
     let mut clusters: Vec<Cluster> = Vec::new();
     for file in files {
-        let same = file.clone_id.and_then(|id| {
+        let clone_id = file.clone_id.or_else(|| clone::clone_id(&file.path));
+        let cloned = Candidate {
+            path: file.path.clone(),
+            profile: file.profile.clone(),
+            meta: file.meta.clone(),
+            clone_id,
+        };
+        let same = clone_id.and_then(|id| {
             clusters
                 .iter()
                 .position(|c| c.first().and_then(|f| f.clone_id) == Some(id))
         });
         match same {
-            Some(i) => clusters[i].push(file),
-            None => clusters.push(vec![file]),
+            Some(i) => clusters[i].push(cloned),
+            None => clusters.push(vec![cloned]),
         }
     }
     clusters
@@ -645,17 +670,30 @@ fn by_clone_id(files: Vec<Candidate>) -> Vec<Cluster> {
 /// Splits clusters of files of the same size into classes of identical
 /// contents, comparing the first file of each, and drops clusters that
 /// match no other.
-fn partition(mut clusters: Vec<Cluster>) -> Vec<Vec<Cluster>> {
+fn partition(mut clusters: Vec<Cluster>, file_size: u64) -> Vec<Vec<Cluster>> {
+    const MAX_CHUNK: usize = 256 * 1024;
+    let buf_len = usize::try_from(file_size)
+        .unwrap_or(MAX_CHUNK)
+        .clamp(4096, MAX_CHUNK);
+    let mut buf_a = vec![0u8; buf_len];
+    let mut buf_b = vec![0u8; buf_len];
     let mut classes = Vec::new();
     while clusters.len() >= 2 {
         let first = clusters.remove(0);
         let Some(probe) = first.first().map(|f| f.path.clone()) else {
             continue;
         };
-        let (same, rest): (Vec<Cluster>, Vec<Cluster>) = clusters.into_iter().partition(|c| {
-            c.first()
-                .is_some_and(|f| same_contents(&probe, &f.path).unwrap_or(false))
-        });
+        let mut same = Vec::new();
+        let mut rest = Vec::new();
+        for cluster in clusters {
+            if cluster.first().is_some_and(|f| {
+                same_contents_with(&probe, &f.path, &mut buf_a, &mut buf_b).unwrap_or(false)
+            }) {
+                same.push(cluster);
+            } else {
+                rest.push(cluster);
+            }
+        }
         if !same.is_empty() {
             let mut class = vec![first];
             class.extend(same);
@@ -667,15 +705,19 @@ fn partition(mut clusters: Vec<Cluster>) -> Vec<Vec<Cluster>> {
 }
 
 /// Whether two files hold the same bytes, read side by side.
+#[cfg(test)]
 fn same_contents(a: &Path, b: &Path) -> io::Result<bool> {
-    const CHUNK: usize = 256 * 1024;
+    let mut buf_a = vec![0u8; 256 * 1024];
+    let mut buf_b = vec![0u8; 256 * 1024];
+    same_contents_with(a, b, &mut buf_a, &mut buf_b)
+}
+
+fn same_contents_with(a: &Path, b: &Path, buf_a: &mut [u8], buf_b: &mut [u8]) -> io::Result<bool> {
     let mut a = fsutil::open_quietly(a)?;
     let mut b = fsutil::open_quietly(b)?;
-    let mut buf_a = vec![0u8; CHUNK];
-    let mut buf_b = vec![0u8; CHUNK];
     loop {
-        let n = read_full(&mut a, &mut buf_a)?;
-        let m = read_full(&mut b, &mut buf_b)?;
+        let n = read_full(&mut a, buf_a)?;
+        let m = read_full(&mut b, buf_b)?;
         if n != m || buf_a[..n] != buf_b[..m] {
             return Ok(false);
         }

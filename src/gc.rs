@@ -175,8 +175,15 @@ pub struct ProfileScan {
 impl ProfileScan {
     pub fn read(profile: &Profile) -> ProfileScan {
         ProfileScan {
-            legacy_last_used: scan::legacy_last_used(&profile.path),
-            units: scan::v2_units(&profile.path),
+            legacy_last_used: profile
+                .legacy
+                .then(|| scan::legacy_last_used(&profile.path))
+                .flatten(),
+            units: if profile.v2 {
+                scan::v2_units(&profile.path)
+            } else {
+                Vec::new()
+            },
             incremental: scan::incremental_dirs(&profile.path),
         }
     }
@@ -291,6 +298,36 @@ pub fn inventory(
     scan_roots: &[PathBuf],
     write: bool,
 ) -> Result<(Registry, Vec<BuildDir>)> {
+    let (registry, dirs, _) = inventory_discovered(paths, scan_roots, false, write)?;
+    Ok((registry, dirs))
+}
+
+/// Every known build directory and every interrupted deletion under the scan
+/// and routed temporary roots, in a single parallel tree walk.
+pub fn inventory_with_trash(
+    paths: &Paths,
+    config: &config::Config,
+    write: bool,
+) -> Result<(Registry, Vec<BuildDir>, Vec<PathBuf>)> {
+    let scan = scan_roots(config);
+    let (registry, dirs, mut trash) = inventory_discovered(paths, &scan, true, write)?;
+    let extra_tmp: Vec<PathBuf> = crate::proxy::tmp_roots(config)
+        .into_iter()
+        .filter(|root| !scan.contains(root))
+        .collect();
+    if !extra_tmp.is_empty() {
+        trash.extend(scan::discover_trash(&extra_tmp, SCAN_DEPTH));
+    }
+    trash.extend(trash::near_builds(&dirs));
+    Ok((registry, dirs, scan::outermost(trash)))
+}
+
+fn inventory_discovered(
+    paths: &Paths,
+    scan_roots: &[PathBuf],
+    include_trash: bool,
+    write: bool,
+) -> Result<(Registry, Vec<BuildDir>, Vec<PathBuf>)> {
     let compacted = if write {
         ledger::compact(paths)?
     } else {
@@ -306,12 +343,19 @@ pub fn inventory(
         .filter(|root| root.exists())
         .cloned()
         .collect();
-    roots.extend(scan::discover(scan_roots, SCAN_DEPTH));
+    let trash = if include_trash {
+        let found = scan::discover_all(scan_roots, SCAN_DEPTH);
+        roots.extend(found.builds);
+        found.trash
+    } else {
+        roots.extend(scan::discover(scan_roots, SCAN_DEPTH));
+        Vec::new()
+    };
     let roots = scan::outermost(roots);
     let dirs = fsutil::parallel_map(&roots, |root| {
         BuildDir::inspect(root, registry.roots.get(root))
     });
-    Ok((registry, dirs))
+    Ok((registry, dirs, trash))
 }
 
 /// Cheap, read-only status of build directories the wrapper has recorded.
@@ -340,12 +384,29 @@ const MOUNT_CONTAINERS: &[&str] = &["/Volumes", "/media", "/run/media", "/mnt"];
 /// isn't mounted (an external or scratch disk): its history (workspaces,
 /// compile time) is kept for when it's back.
 fn resolve_registry(compacted: &Registry, containers: &[&str]) -> Registry {
+    resolve_registry_with(compacted, containers, config::cargo_home().as_deref())
+}
+
+fn resolve_registry_with(
+    compacted: &Registry,
+    containers: &[&str],
+    cargo_home: Option<&Path>,
+) -> Registry {
     let mut registry = Registry::default();
     for (root, info) in &compacted.roots {
+        let mut cleaned = info.clone();
+        cleaned
+            .workspaces
+            .retain(|w| !crate::wrapper::is_cargo_download_cache(w, cargo_home));
+        cleaned.linked.retain(|w, _| cleaned.workspaces.contains(w));
         if let Some(found) = scan::find_root(root) {
-            registry.roots.entry(found).or_default().absorb(info);
+            registry.roots.entry(found).or_default().absorb(&cleaned);
         } else if on_missing_volume(root, containers) {
-            registry.roots.entry(root.clone()).or_default().absorb(info);
+            registry
+                .roots
+                .entry(root.clone())
+                .or_default()
+                .absorb(&cleaned);
         }
     }
     registry
@@ -410,13 +471,12 @@ pub fn run(options: Options) -> Result<()> {
         touch(&paths.stamp());
     }
 
-    let (mut registry, dirs) = inventory(&paths, &scan_roots(&config), options.apply)?;
+    let (mut registry, dirs, trash) = inventory_with_trash(&paths, &config, options.apply)?;
     let running = if config.process_guard {
         Running::collect()
     } else {
         Running::default()
     };
-    let trash = trash::inventory(&config, &dirs);
     let tmp_paths: Vec<_> = dirs
         .iter()
         .filter_map(|d| crate::proxy::routed_tmp_dir(&config, &d.root))
@@ -891,7 +951,7 @@ fn clean_profile(
     if profile.legacy
         && profile.v2
         && legacy_idle(scan.legacy_last_used)
-        && legacy_idle(scan::legacy_last_used(&profile.path))
+        && (!sweep.apply || legacy_idle(scan::legacy_last_used(&profile.path)))
     {
         for path in scan::legacy_paths(&profile.path) {
             remove_dir(
@@ -3154,5 +3214,56 @@ mod tests {
         assert_eq!(resolved.roots.keys().collect::<Vec<_>>(), [&away]);
         assert_eq!(resolved.roots[&away], info);
         assert!(!on_missing_volume(&elsewhere, &containers));
+    }
+
+    #[test]
+    fn strips_cargo_download_caches_from_recorded_workspaces() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let cargo_home = base.join("cargo-home");
+        let cached_crate = cargo_home.join("registry/src/index.crates.io-abc/tool-0.1.0");
+        fs::create_dir_all(&cached_crate).unwrap();
+        let root = build_dir(&base, "target");
+        let deleted_ws = base.join("deleted-ws");
+        let mut recorded = Registry::default();
+        recorded.roots.insert(
+            root.clone(),
+            RootInfo {
+                last_used: 5,
+                workspaces: [deleted_ws.clone(), cached_crate].into(),
+                compile_ms: 10,
+                linked: BTreeMap::new(),
+            },
+        );
+        let resolved = resolve_registry_with(&recorded, &[], Some(&cargo_home));
+        let dir = BuildDir::inspect(&root, resolved.roots.get(&root));
+        assert_eq!(dir.workspaces, [deleted_ws].into());
+        assert!(dir.orphaned());
+    }
+
+    #[test]
+    fn profile_scan_skips_inactive_layouts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = tmp.path().join("debug");
+        make(&profile.join(".fingerprint/a-0123456789abcdef/lib-a"));
+        make(&profile.join("build/b/0123456789abcdef/fingerprint/lib-b"));
+
+        let legacy_only = Profile {
+            path: profile.clone(),
+            legacy: true,
+            v2: false,
+        };
+        let scan = ProfileScan::read(&legacy_only);
+        assert!(scan.legacy_last_used.is_some());
+        assert!(scan.units.is_empty());
+
+        let v2_only = Profile {
+            path: profile,
+            legacy: false,
+            v2: true,
+        };
+        let scan = ProfileScan::read(&v2_only);
+        assert!(scan.legacy_last_used.is_none());
+        assert_eq!(scan.units.len(), 1);
     }
 }

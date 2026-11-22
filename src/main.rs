@@ -178,6 +178,16 @@ fn main() -> ExitCode {
         wrapper::run(args.split_off(1));
     }
 
+    // Restore default SIGPIPE handling for CLI commands so piping `stats`,
+    // `status`, or `gc` to `head` exits quietly instead of panicking.
+    // Done after proxy/wrapper dispatch so cargo and rustc inherit the
+    // caller's signal disposition untouched.
+    #[cfg(unix)]
+    // SAFETY: Setting SIGPIPE to SIG_DFL is async-signal-safe and requires no pointers.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     let cli = Cli::parse_from(args);
     let json = cli.command.json();
     let result = match cli.command {

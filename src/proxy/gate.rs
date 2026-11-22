@@ -63,9 +63,30 @@ const NON_BUILD: [&str; 23] = [
     "watch",
 ];
 
+/// Commands that never read or write a target directory or routed TMPDIR, so
+/// the proxy should not create empty build/temp directories or run git for
+/// them. `cargo steward ci` is kept routed because it invokes `$CARGO metadata`.
+const NO_ROUTE: [&str; 8] = [
+    "help", "version", "login", "logout", "search", "owner", "yank", "info",
+];
+
 /// Whether a cargo invocation may compile, and so takes a build slot.
 pub fn is_build(args: &[OsString]) -> bool {
     command(args).is_some_and(|c| !NON_BUILD.contains(&c.as_str()))
+}
+
+/// Whether a cargo invocation may use `CARGO_TARGET_DIR` or routed `TMPDIR`.
+pub fn needs_routing(args: &[OsString]) -> bool {
+    let Some(cmd) = command(args) else {
+        return false;
+    };
+    if NO_ROUTE.contains(&cmd.as_str()) {
+        return false;
+    }
+    if cmd == "steward" {
+        return matches!(command_args(args), [_, sub, ..] if sub == "ci");
+    }
+    true
 }
 
 /// The cargo subcommand, skipping `+toolchain` and global options. `None`
@@ -135,29 +156,48 @@ pub fn acquire(dir: &Path, limit: u32, about: &str) -> io::Result<Slot> {
         return Ok(Slot::Inherited);
     }
     fs::create_dir_all(dir)?;
-    let mut waiting = false;
-    loop {
-        if let Some((mut file, path)) = try_any(dir, limit)? {
-            let _ = describe(&mut file, about);
-            return Ok(Slot::Held { file, path });
-        }
-        if !waiting {
-            let holders = holders(dir, limit);
-            if holders.is_empty() {
-                eprintln!("cargo-steward: waiting for one of {limit} Cargo build slots");
-            } else {
-                eprintln!(
-                    "cargo-steward: waiting for one of {limit} Cargo build slots (held by {})",
-                    holders.join("; ")
-                );
+    // Open each slot once, returning immediately on the first free one and
+    // reusing the open descriptors if we have to wait.
+    let mut slots: Vec<(File, PathBuf)> = Vec::with_capacity(limit as usize);
+    for index in 0..limit {
+        let path = dir.join(format!("{index}.lock"));
+        let mut file = open_slot(&path)?;
+        match file.try_lock() {
+            Ok(()) => {
+                let _ = describe(&mut file, about);
+                return Ok(Slot::Held { file, path });
             }
-            waiting = true;
+            Err(TryLockError::WouldBlock) => slots.push((file, path)),
+            Err(TryLockError::Error(e)) => return Err(e),
         }
+    }
+    let holders = holders(dir, limit);
+    if holders.is_empty() {
+        eprintln!("cargo-steward: waiting for one of {limit} Cargo build slots");
+    } else {
+        eprintln!(
+            "cargo-steward: waiting for one of {limit} Cargo build slots (held by {})",
+            holders.join("; ")
+        );
+    }
+    loop {
         sleep(POLL);
+        for (index, (file, _)) in slots.iter().enumerate() {
+            match file.try_lock() {
+                Ok(()) => {
+                    let (mut file, path) = slots.swap_remove(index);
+                    let _ = describe(&mut file, about);
+                    return Ok(Slot::Held { file, path });
+                }
+                Err(TryLockError::WouldBlock) => continue,
+                Err(TryLockError::Error(e)) => return Err(e),
+            }
+        }
     }
 }
 
 /// One pass over the slots: the first free one, locked.
+#[cfg(test)]
 fn try_any(dir: &Path, limit: u32) -> io::Result<Option<(File, PathBuf)>> {
     for index in 0..limit {
         let path = dir.join(format!("{index}.lock"));
@@ -428,6 +468,35 @@ mod tests {
             command(&os(&["+1.88", "-q", "check"])).as_deref(),
             Some("check")
         );
+
+        for unrouted in [
+            &[][..],
+            &["--version"],
+            &["-V"],
+            &["-vV"],
+            &["--list"],
+            &["--help"],
+            &["-h"],
+            &["build", "--help"],
+            &["help", "build"],
+            &["version"],
+            &["--explain", "E0308"],
+            &["steward", "status"],
+            &["steward", "shim", "explain"],
+            &["steward", "gc"],
+        ] {
+            assert!(!needs_routing(&os(unrouted)), "{unrouted:?}");
+        }
+        for routed in [
+            &["build"][..],
+            &["metadata", "--format-version", "1"],
+            &["clean"],
+            &["test"],
+            &["steward", "ci", "start"],
+            &["steward", "ci", "trim"],
+        ] {
+            assert!(needs_routing(&os(routed)), "{routed:?}");
+        }
     }
 
     fn open(path: &Path) -> File {

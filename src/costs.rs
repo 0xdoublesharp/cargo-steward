@@ -207,7 +207,7 @@ pub fn run(args: &Args) -> Result<()> {
         Some(root) => root.clone(),
         None => crate::gc::build_dir_of(&std::env::current_dir().context("current directory")?)?,
     };
-    let observations = collect(&root);
+    let mut observations = collect(&root);
     if args.json {
         return json::print(
             &serde_json::json!({"version":json::VERSION,"target_dir":root,
@@ -216,6 +216,16 @@ pub fn run(args: &Args) -> Result<()> {
             })).collect::<Vec<_>>()}),
         );
     }
+    // Show the heaviest units first in human output so `stats | head`
+    // surfaces slow/large crates rather than zero-call seeded entries.
+    observations.sort_by(|a, b| {
+        b.1.execution_ms
+            .cmp(&a.1.execution_ms)
+            .then_with(|| b.1.cpu_ms.cmp(&a.1.cpu_ms))
+            .then_with(|| b.1.max_rss_bytes.cmp(&a.1.max_rss_bytes))
+            .then_with(|| b.1.calls.cmp(&a.1.calls))
+            .then_with(|| a.1.crate_name.cmp(&b.1.crate_name))
+    });
     println!(
         "{:>8} {:>10} {:>10} {:>10} {:>10}  CRATE",
         "CALLS", "EXECUTION", "QUEUED", "CPU", "PEAK RSS"

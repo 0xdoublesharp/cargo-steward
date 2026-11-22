@@ -62,9 +62,7 @@ fn lock(state: &Mutex<State>) -> MutexGuard<'_, State> {
 }
 
 fn watch(state: &Mutex<State>, parent: u32) {
-    while !orphaned(parent, parent_id()) {
-        thread::sleep(POLL);
-    }
+    wait_for_parent_exit(parent);
     let state = lock(state);
     if state.finished {
         return;
@@ -74,6 +72,88 @@ fn watch(state: &Mutex<State>, parent: u32) {
         Some(child) => terminate(child),
         // Still waiting for a slot: leave instead of starting the compile.
         None => process::exit(128 + libc::SIGTERM),
+    }
+}
+
+/// Blocks until `parent` exits, using kernel notifications (`kqueue`
+/// `EVFILT_PROC` `NOTE_EXIT`) on macOS for instant response with zero
+/// periodic wakeups, falling back to `POLL` if unavailable.
+fn wait_for_parent_exit(parent: u32) {
+    #[cfg(target_os = "macos")]
+    {
+        if !orphaned(parent, parent_id()) && kqueue_wait_exit(parent) {
+            // Confirm reparenting completed (covers any brief kernel window
+            // right as the parent exits).
+            while !orphaned(parent, parent_id()) {
+                thread::sleep(Duration::from_millis(10));
+            }
+            return;
+        }
+    }
+    while !orphaned(parent, parent_id()) {
+        thread::sleep(POLL);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn kqueue_wait_exit(parent: u32) -> bool {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    if parent <= 1 {
+        return false;
+    }
+    // SAFETY: kqueue() takes no arguments and returns a new fd or -1.
+    let kq = unsafe { libc::kqueue() };
+    if kq < 0 {
+        return false;
+    }
+    // SAFETY: `kq` is a freshly created, valid file descriptor owned here.
+    let kq = unsafe { OwnedFd::from_raw_fd(kq) };
+    let change = libc::kevent {
+        ident: parent as libc::uintptr_t,
+        filter: libc::EVFILT_PROC,
+        flags: libc::EV_ADD | libc::EV_ONESHOT,
+        fflags: libc::NOTE_EXIT,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    };
+    let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+    // Register first (zero timeout) so we can distinguish registration errors
+    // (ESRCH = already exited, EPERM = fall back to polling) from blocking.
+    let zero = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `change`, `event`, and `zero` are valid stack values for the call.
+    let rc = unsafe { libc::kevent(kq.as_raw_fd(), &change, 1, &mut event, 1, &zero) };
+    if rc < 0 {
+        return io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+    }
+    if rc > 0 {
+        return true;
+    }
+    if orphaned(parent, parent_id()) {
+        return true;
+    }
+    loop {
+        // SAFETY: `event` is a valid writable kevent; null timeout blocks until NOTE_EXIT.
+        let ready = unsafe {
+            libc::kevent(
+                kq.as_raw_fd(),
+                std::ptr::null(),
+                0,
+                &mut event,
+                1,
+                std::ptr::null(),
+            )
+        };
+        if ready > 0 {
+            return true;
+        }
+        if ready < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return false;
     }
 }
 

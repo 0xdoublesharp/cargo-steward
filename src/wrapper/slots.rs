@@ -147,54 +147,36 @@ pub fn acquire_memory(
     if inherited(dir) {
         return None;
     }
-    fs::create_dir_all(dir).ok()?;
-    let ancestors = crate::proxy::ancestor_pids();
+    let admission = open_in_dir(dir, &dir.join("admission.lock"))?;
+    let requested = estimate.max(1).min(budget);
+    let mut ancestors: Option<std::collections::BTreeSet<u32>> = None;
+
+    // Fast path: when nobody holds the turnstile, take it immediately and do
+    // a single directory scan + reentrancy check inside the admission pass.
+    // Only when the turnstile is contended do we check reentrancy beforehand
+    // (without transiently locking free slots, which would race with the
+    // admission holder's scan and cause a phantom fallback reservation).
+    match admission.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => {
+            if held_by_ancestor_without_locking_free(dir, limit, &mut ancestors)? {
+                return None;
+            }
+            admission.lock().ok()?;
+        }
+        Err(TryLockError::Error(_)) => return None,
+    }
+
     let mut indexes: std::collections::BTreeSet<u32> = (0..limit).collect();
-    indexes.extend(fs::read_dir(dir).ok()?.flatten().filter_map(|entry| {
-        entry
-            .file_name()
-            .to_str()?
-            .strip_suffix(".lock")?
-            .parse::<u32>()
-            .ok()
-    }));
-    let mut files: Vec<_> = indexes
+    extend_slot_indexes(dir, &mut indexes)?;
+    let files: Vec<_> = indexes
         .iter()
         .map(|&index| Some((index, open(dir, index)?)))
         .collect::<Option<_>>()?;
-    // Reentrancy is checked before waiting for the turnstile: a current
-    // head may itself be waiting for the enclosing compiler to finish.
-    for (_, file) in &files {
-        match file.try_lock() {
-            Ok(()) => {
-                file.unlock().ok()?;
-            }
-            Err(TryLockError::WouldBlock)
-                if record(file).0.is_some_and(|p| ancestors.contains(&p)) =>
-            {
-                return None;
-            }
-            Err(TryLockError::WouldBlock) => {}
-            Err(TryLockError::Error(_)) => return None,
-        }
-    }
-    let admission = open_slot(&dir.join("admission.lock")).ok()?;
-    let requested = estimate.max(1).min(budget);
-    admission.lock().ok()?;
-    let mut notifications = Notifications::open(dir);
-    // A client with a larger count limit may have created higher slots
-    // while we waited for the turnstile. Include those reservations too.
-    for entry in fs::read_dir(dir).ok()?.flatten() {
-        if let Some(index) = entry
-            .file_name()
-            .to_str()
-            .and_then(|s| s.strip_suffix(".lock"))
-            .and_then(|s| s.parse::<u32>().ok())
-            && indexes.insert(index)
-        {
-            files.push((index, open(dir, index)?));
-        }
-    }
+
+    let mut check_reentrancy = true;
+    let mut tried_notifications = false;
+    let mut notifications: Option<Notifications> = None;
     loop {
         let mut free = None;
         let mut reserved = 0u64;
@@ -210,7 +192,20 @@ pub fn acquire_memory(
                     }
                 }
                 Err(TryLockError::WouldBlock) => {
-                    let memory = record(file).1.filter(|&n| n > 0).unwrap_or(fallback.max(1));
+                    let (pid, mem, _) = record(file);
+                    if check_reentrancy
+                        && let Some(pid) = pid
+                        && ancestors
+                            .get_or_insert_with(crate::proxy::ancestor_pids)
+                            .contains(&pid)
+                    {
+                        if let Some((_, held)) = free {
+                            let _ = held.unlock();
+                        }
+                        let _ = admission.unlock();
+                        return None;
+                    }
+                    let memory = mem.filter(|&n| n > 0).unwrap_or(fallback.max(1));
                     reserved = reserved.saturating_add(memory);
                     if *index < limit && wait_count.is_none() {
                         wait_count = Some(file);
@@ -222,6 +217,7 @@ pub fn acquire_memory(
                 Err(TryLockError::Error(_)) => return None,
             }
         }
+        check_reentrancy = false;
         if reserved.saturating_add(requested) <= budget
             && let Some((index, file)) = free.take()
         {
@@ -232,6 +228,16 @@ pub fn acquire_memory(
         let count_full = free.is_none();
         if let Some((_, file)) = free {
             file.unlock().ok()?;
+        }
+        // Open wake.fifo lazily only when we actually need to wait, then
+        // re-scan once before sleeping so a completion just before `open`
+        // can never be missed.
+        if !tried_notifications {
+            tried_notifications = true;
+            notifications = Notifications::open(dir);
+            if notifications.is_some() {
+                continue;
+            }
         }
         if let Some(wake) = &mut notifications {
             if wake.wait().is_ok() {
@@ -247,6 +253,75 @@ pub fn acquire_memory(
         wake.lock().ok()?;
         wake.unlock().ok()?;
     }
+}
+
+/// Checks whether any slot under `dir` is held by an ancestor process,
+/// reading each slot's PID first and only calling `try_lock` on slots whose
+/// recorded PID is actually an ancestor. Free slots contain spaces (no PID),
+/// so they are never transiently locked while another caller holds the
+/// admission turnstile.
+fn held_by_ancestor_without_locking_free(
+    dir: &Path,
+    limit: u32,
+    ancestors: &mut Option<std::collections::BTreeSet<u32>>,
+) -> Option<bool> {
+    let mut indexes: std::collections::BTreeSet<u32> = (0..limit).collect();
+    extend_slot_indexes(dir, &mut indexes)?;
+    for index in indexes {
+        let Ok(file) = open_slot_existing(&slot_path(dir, index)) else {
+            continue;
+        };
+        let Some(pid) = record(&file).0 else {
+            continue;
+        };
+        if !ancestors
+            .get_or_insert_with(crate::proxy::ancestor_pids)
+            .contains(&pid)
+        {
+            continue;
+        }
+        match file.try_lock() {
+            Ok(()) => {
+                file.unlock().ok()?;
+            }
+            Err(TryLockError::WouldBlock) => return Some(true),
+            Err(TryLockError::Error(_)) => return None,
+        }
+    }
+    Some(false)
+}
+
+fn extend_slot_indexes(dir: &Path, indexes: &mut std::collections::BTreeSet<u32>) -> Option<()> {
+    for entry in fs::read_dir(dir).ok()?.flatten() {
+        if let Some(index) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.strip_suffix(".lock"))
+            .and_then(|s| s.parse::<u32>().ok())
+        {
+            indexes.insert(index);
+        }
+    }
+    Some(())
+}
+
+fn open_in_dir(dir: &Path, path: &Path) -> Option<File> {
+    match open_slot(path) {
+        Ok(file) => Some(file),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(dir).ok()?;
+            open_slot(path).ok()
+        }
+        Err(_) => None,
+    }
+}
+
+fn open_slot_existing(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
 }
 
 fn retry_interrupted<T>(mut operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {
@@ -666,5 +741,51 @@ mod tests {
         let flags = unsafe { libc::fcntl(slot._file.as_raw_fd(), libc::F_GETFD) };
         assert!(flags >= 0);
         assert_ne!(flags & libc::FD_CLOEXEC, 0, "the slot is inherited on exec");
+    }
+
+    #[test]
+    fn uncontended_memory_admission_does_not_create_wake_fifo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("compile-slots");
+        let slot = acquire_memory(&dir, 4, 1000, 100, 200).unwrap();
+        assert!(
+            !dir.join("wake.fifo").exists(),
+            "uncontended admission should not open wake.fifo"
+        );
+        drop(slot);
+    }
+
+    #[test]
+    fn contended_reentrancy_check_detects_ancestor_without_locking_free_slots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("compile-slots");
+        fs::create_dir_all(&dir).unwrap();
+        // Hold the admission turnstile so callers take the contended path.
+        let admission = open_slot(&dir.join("admission.lock")).unwrap();
+        admission.lock().unwrap();
+        // Slot 0 is free (spaces); slot 1 is held by our parent (ancestor).
+        let free = open(&dir, 0).unwrap();
+        free.write_at(&[b' '; 96], 0).unwrap();
+        let held = open(&dir, 1).unwrap();
+        held.lock().unwrap();
+        // SAFETY: plain syscall with no arguments.
+        let parent = unsafe { libc::getppid() };
+        held.write_at(format!("{parent:<10}\n{:<20}\n", 100).as_bytes(), 0)
+            .unwrap();
+        // Reentrancy check sees our ancestor immediately even while admission is held.
+        assert!(acquire_memory(&dir, 2, 1000, 100, 200).is_none());
+        // With no ancestor holding a slot, helper does not treat free or unrelated slots as ancestors.
+        held.write_at(
+            format!("{:<10}\n{:<20}\n", 999_999_999u32, 100).as_bytes(),
+            0,
+        )
+        .unwrap();
+        let mut ancestors = None;
+        assert_eq!(
+            held_by_ancestor_without_locking_free(&dir, 2, &mut ancestors),
+            Some(false)
+        );
+        drop(held);
+        drop(admission);
     }
 }

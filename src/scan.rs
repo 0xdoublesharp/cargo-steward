@@ -95,7 +95,7 @@ pub fn outermost(mut roots: Vec<PathBuf>) -> Vec<PathBuf> {
 }
 
 /// Directory names never searched for build directories.
-const SKIP_DIRS: [&str; 8] = [
+const SKIP_DIRS: [&str; 17] = [
     ".git",
     "node_modules",
     ".Trashes",
@@ -104,35 +104,28 @@ const SKIP_DIRS: [&str; 8] = [
     ".DocumentRevisions-V100",
     ".TemporaryItems",
     ".pnpm-store",
+    "pnpm-store",
+    ".pnpm-cache",
+    "pnpm-cache",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".next",
+    ".nuxt",
+    ".turbo",
 ];
+
+/// Build directories and interrupted deletions found in one traversal.
+#[derive(Debug, Default)]
+pub struct Discovery {
+    pub builds: Vec<PathBuf>,
+    pub trash: Vec<PathBuf>,
+}
 
 /// Build directories under each of `roots`, at most `max_depth` levels down.
 /// Build directories are not searched inside.
 pub fn discover(roots: &[PathBuf], max_depth: usize) -> Vec<PathBuf> {
-    let mut found = Vec::new();
-    let mut stack: Vec<(PathBuf, usize)> = roots.iter().map(|r| (r.clone(), 0)).collect();
-    while let Some((dir, depth)) = stack.pop() {
-        if is_cargo_root(&dir) {
-            found.push(dir);
-            continue;
-        }
-        // Other directories cargo tags are its caches, such as a registry's
-        // thousands of unpacked crates: nothing to find in there.
-        if depth >= max_depth || has_cargo_tag(&dir) {
-            continue;
-        }
-        // read_dir already carries file types on APFS and common Linux
-        // filesystems. Asking lstat about every cache blob here makes a
-        // scan of a shared compiler cache cost millions of syscalls.
-        for path in subdirs(&dir) {
-            let name = path.file_name().unwrap_or_default().to_string_lossy();
-            if SKIP_DIRS.contains(&name.as_ref()) || name.starts_with(crate::fsutil::TRASH_PREFIX) {
-                continue;
-            }
-            stack.push((path, depth + 1));
-        }
-    }
-    outermost(found)
+    walk_discover(roots, max_depth, true, false).builds
 }
 
 /// Interrupted deletions are independent of Cargo markers: a whole build
@@ -140,31 +133,229 @@ pub fn discover(roots: &[PathBuf], max_depth: usize) -> Vec<PathBuf> {
 /// Use the same bounded search and cache exclusions as build discovery;
 /// inspect build roots themselves but never descend into their artifacts.
 pub fn discover_trash(roots: &[PathBuf], max_depth: usize) -> Vec<PathBuf> {
-    let mut found = Vec::new();
-    let mut stack: Vec<_> = roots
-        .iter()
-        .filter_map(|r| r.canonicalize().ok())
-        .map(|r| (r, 0))
-        .collect();
-    while let Some((dir, depth)) = stack.pop() {
-        if dir
-            .file_name()
-            .is_some_and(|n| n.to_string_lossy().starts_with(crate::fsutil::TRASH_PREFIX))
-        {
-            found.push(dir);
+    walk_discover(roots, max_depth, false, true).trash
+}
+
+/// Build directories and interrupted deletions under `roots` in one parallel pass.
+pub fn discover_all(roots: &[PathBuf], max_depth: usize) -> Discovery {
+    walk_discover(roots, max_depth, true, true)
+}
+
+/// One `read_dir` pass over a directory during discovery: detects Cargo root
+/// markers, `Cargo.toml`, trash entries, and candidate child directories
+/// without extra `stat` calls per entry.
+struct DirScan {
+    has_rustc_info: bool,
+    has_tag_file: bool,
+    has_cargo_toml: bool,
+    children: Vec<PathBuf>,
+    trash: Vec<PathBuf>,
+    hex1_mask: u16,
+    hex2_count: usize,
+}
+
+fn scan_dir_once(dir: &Path) -> Option<DirScan> {
+    let entries = fs::read_dir(dir).ok()?;
+    let mut out = DirScan {
+        has_rustc_info: false,
+        has_tag_file: false,
+        has_cargo_toml: false,
+        children: Vec::new(),
+        trash: Vec::new(),
+        hex1_mask: 0,
+        hex2_count: 0,
+    };
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else {
             continue;
-        }
-        let stop = is_cargo_root(&dir) || depth >= max_depth || has_cargo_tag(&dir);
-        for path in subdirs(&dir) {
-            let name = path.file_name().unwrap_or_default().to_string_lossy();
+        };
+        let os_name = entry.file_name();
+        let name = os_name.to_string_lossy();
+        if ft.is_dir() {
             if name.starts_with(crate::fsutil::TRASH_PREFIX) {
-                found.push(path);
-            } else if !stop && !SKIP_DIRS.contains(&name.as_ref()) {
-                stack.push((path, depth + 1));
+                out.trash.push(entry.path());
+            } else if !SKIP_DIRS.contains(&name.as_ref()) {
+                if let Some(bit) = single_hex_bit(&name) {
+                    out.hex1_mask |= bit;
+                } else if is_two_hex(&name) {
+                    out.hex2_count += 1;
+                }
+                out.children.push(entry.path());
+            }
+        } else if ft.is_file() || (ft.is_symlink() && entry.path().is_file()) {
+            match name.as_ref() {
+                ".rustc_info.json" | ".rustc-info.json" => out.has_rustc_info = true,
+                "CACHEDIR.TAG" => out.has_tag_file = true,
+                "Cargo.toml" => out.has_cargo_toml = true,
+                _ => {}
             }
         }
     }
-    outermost(found)
+    Some(out)
+}
+
+fn single_hex_bit(name: &str) -> Option<u16> {
+    let [b] = name.as_bytes() else {
+        return None;
+    };
+    let nibble = match b {
+        b'0'..=b'9' => b - b'0',
+        b'a'..=b'f' => 10 + (b - b'a'),
+        _ => return None,
+    };
+    Some(1u16 << nibble)
+}
+
+fn is_two_hex(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    bytes.len() == 2
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+}
+
+/// Content-addressed cache buckets (`sccache`'s `0..=f` fanout, `pnpm-store`
+/// or `ccache`/`go-build` `00..=ff` fanout): hundreds of thousands of files
+/// with no Cargo build roots inside.
+fn is_hex_bucket_dir(scan: &DirScan) -> bool {
+    if scan.has_cargo_toml {
+        return false;
+    }
+    scan.hex1_mask == 0xffff
+        || (scan.hex2_count >= 16 && scan.hex2_count * 2 >= scan.children.len())
+}
+
+fn has_any_profile(children: &[PathBuf]) -> bool {
+    children.iter().any(|child| {
+        as_profile(child).is_some()
+            || subdirs(child)
+                .filter(|g| !is_trash(g))
+                .any(|g| as_profile(&g).is_some())
+    })
+}
+
+fn inspect_for_discovery(
+    dir: &Path,
+    depth: usize,
+    max_depth: usize,
+    want_builds: bool,
+    want_trash: bool,
+    builds: &mut Vec<PathBuf>,
+    trash: &mut Vec<PathBuf>,
+) -> Vec<PathBuf> {
+    if want_trash && is_trash(dir) {
+        if fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir())
+            && let Ok(canon) = dir.canonicalize()
+        {
+            trash.push(canon);
+        }
+        return Vec::new();
+    }
+    let Some(scan) = scan_dir_once(dir) else {
+        return Vec::new();
+    };
+    if want_trash {
+        for path in &scan.trash {
+            if let Ok(canon) = path.canonicalize() {
+                trash.push(canon);
+            }
+        }
+    }
+    let cargo_tag = scan.has_tag_file && has_cargo_tag(dir);
+    let is_root = scan.has_rustc_info || (cargo_tag && has_any_profile(&scan.children));
+    if is_root {
+        if want_builds {
+            builds.push(dir.to_path_buf());
+        }
+        return Vec::new();
+    }
+    // Other directories cargo tags are its caches, such as a registry's
+    // thousands of unpacked crates: nothing to find in there.
+    if depth >= max_depth || cargo_tag || (depth > 0 && is_hex_bucket_dir(&scan)) {
+        return Vec::new();
+    }
+    scan.children
+}
+
+fn walk_discover(
+    roots: &[PathBuf],
+    max_depth: usize,
+    want_builds: bool,
+    want_trash: bool,
+) -> Discovery {
+    let mut builds = Vec::new();
+    let mut trash = Vec::new();
+    let mut depth1: Vec<PathBuf> = Vec::new();
+    for root in roots {
+        let children = inspect_for_discovery(
+            root,
+            0,
+            max_depth,
+            want_builds,
+            want_trash,
+            &mut builds,
+            &mut trash,
+        );
+        depth1.extend(children);
+    }
+    // Expand one more level before fanning out so one large top-level project
+    // directory (e.g., `/Volumes/Scratch/olc` with `build/`, `tmp/`, `data/`)
+    // is spread across all worker threads instead of serializing on one.
+    let work: Vec<(PathBuf, usize)> = if max_depth >= 2 && !depth1.is_empty() {
+        let expanded = crate::fsutil::parallel_map(&depth1, |dir| {
+            let mut local_builds = Vec::new();
+            let mut local_trash = Vec::new();
+            let children = inspect_for_discovery(
+                dir,
+                1,
+                max_depth,
+                want_builds,
+                want_trash,
+                &mut local_builds,
+                &mut local_trash,
+            );
+            (local_builds, local_trash, children)
+        });
+        let mut next = Vec::new();
+        for (local_builds, local_trash, children) in expanded {
+            builds.extend(local_builds);
+            trash.extend(local_trash);
+            for child in children {
+                next.push((child, 2));
+            }
+        }
+        next
+    } else {
+        depth1.into_iter().map(|d| (d, 1)).collect()
+    };
+    let batches = crate::fsutil::parallel_map(&work, |(start, start_depth)| {
+        let mut local_builds = Vec::new();
+        let mut local_trash = Vec::new();
+        let mut stack = vec![(start.clone(), *start_depth)];
+        while let Some((dir, depth)) = stack.pop() {
+            let children = inspect_for_discovery(
+                &dir,
+                depth,
+                max_depth,
+                want_builds,
+                want_trash,
+                &mut local_builds,
+                &mut local_trash,
+            );
+            for child in children {
+                stack.push((child, depth + 1));
+            }
+        }
+        (local_builds, local_trash)
+    });
+    for (local_builds, local_trash) in batches {
+        builds.extend(local_builds);
+        trash.extend(local_trash);
+    }
+    Discovery {
+        builds: outermost(builds),
+        trash: outermost(trash),
+    }
 }
 
 /// A profile directory, such as `target/debug` or
@@ -450,8 +641,10 @@ fn is_legacy_unit_dir(dir: &Path) -> bool {
 
 /// Newest [`touched`] time of the entries directly in `dir`.
 fn newest_in(dir: &Path) -> Option<SystemTime> {
-    entries(dir)
-        .filter_map(|(_, p)| fs::symlink_metadata(&p).ok())
+    fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter_map(|e| e.metadata().ok())
         .map(|m| touched(&m))
         .max()
 }
@@ -1721,5 +1914,48 @@ mod tests {
         contents.extend([0u8; 1000]);
         write(&output, &contents);
         assert_eq!(named_objects(&output), HashSet::from([name.to_owned()]));
+    }
+
+    #[test]
+    fn discover_all_finds_builds_and_trash_and_skips_hex_caches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let tag = b"Signature: 8a477f597d28d172789f06886806bc55\n# created by cargo.\n";
+
+        // A real build dir with a trash dir beside it and inside it.
+        let build = root.join("proj/target");
+        write(&build.join("CACHEDIR.TAG"), tag);
+        fs::create_dir_all(build.join("debug/.fingerprint")).unwrap();
+        let beside_trash = root.join("proj/.steward-trash-123-0");
+        fs::create_dir_all(&beside_trash).unwrap();
+        let inside_trash = build.join(".steward-trash-123-1");
+        fs::create_dir_all(&inside_trash).unwrap();
+
+        // A pnpm-store dir and an sccache-like 0..=f hex-bucket cache dir: skipped.
+        let pnpm = root.join("olc/pnpm-store/v3/fake/target");
+        write(&pnpm.join(".rustc_info.json"), b"{}");
+        let sccache = root.join("sccache");
+        for nibble in [
+            "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c", "d", "e", "f",
+        ] {
+            fs::create_dir_all(sccache.join(nibble)).unwrap();
+        }
+        write(&sccache.join("0/fake/target/.rustc_info.json"), b"{}");
+
+        // A 2-hex-digit (00..=ff) cache dir: skipped, but trash right in it is still found.
+        let cas = root.join("cas/objects");
+        for byte in 0..20u8 {
+            fs::create_dir_all(cas.join(format!("{byte:02x}"))).unwrap();
+        }
+        write(&cas.join("00/fake/target/.rustc_info.json"), b"{}");
+
+        let found = discover_all(&[root.to_path_buf()], 6);
+        assert_eq!(found.builds, [build]);
+        let mut expected_trash = vec![
+            beside_trash.canonicalize().unwrap(),
+            inside_trash.canonicalize().unwrap(),
+        ];
+        expected_trash.sort();
+        assert_eq!(found.trash, expected_trash);
     }
 }

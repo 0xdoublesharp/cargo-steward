@@ -37,8 +37,16 @@ pub(crate) fn clone_tree(src: &Path, dst: &Path) -> io::Result<Cloned> {
 
 /// Clones the regular file `src` to `dst`, which must not exist, keeping
 /// `src`'s access and modification times and permissions.
+#[allow(dead_code)] // Used in tests and callers preserving source metadata.
 pub(crate) fn clone_file(src: &Path, dst: &Path) -> io::Result<Cloned> {
-    imp::clone_file(src, dst)
+    imp::clone_file(src, dst, None)
+}
+
+/// Clones the regular file `src` to `dst`, which must not exist, giving `dst`
+/// the times and permissions in `like` in one pass (avoiding redundant
+/// `set_times_and_mode` syscalls when replacing a duplicate).
+pub(crate) fn clone_file_like(src: &Path, dst: &Path, like: &fs::Metadata) -> io::Result<Cloned> {
+    imp::clone_file(src, dst, Some(like))
 }
 
 /// Gives `path` the access and modification times and the permissions in
@@ -108,7 +116,11 @@ mod imp {
         clonefile(src, dst)
     }
 
-    pub(super) fn clone_file(src: &Path, dst: &Path) -> io::Result<Cloned> {
+    pub(super) fn clone_file(
+        src: &Path,
+        dst: &Path,
+        like: Option<&std::fs::Metadata>,
+    ) -> io::Result<Cloned> {
         let meta = std::fs::symlink_metadata(src)?;
         if !meta.is_file() {
             return Err(io::Error::new(
@@ -119,9 +131,8 @@ mod imp {
         if clonefile(src, dst)? == Cloned::Unsupported {
             return Ok(Cloned::Unsupported);
         }
-        // clonefile already keeps the times; set them anyway so the result
-        // doesn't depend on that.
-        if let Err(e) = set_times_and_mode(dst, &meta) {
+        let target_meta = like.unwrap_or(&meta);
+        if let Err(e) = set_times_and_mode(dst, target_meta) {
             let _ = std::fs::remove_file(dst);
             return Err(e);
         }
@@ -272,10 +283,14 @@ mod imp {
             // Sockets, FIFOs and devices have no data to share.
             return Ok(Cloned::Done);
         }
-        clone_file(src, dst)
+        clone_file(src, dst, None)
     }
 
-    pub(super) fn clone_file(src: &Path, dst: &Path) -> io::Result<Cloned> {
+    pub(super) fn clone_file(
+        src: &Path,
+        dst: &Path,
+        like: Option<&fs::Metadata>,
+    ) -> io::Result<Cloned> {
         let from = File::open(src)?;
         let meta = from.metadata()?;
         if !meta.is_file() {
@@ -294,7 +309,7 @@ mod imp {
         let rc = unsafe { libc::ioctl(to.as_raw_fd(), libc::FICLONE, from.as_raw_fd()) };
         let result = if rc == 0 {
             drop(to);
-            set_times_and_mode(dst, &meta).map(|()| Cloned::Done)
+            set_times_and_mode(dst, like.unwrap_or(&meta)).map(|()| Cloned::Done)
         } else {
             let err = io::Error::last_os_error();
             // EINVAL: the filesystem can't share these files' blocks;
@@ -348,7 +363,11 @@ mod imp {
         Ok(Cloned::Unsupported)
     }
 
-    pub(super) fn clone_file(_src: &Path, _dst: &Path) -> io::Result<Cloned> {
+    pub(super) fn clone_file(
+        _src: &Path,
+        _dst: &Path,
+        _like: Option<&std::fs::Metadata>,
+    ) -> io::Result<Cloned> {
         Ok(Cloned::Unsupported)
     }
 

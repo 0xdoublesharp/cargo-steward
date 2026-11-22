@@ -129,7 +129,8 @@ pub fn probe_atime(dir: &Path) -> io::Result<bool> {
     let path = dir.join(PROBE_FILE);
     fs::write(&path, b"cargo-steward atime probe\n")?;
     let updates = (|| -> io::Result<bool> {
-        if !set_atime(&path, UNIX_EPOCH)? {
+        set_atime(&path, UNIX_EPOCH)?;
+        if fs::metadata(&path)?.accessed()? != UNIX_EPOCH {
             return Ok(false);
         }
         let mut contents = Vec::new();
@@ -140,12 +141,10 @@ pub fn probe_atime(dir: &Path) -> io::Result<bool> {
     Ok(updates.unwrap_or(false))
 }
 
-/// Sets a file's access time, keeping its modification time. False when the
-/// filesystem didn't take it.
-fn set_atime(path: &Path, when: SystemTime) -> io::Result<bool> {
+/// Sets a file's access time, keeping its modification time.
+fn set_atime(path: &Path, when: SystemTime) -> io::Result<()> {
     // Opening a file doesn't change its access time; only reading does.
-    File::open(path)?.set_times(FileTimes::new().set_accessed(when))?;
-    Ok(fs::metadata(path)?.accessed()? == when)
+    File::open(path)?.set_times(FileTimes::new().set_accessed(when))
 }
 
 /// Saves when each fingerprint directory in the build directory was last

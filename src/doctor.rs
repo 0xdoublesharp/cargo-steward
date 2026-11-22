@@ -249,11 +249,14 @@ fn collect() -> Result<Report> {
             s.spawn(move || backup::isexcluded(&dirs))
         };
 
+        let cargo_home = config::cargo_home();
         let packages: BTreeSet<PathBuf> = registry
             .roots
             .values()
             .flat_map(|info| info.workspaces.iter().cloned())
-            .filter(|w| w.exists())
+            .filter(|w| {
+                w.exists() && !crate::wrapper::is_cargo_download_cache(w, cargo_home.as_deref())
+            })
             .collect();
         let workspace_roots = profile::workspace_roots(&packages);
         let pins = toolchain_pins(&packages);
