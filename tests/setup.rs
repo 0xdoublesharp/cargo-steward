@@ -726,6 +726,6 @@ fn install_script_builds_without_the_configured_wrapper() {
         .collect();
     assert_eq!(lines.len(), 3, "{lines:?}");
     for line in &lines {
-        assert!(line.starts_with("||install --locked "), "{line}");
+        assert!(line.starts_with("||install --locked --force "), "{line}");
     }
 }

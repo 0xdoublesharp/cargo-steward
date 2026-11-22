@@ -212,16 +212,16 @@ case $mode in
         need_cargo
         [ -f "$source_dir/Cargo.toml" ] || die "$source_dir has no Cargo.toml"
         say "Installing cargo-steward from $source_dir"
-        cargo_install --locked --path "$source_dir"
+        cargo_install --locked --force --path "$source_dir"
         bin_dir=${CARGO_INSTALL_ROOT:-$cargo_home}/bin
         ;;
     git)
         need_cargo
         say "Installing cargo-steward from $git_url${git_rev:+ at $git_rev}"
         if [ -n "$git_rev" ]; then
-            cargo_install --locked --git "$git_url" --rev "$git_rev" cargo-steward
+            cargo_install --locked --force --git "$git_url" --rev "$git_rev" cargo-steward
         else
-            cargo_install --locked --git "$git_url" cargo-steward
+            cargo_install --locked --force --git "$git_url" cargo-steward
         fi
         bin_dir=${CARGO_INSTALL_ROOT:-$cargo_home}/bin
         ;;
